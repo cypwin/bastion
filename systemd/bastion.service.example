@@ -1,0 +1,43 @@
+# BASTION — Batch Affinity Scheduler for Throttled Inference on Ollama Networks
+# Install: sudo cp bastion.service.example /etc/systemd/system/bastion.service
+#          sudo systemctl daemon-reload && sudo systemctl enable --now bastion
+
+[Unit]
+Description=BASTION GPU/LLM Broker (Ollama proxy on :11434)
+Documentation=https://github.com/cyprian-w/bastion
+After=network-online.target ollama.service nvidia-powercap.service
+Wants=network-online.target nvidia-powercap.service
+Requires=ollama.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=30
+User=<USER>
+Group=bastion
+WorkingDirectory=<BASTION_DIR>
+ExecStart=<PYTHON_PATH> -m bastion --config config/broker.yaml
+Restart=always
+RestartSec=3
+StartLimitBurst=5
+StartLimitIntervalSec=60
+SupplementaryGroups=<USER>
+TimeoutStopSec=15
+
+# Environment
+Environment="PYTHONPATH=<BASTION_DIR>/src"
+
+# Logging — journal captures stdout/stderr
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bastion
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=<BASTION_DIR>
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
