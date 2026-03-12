@@ -1,0 +1,30 @@
+# Ollama systemd override — move Ollama to port 11435 so BASTION can own 11434.
+#
+# Install:
+#   sudo mkdir -p /etc/systemd/system/ollama.service.d/
+#   sudo cp ollama-port-override.conf.example /etc/systemd/system/ollama.service.d/override.conf
+#   sudo systemctl daemon-reload && sudo systemctl restart ollama
+#
+# After install, Ollama listens on 127.0.0.1:11435 (localhost only).
+# BASTION proxies on 0.0.0.0:11434 (all interfaces, standard Ollama port).
+# All clients (ollama CLI, scripts) connect to 11434 transparently.
+
+[Service]
+# Move Ollama to non-standard port (BASTION owns 11434)
+Environment="OLLAMA_HOST=127.0.0.1:11435"
+
+# Max models co-resident in VRAM (adjust for your GPU capacity)
+Environment="OLLAMA_MAX_LOADED_MODELS=4"
+
+# One request per model at a time (BASTION serializes concurrency)
+Environment="OLLAMA_NUM_PARALLEL=1"
+
+# 2 GB GPU overhead reservation for CUDA/KV cache
+Environment="OLLAMA_GPU_OVERHEAD=2147483648"
+
+# Required for q8_0 KV cache type — enables flash attention kernel
+Environment="OLLAMA_FLASH_ATTENTION=1"
+
+# Halves KV cache memory vs fp16 default (~50% reduction)
+# Requires FLASH_ATTENTION=1.
+Environment="OLLAMA_KV_CACHE_TYPE=q8_0"

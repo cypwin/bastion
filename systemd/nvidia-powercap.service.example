@@ -1,0 +1,20 @@
+# nvidia-powercap — Set GPU power limit on boot
+# Prevents sustained high-power inference from crashing the GPU.
+# Adjust the power limit (-pl) value for your specific GPU model.
+#
+# Install: sudo cp nvidia-powercap.service.example /etc/systemd/system/nvidia-powercap.service
+#          sudo systemctl daemon-reload && sudo systemctl enable nvidia-powercap
+
+[Unit]
+Description=NVIDIA GPU Power Cap
+After=nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Set power limit in watts — adjust for your GPU (e.g., 300 for RTX 4090, 425 for high-TDP cards)
+ExecStart=/usr/bin/nvidia-smi -pl <POWER_LIMIT_WATTS>
+
+[Install]
+WantedBy=multi-user.target

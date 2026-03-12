@@ -1,0 +1,12 @@
+# Allow a user to manage bastion.service without password.
+# This enables the BASTION dashboard TUI to restart the service.
+#
+# Install:
+#   sudo cp bastion-sudoers.example /etc/sudoers.d/bastion
+#   sudo chmod 0440 /etc/sudoers.d/bastion
+#   sudo visudo -cf /etc/sudoers.d/bastion   # validate syntax
+#
+<USER> ALL=(root) NOPASSWD: /usr/bin/systemctl start bastion.service
+<USER> ALL=(root) NOPASSWD: /usr/bin/systemctl stop bastion.service
+<USER> ALL=(root) NOPASSWD: /usr/bin/systemctl restart bastion.service
+<USER> ALL=(root) NOPASSWD: /usr/bin/systemctl status bastion.service
