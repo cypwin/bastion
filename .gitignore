@@ -1,0 +1,58 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+*.so
+.env
+.venv/
+
+# Pytest temp directories
+pytest-of-*/
+
+# IDE
+.idea/
+.vscode/
+
+# Claude Code / MCP
+.claude/
+.mcp.json
+
+# Project-specific ignores
+CLAUDE.md
+_archive/
+ARCHIVE/
+prompts/
+plans/
+logs/
+*.log
+config/broker.yaml
+.deepeval/
+
+# Shell dotfiles (should not be in project)
+.bash_profile
+.bashrc
+.zshrc
+.zprofile
+.profile
+.gitconfig
+.ripgreprc
+.gitmodules
+
+# Loose git objects (not part of this repo)
+/HEAD
+/hooks
+/objects
+/refs
+
+# Session notes (personal)
+CRASH_ROOT_CAUSE.md
+CRASH_most_recent_chat.md
+BASTION_LLM_INVENTORY.md
+QUERIES_DRs.txt
+TO_ADD_TO_DASHBOARD_BUTTONS_OPTION_TO_OPEN_NEW_TMUX.txt
