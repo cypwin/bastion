@@ -1,7 +1,8 @@
 # Design Spec: BASTION Observability-First Enhancement
 
 **Date**: 2026-03-13
-**Status**: Draft
+**Status**: Draft (post-review revision 1)
+**Reviewed by**: Spec reviewer agent (Opus 4.6) — 3 CRITICAL, 5 HIGH findings addressed below
 **Origin**: Comprehensive audit by 11 specialist agents (3 scouts + 8 analysts)
 **Synthesis**: `docs/audit/SYNTHESIS.md` (164 findings, 633 lines)
 
@@ -10,9 +11,9 @@
 ## Problem Statement
 
 BASTION computes far more data than it exposes. The audit identified:
-- 12 computed fields never surfaced via API
-- 9 of 17 Prometheus metrics defined but never emitted
-- 3 of 5 OpenTelemetry spans defined but never used
+- 10+ computed fields never surfaced via API (2 previously identified items — `vram_ledger` and `total_requests_served` — have since been wired)
+- 8 fully dead + 1 partially wired Prometheus metrics (17 defined, 8 emitting)
+- 3 of 5 OpenTelemetry spans defined but never used (2 are active in A2A path)
 - 17 scheduler/queue internal fields invisible to operators
 - 6 rich state structures reduced to simple counts before returning
 - The primary crash-prevention signal (`swap_rate_level`) is invisible
@@ -38,31 +39,37 @@ Surface all hidden internal state through three layers: API endpoints, Prometheu
 
 ## Section 1: "The 10-Line Revolution"
 
-Wire 10 hidden data fields into existing API responses. ~35 lines total.
+Wire hidden data fields into existing API responses. ~30 lines total.
+
+> **Review note (C2, C3)**: Items T1-01 (`vram_ledger`) and T1-02 (`total_requests_served`) were found to be **already wired** in the current codebase. `vram_ledger` is wired at `server.py:602` via `_vram_manager.status()`. `total_requests_served` is wired at `server.py:599` to `_proxy._requests_served`. These are removed from the task list below. Implementers MUST verify each remaining item against current code before changing it.
 
 ### Changes
 
 | Item | File | Change | Lines |
 |------|------|--------|-------|
-| T1-01 | `server.py` | Wire `VRAMManager.status()` to `BrokerStatus.vram_ledger` | 1 |
-| T1-02 | `server.py` | Wire `Scheduler._total_dispatched` to `BrokerStatus.total_requests_served` | 1 |
+| ~~T1-01~~ | ~~`server.py`~~ | ~~Already wired (`server.py:602`)~~ | 0 |
+| ~~T1-02~~ | ~~`server.py`~~ | ~~Already wired (`server.py:599`) — also add `total_dispatched` as separate field from `Scheduler._total_dispatched` (dispatched vs. served are different counts)~~ | 2 |
 | T1-03 | `server.py` | Add `swap_rate_level` to status response from `Scheduler._swap_rate_level` | 3-5 |
 | T1-04 | `server.py` | Add `stall_reason` + `stall_time` to status response | 5-10 |
 | T1-05 | `server.py` | Add `_inflight_models` to status response | 2 |
-| T1-06 | `models.py` | Convert `GPUStatus.vram_utilization_pct` and `is_safe()` to computed Pydantic fields | 5 |
+| T1-06 | `models.py` | Convert `GPUStatus.vram_utilization_pct` to `@computed_field`. Note: `is_safe()` takes a parameter (`gpu_config`) so it CANNOT be a computed field — instead compute `gpu_is_safe: bool` in the status handler and add to `BrokerStatus` | 5 |
 | T1-07 | `vram.py`, `models.py` | Include `LoadedModel.details` in serialization | 2 |
 | T1-08 | `server.py` | Add circuit breaker state/failures/opened_at to status | 5 |
-| T1-09 | `server.py` | New `/a2a/stats` endpoint calling `TaskStore.stats()` | 5-10 |
+| T1-09 | `server.py` | New `GET /a2a/stats` endpoint calling `TaskStore.stats()` | 5-10 |
 | T1-10 | `server.py`, `dashboard.py` | Return `GPUConfig.max_vram_gb` in status; remove dashboard hardcode | 3 |
+| T1-11 | `__init__.py` | Fix version mismatch: `__version__` says `0.1.0` but `pyproject.toml` says `0.2.0` | 1 |
 
 ### Models Impact
 
-`BrokerStatus` in `models.py` may need new optional fields:
+`BrokerStatus` in `models.py` needs new optional fields:
+- `total_dispatched: int | None` (distinct from `total_requests_served`)
 - `swap_rate_level: str | None`
 - `stall_reason: str | None`
 - `stall_duration_seconds: float | None`
 - `inflight_models: dict[str, int] | None`
 - `circuit_breaker: dict | None`
+- `gpu_is_safe: bool | None`
+- `max_vram_gb: float | None`
 
 These should be optional with `None` default for backward compatibility.
 
@@ -70,29 +77,33 @@ These should be optional with `None` default for backward compatibility.
 
 ## Section 2: "Waking the Dead Metrics"
 
-Activate 9 dormant Prometheus metrics, 3 dormant OTel spans, and add a periodic gauge updater. ~75 lines.
+Activate 8 fully dormant Prometheus metrics + extend 1 partial, wire 3 dormant OTel spans, add periodic gauge updater. ~75 lines.
+
+> **Review note (C1)**: There is no `_do_model_swap()` method. The swap logic lives in `_handle_swap_dispatch()` at `scheduler.py:445`. Timing and OTel spans should wrap the section around lines 532-579 where `_last_swap_time` and `_total_swaps` are updated.
+>
+> **Review note (H1)**: `metrics.py` and `telemetry.py` both define functions named `record_queue_wait()` and `record_model_swap()` with DIFFERENT signatures. Metrics versions record histogram observations; telemetry versions are context managers creating spans. Implementers must call BOTH at appropriate sites using qualified imports (e.g., `from bastion.metrics import record_queue_wait as metrics_record_queue_wait`).
 
 ### Prometheus Call Sites
 
-| Metric | Helper | Call Site | File |
+| Metric | Helper (`metrics.py`) | Call Site | File |
 |--------|--------|----------|------|
-| `bastion_queue_wait_seconds` | `record_queue_wait()` | When request granted: `now - queued_at` | `scheduler.py` |
-| `bastion_queue_depth` | `update_queue_depth()` | Each scheduler tick | `scheduler.py` |
-| `bastion_model_swap_total` | `record_model_swap()` | After `_do_model_swap()` | `scheduler.py` |
-| `bastion_model_swap_duration_seconds` | `record_model_swap_duration()` | Wrap swap with timing | `scheduler.py` |
+| `bastion_queue_wait_seconds` | `metrics.record_queue_wait(model, tier, wait_seconds)` | When request granted: `now - queued_at` | `scheduler.py` |
+| `bastion_queue_depth` | `metrics.update_queue_depth(depth)` | Each scheduler tick | `scheduler.py` |
+| `bastion_model_swap_total` | `metrics.record_model_swap(from_model, to_model)` | After swap in `_handle_swap_dispatch()` (~line 535) | `scheduler.py` |
+| `bastion_model_swap_duration_seconds` | `metrics.record_model_swap_duration(seconds)` | Wrap swap section in `_handle_swap_dispatch()` with timing | `scheduler.py` |
 | `bastion_cooldown_waits_total` | `record_cooldown_wait()` | When cooldown blocks dispatch | `scheduler.py` |
 | `bastion_vram_used_bytes` | `update_vram_usage()` | Periodic gauge updater | `server.py` |
 | `bastion_gpu_temperature_celsius` | `update_gpu_temperature()` | After nvidia-smi query | `health.py` |
 | `bastion_a2a_queue_depth` | `update_a2a_queue_depth()` | On task create/complete | `a2a.py` |
-| `bastion_llm_time_to_first_token` | `observe_llm_ttft()` | Proxy streaming path (extend) | `proxy.py` |
+| `bastion_llm_time_to_first_token` | `metrics.observe_llm_ttft(seconds)` | **PARTIAL** — already wired in A2A path (`a2a.py:801`), extend to proxy streaming path | `proxy.py` |
 
-### OpenTelemetry Spans
+### OpenTelemetry Spans (use `telemetry.*` context managers)
 
-| Span | File | Wraps |
-|------|------|-------|
-| `bastion.scheduler.queue_wait` | `scheduler.py` | `grant_event.wait()` |
-| `bastion.scheduler.model_swap` | `scheduler.py` | Model unload + load |
-| `bastion.ollama.inference` | `proxy.py` | httpx calls to Ollama |
+| Span | Helper (`telemetry.py`) | File | Wraps |
+|------|--------|------|-------|
+| `bastion.scheduler.queue_wait` | `telemetry.record_queue_wait(request_id, model)` | `scheduler.py` | `grant_event.wait()` |
+| `bastion.scheduler.model_swap` | `telemetry.record_model_swap(from_model, to_model)` | `scheduler.py` | Swap section in `_handle_swap_dispatch()` |
+| `bastion.ollama.inference` | `telemetry.record_inference(model, request_id)` | `proxy.py` | httpx calls to Ollama |
 
 ### Periodic Gauge Updater
 
@@ -145,7 +156,9 @@ Visual alerts (color changes / banners) for:
 
 ## Section 4: "The Plumbing Layer"
 
-14 new endpoints, RequestID middleware, Grafana artifacts. ~250 lines.
+12 new endpoints (after deducting `/a2a/stats` which moves to Phase 1), RequestID middleware, Grafana artifacts. ~250 lines.
+
+> **Review note (H3, M5)**: Phases 1 and 2 both modify `server.py`. If run in parallel, `server.py` changes must be serialized or merged carefully. Also, every route handler is duplicated between `create_app()` and `create_admin_app()` — consider extracting handlers into standalone functions to avoid 2x duplication for all new endpoints.
 
 ### Wave 1 — Direct Data Exposure
 
@@ -154,7 +167,6 @@ Visual alerts (color changes / banners) for:
 | `GET /broker/scheduler/diagnostics` | ~15 | current_model, stall_reason, stall_duration, swap_rate_level, swaps_in_window, effective_cooldown, cooldown_remaining, total_dispatched |
 | `GET /broker/queue/details` | ~20 | Per-request: id, model, tier, age_seconds, effective_priority, endpoint, client_info |
 | `GET /broker/inflight` | ~10 | inflight_models, pending_grants count, pending_completions count |
-| `GET /a2a/stats` | ~5 | Calls `TaskStore.stats()` |
 | `GET /a2a/leases` | ~15 | Active leases with full state |
 | `GET /broker/residency` | ~10 | Resident models, per-model VRAM, cache age, staleness |
 | `GET /broker/profiles` | ~5 | Session profiles from config |
@@ -173,7 +185,7 @@ Visual alerts (color changes / banners) for:
 
 | Endpoint | Lines | What |
 |----------|-------|------|
-| `POST /broker/config/reload` | ~30 | Hot-reload broker.yaml |
+| `POST /broker/config/reload` | ~50 | Hot-reload broker.yaml — MUST validate config before applying (reject negative cooldowns, headroom > total VRAM, etc.). Rollback on validation failure. |
 
 ### RequestID Middleware (~20 lines)
 
@@ -184,7 +196,10 @@ Visual alerts (color changes / banners) for:
 
 ### Rate Limiting Fix (1 line)
 
-Apply existing `RateLimitMiddleware` to `create_admin_app()` in two-port mode at `server.py` ~line 1172.
+Apply existing `RateLimitMiddleware` to `create_admin_app()` in two-port mode at `server.py` ~line 1172:
+```python
+app.add_middleware(RateLimitMiddleware, config=config.rate_limit)
+```
 
 ### Grafana Artifacts (config-only)
 
@@ -214,9 +229,9 @@ Apply existing `RateLimitMiddleware` to `create_admin_app()` in two-port mode at
 
 ---
 
-## Non-Goals
+## Non-Goals (with follow-up notes)
 
 - Multi-GPU support (separate design)
 - A2A orchestration enhancements (separate design)
-- Client library expansion (separate design)
-- Config validation constraints (could be folded in but not primary goal)
+- Client library expansion (separate design — but note the 13 new endpoints will need corresponding client methods eventually)
+- Full config validation constraints (separate design — but `/broker/config/reload` MUST validate before applying to prevent runtime crashes)

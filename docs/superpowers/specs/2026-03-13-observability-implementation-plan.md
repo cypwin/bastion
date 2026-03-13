@@ -27,24 +27,30 @@ Phases are ordered by dependency: later phases consume endpoints/fields created 
 
 ### Tasks
 
+#### IMPORTANT: Pre-Implementation Verification
+Before modifying any code, each agent MUST verify the current state of fields/methods referenced in the spec against the actual source code. The audit ran against a prior snapshot; some items (T1-01 `vram_ledger`, T1-02 `total_requests_served`) were already wired by the time of review.
+
 #### Agent 1: Status Endpoint Wiring (`server.py`)
-- [ ] Wire `VRAMManager.status()` to `BrokerStatus.vram_ledger` (T1-01)
-- [ ] Wire `Scheduler._total_dispatched` to `BrokerStatus.total_requests_served` (T1-02)
+- [ ] VERIFY: Check if `vram_ledger` is already wired at ~line 602 (skip if so)
+- [ ] VERIFY: Check if `total_requests_served` is already wired at ~line 599 (if so, add `total_dispatched` as SEPARATE field from `Scheduler._total_dispatched`)
 - [ ] Add `swap_rate_level` from `Scheduler._swap_rate_level` to status (T1-03)
 - [ ] Add `stall_reason` + `stall_time` to status response (T1-04)
 - [ ] Add `_inflight_models` to status response (T1-05)
 - [ ] Add circuit breaker state/failures to status (T1-08)
 - [ ] Return `GPUConfig.max_vram_gb` in status (T1-10)
+- [ ] Compute `gpu_is_safe` in handler using `gpu_status.is_safe(config.gpu)` and add to response
+- [ ] Fix version mismatch: update `__init__.__version__` to match `pyproject.toml` (T1-11)
+- [ ] DUPLICATE: Apply same changes to `create_admin_app()` status handler (~line 1183)
 
 #### Agent 2: Model Serialization Fixes (`models.py`, `vram.py`)
-- [ ] Convert `GPUStatus.vram_utilization_pct` to computed Pydantic field (T1-06)
-- [ ] Convert `GPUStatus.is_safe()` to computed Pydantic field (T1-06)
+- [ ] Convert `GPUStatus.vram_utilization_pct` to `@computed_field` (Pydantic v2)
+- [ ] NOTE: `GPUStatus.is_safe()` takes a `gpu_config` param — keep as method, do NOT convert to computed_field. `gpu_is_safe` is computed in the status handler instead.
 - [ ] Include `LoadedModel.details` in serialization (T1-07)
-- [ ] Add new optional fields to `BrokerStatus`: `swap_rate_level`, `stall_reason`, `stall_duration_seconds`, `inflight_models`, `circuit_breaker`
+- [ ] Add new optional fields to `BrokerStatus`: `total_dispatched`, `swap_rate_level`, `stall_reason`, `stall_duration_seconds`, `inflight_models`, `circuit_breaker`, `gpu_is_safe`, `max_vram_gb`
 
 #### Agent 3: New Endpoint + Dashboard Fix
-- [ ] Create `GET /a2a/stats` endpoint calling `TaskStore.stats()` (T1-09)
-- [ ] Remove hardcoded `VRAM_BUDGET_GB = 26.0` from `dashboard.py`, read from API (T1-10)
+- [ ] Create `GET /a2a/stats` endpoint calling `TaskStore.stats()` (T1-09) — in BOTH app factories
+- [ ] Remove hardcoded `VRAM_BUDGET_GB = 26.0` from `dashboard.py`, read from API (T1-10) — sequence: server change first, then dashboard
 - [ ] Write tests for all new status fields
 - [ ] Write test for `/a2a/stats` endpoint
 
@@ -64,19 +70,21 @@ Confirm: `/broker/status` response includes all new fields. `/a2a/stats` returns
 ### Tasks
 
 #### Agent 1: Scheduler Metric Call Sites (`scheduler.py`)
-- [ ] Call `record_queue_wait()` when request granted (now - queued_at)
-- [ ] Call `update_queue_depth()` on each scheduler tick
-- [ ] Call `record_model_swap()` after `_do_model_swap()`
-- [ ] Call `record_model_swap_duration()` wrapping swap timing
-- [ ] Call `record_cooldown_wait()` when cooldown blocks dispatch
-- [ ] Wrap `grant_event.wait()` with `bastion.scheduler.queue_wait` OTel span
-- [ ] Wrap swap logic with `bastion.scheduler.model_swap` OTel span
+NOTE: `metrics.py` and `telemetry.py` have identically-named functions with DIFFERENT signatures.
+Use qualified imports: `from bastion.metrics import record_queue_wait as metrics_queue_wait` etc.
+- [ ] Call `metrics.record_queue_wait(model, tier, wait_seconds)` when request granted
+- [ ] Call `metrics.update_queue_depth(depth)` on each scheduler tick
+- [ ] Call `metrics.record_model_swap(from_model, to_model)` after swap in `_handle_swap_dispatch()` (~line 535) — NOTE: there is NO `_do_model_swap()` method
+- [ ] Call `metrics.record_model_swap_duration(seconds)` wrapping swap timing in `_handle_swap_dispatch()`
+- [ ] Call `metrics.record_cooldown_wait()` when cooldown blocks dispatch
+- [ ] Wrap `grant_event.wait()` with `telemetry.record_queue_wait(request_id, model)` OTel context manager
+- [ ] Wrap swap section in `_handle_swap_dispatch()` with `telemetry.record_model_swap(from_model, to_model)` OTel context manager
 
 #### Agent 2: Non-Scheduler Metric Call Sites
 - [ ] `health.py`: Call `update_gpu_temperature()` after nvidia-smi query
 - [ ] `a2a.py`: Call `update_a2a_queue_depth()` on task create/complete
-- [ ] `proxy.py`: Extend `observe_llm_ttft()` to proxy streaming path (not just A2A)
-- [ ] `proxy.py`: Wrap httpx calls with `bastion.ollama.inference` OTel span
+- [ ] `proxy.py`: Extend `metrics.observe_llm_ttft()` to proxy streaming path (already wired in A2A at `a2a.py:801`, needs proxy path too)
+- [ ] `proxy.py`: Wrap httpx calls with `telemetry.record_inference(model, request_id)` OTel context manager
 
 #### Agent 3: Periodic Gauge Updater + Tests
 - [ ] Create `_gauge_update_loop()` in `server.py` (~30 lines)
@@ -201,12 +209,16 @@ Full green. Documentation matches implementation.
 ## Parallelization Map
 
 ```
-Phase 1 (3 agents)  ──────┐
-                           ├──> Phase 3 (4 agents) ──> Phase 4 (3 agents) ──> Phase 5 (2 agents)
-Phase 2 (3 agents)  ──────┘
+Phase 1 (3 agents)  ──> Phase 2 (3 agents) ──> Phase 3 (4 agents) ──> Phase 4 (3 agents) ──> Phase 5 (2 agents)
 ```
 
-Phases 1 and 2 can run in parallel (independent concerns).
+Phases are SEQUENTIAL (not parallel) because:
+- Phase 2 needs Phase 1's model changes to `BrokerStatus`
+- Phases 1 and 2 both modify `server.py` — parallel execution causes merge conflicts
+- Phase 3 needs endpoints from Phase 1 and metrics from Phase 2
+- Phase 4 needs all new endpoints from Phase 3
+
+Within each phase, agents run in parallel on different files.
 Phase 3 depends on Phase 1 (needs wired status fields).
 Phase 4 depends on Phase 3 (needs new endpoints).
 Phase 5 depends on all phases.
