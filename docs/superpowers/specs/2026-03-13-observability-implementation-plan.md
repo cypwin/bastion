@@ -1,0 +1,239 @@
+# Implementation Plan: BASTION Observability-First Enhancement
+
+**Design Spec**: `docs/superpowers/specs/2026-03-13-observability-first-design.md`
+**Audit Source**: `docs/audit/SYNTHESIS.md`
+**Workflow**: Implement -> Test -> Commit -> Q&A -> Plan next -> Context clear -> Repeat
+
+---
+
+## Execution Model
+
+Each phase follows this cycle:
+1. **Plan** — Review phase scope, assign tasks to agent team
+2. **Implement** — Agent team executes in parallel where possible
+3. **Test** — Run full test suite, verify new functionality
+4. **Commit** — Stage and commit with descriptive message
+5. **Q&A** — User reviews changes, asks questions, requests adjustments
+6. **Context clear** — Fresh session for next phase
+
+Phases are ordered by dependency: later phases consume endpoints/fields created by earlier phases.
+
+---
+
+## Phase 1: "The 10-Line Revolution" — Wire Hidden Data
+
+**Depends on**: Nothing (foundation phase)
+**Estimated agents**: 3 parallel
+
+### Tasks
+
+#### Agent 1: Status Endpoint Wiring (`server.py`)
+- [ ] Wire `VRAMManager.status()` to `BrokerStatus.vram_ledger` (T1-01)
+- [ ] Wire `Scheduler._total_dispatched` to `BrokerStatus.total_requests_served` (T1-02)
+- [ ] Add `swap_rate_level` from `Scheduler._swap_rate_level` to status (T1-03)
+- [ ] Add `stall_reason` + `stall_time` to status response (T1-04)
+- [ ] Add `_inflight_models` to status response (T1-05)
+- [ ] Add circuit breaker state/failures to status (T1-08)
+- [ ] Return `GPUConfig.max_vram_gb` in status (T1-10)
+
+#### Agent 2: Model Serialization Fixes (`models.py`, `vram.py`)
+- [ ] Convert `GPUStatus.vram_utilization_pct` to computed Pydantic field (T1-06)
+- [ ] Convert `GPUStatus.is_safe()` to computed Pydantic field (T1-06)
+- [ ] Include `LoadedModel.details` in serialization (T1-07)
+- [ ] Add new optional fields to `BrokerStatus`: `swap_rate_level`, `stall_reason`, `stall_duration_seconds`, `inflight_models`, `circuit_breaker`
+
+#### Agent 3: New Endpoint + Dashboard Fix
+- [ ] Create `GET /a2a/stats` endpoint calling `TaskStore.stats()` (T1-09)
+- [ ] Remove hardcoded `VRAM_BUDGET_GB = 26.0` from `dashboard.py`, read from API (T1-10)
+- [ ] Write tests for all new status fields
+- [ ] Write test for `/a2a/stats` endpoint
+
+### Verification
+```bash
+/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/ -v
+```
+Confirm: `/broker/status` response includes all new fields. `/a2a/stats` returns store statistics.
+
+---
+
+## Phase 2: "Waking the Dead Metrics" — Prometheus + OTel
+
+**Depends on**: Phase 1 (status fields must exist for gauge updater to read)
+**Estimated agents**: 3 parallel
+
+### Tasks
+
+#### Agent 1: Scheduler Metric Call Sites (`scheduler.py`)
+- [ ] Call `record_queue_wait()` when request granted (now - queued_at)
+- [ ] Call `update_queue_depth()` on each scheduler tick
+- [ ] Call `record_model_swap()` after `_do_model_swap()`
+- [ ] Call `record_model_swap_duration()` wrapping swap timing
+- [ ] Call `record_cooldown_wait()` when cooldown blocks dispatch
+- [ ] Wrap `grant_event.wait()` with `bastion.scheduler.queue_wait` OTel span
+- [ ] Wrap swap logic with `bastion.scheduler.model_swap` OTel span
+
+#### Agent 2: Non-Scheduler Metric Call Sites
+- [ ] `health.py`: Call `update_gpu_temperature()` after nvidia-smi query
+- [ ] `a2a.py`: Call `update_a2a_queue_depth()` on task create/complete
+- [ ] `proxy.py`: Extend `observe_llm_ttft()` to proxy streaming path (not just A2A)
+- [ ] `proxy.py`: Wrap httpx calls with `bastion.ollama.inference` OTel span
+
+#### Agent 3: Periodic Gauge Updater + Tests
+- [ ] Create `_gauge_update_loop()` in `server.py` (~30 lines)
+  - Updates every 5s: VRAM usage, GPU temp, queue depth, circuit breaker state
+  - Starts as background task alongside scheduler
+- [ ] Write tests verifying metric helper functions are called
+- [ ] Write tests for gauge updater loop
+
+### Verification
+```bash
+/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/ -v
+```
+Confirm: `/broker/metrics` returns non-zero values for all 17 metrics when prometheus_client is installed. OTel spans appear in trace output when SDK installed.
+
+---
+
+## Phase 3: "The Plumbing Layer" — New Endpoints + Middleware
+
+**Depends on**: Phase 1 (data must be accessible), Phase 2 (metrics must be active)
+**Estimated agents**: 4 parallel
+
+### Tasks
+
+#### Agent 1: Wave 1 Endpoints — Diagnostics (`server.py`)
+- [ ] `GET /broker/scheduler/diagnostics` — scheduler internals
+- [ ] `GET /broker/queue/details` — per-request breakdown
+- [ ] `GET /broker/inflight` — inflight models and pending ops
+- [ ] Write tests for all three endpoints (auth, response shape, edge cases)
+
+#### Agent 2: Wave 1 Endpoints — A2A + Residency (`server.py`, `a2a.py`)
+- [ ] `GET /a2a/leases` — active leases with full state
+- [ ] `GET /broker/residency` — resident models, VRAM, cache age
+- [ ] `GET /broker/profiles` — session profiles from config
+- [ ] Write tests for all three endpoints
+
+#### Agent 3: Wave 2 Endpoints (`server.py`)
+- [ ] `GET /broker/config` — running config with token redaction
+- [ ] `GET /broker/audit` — JSONL audit log query with filters
+- [ ] `GET /broker/vram-journal` — VRAM journal query
+- [ ] `GET /broker/metrics?format=json` — JSON metrics export
+- [ ] Write tests for all four endpoints
+
+#### Agent 4: Middleware + Security Fixes
+- [ ] RequestID middleware class (~20 lines) following MetricsMiddleware pattern
+- [ ] Register RequestID middleware in both app factories
+- [ ] Apply `RateLimitMiddleware` to `create_admin_app()` (1-line fix)
+- [ ] Write tests for RequestID injection, passthrough, correlation
+- [ ] Write test for admin rate limiting in two-port mode
+
+### Verification
+```bash
+/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/ -v
+```
+Confirm: All 14 new endpoints return expected data. RequestID appears in response headers. Admin routes are rate-limited in two-port mode.
+
+---
+
+## Phase 4: "The Dashboard Sees All" — TUI Enhancement
+
+**Depends on**: Phase 3 (new endpoints must exist for dashboard to consume)
+**Estimated agents**: 3 parallel
+
+### Tasks
+
+#### Agent 1: Dashboard Data Integration (`dashboard.py`)
+- [ ] Consume `/broker/scheduler/diagnostics` — swap rate level with color coding, cooldown state
+- [ ] Consume `/broker/queue/details` — per-request age, priority, client in queue panel
+- [ ] Consume enhanced `/broker/status` — all new fields (circuit breaker, inflight, stall)
+- [ ] Remove hardcoded values, read from API (VRAM budget already done in Phase 1)
+
+#### Agent 2: Dashboard Alerts + A2A (`dashboard.py`)
+- [ ] Add visual alerts: swap_rate critical (red), circuit breaker open (banner), VRAM >90% (warning)
+- [ ] Add stall duration alert (>30s)
+- [ ] Consume `/a2a/stats` — pressure level, subscriber count
+- [ ] Consume `/a2a/leases` — active leases panel
+- [ ] Queue request age highlighting
+
+#### Agent 3: SSE Streaming + Grafana Artifacts
+- [ ] Create `GET /broker/status/stream` SSE endpoint in `server.py` (~30 lines)
+- [ ] Optionally wire dashboard to consume SSE with polling fallback
+- [ ] Create `config/grafana/bastion-dashboard.json`
+- [ ] Create `config/prometheus/scrape.yml`
+- [ ] Create `config/prometheus/alerts.yml`
+- [ ] Write tests for SSE endpoint
+
+### Verification
+```bash
+/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/ -v
+```
+Confirm: Dashboard shows all 12 new data dimensions. Alert conditions trigger visual changes. SSE endpoint streams events. Grafana artifacts are valid JSON/YAML.
+
+---
+
+## Phase 5: Integration Testing + Documentation
+
+**Depends on**: All previous phases
+**Estimated agents**: 2 parallel
+
+### Tasks
+
+#### Agent 1: Integration Tests
+- [ ] End-to-end test: submit request -> verify it appears in queue/details -> verify metrics increment -> verify audit log entry -> verify RequestID correlation
+- [ ] Verify all 14 new endpoints in two-port mode
+- [ ] Verify backward compatibility: existing client code still works
+- [ ] Run full test suite, fix any regressions
+
+#### Agent 2: Documentation Update
+- [ ] Update `docs/api.md` with all 14 new endpoints
+- [ ] Update `docs/architecture.md` with observability layer description
+- [ ] Update `README.md` with observability section (Prometheus, Grafana, dashboard)
+- [ ] Update `config/broker.example.yaml` with any new config options
+- [ ] Update `ROADMAP.md` — mark observability items as completed
+
+### Verification
+```bash
+/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/ -v
+```
+Full green. Documentation matches implementation.
+
+---
+
+## Parallelization Map
+
+```
+Phase 1 (3 agents)  ──────┐
+                           ├──> Phase 3 (4 agents) ──> Phase 4 (3 agents) ──> Phase 5 (2 agents)
+Phase 2 (3 agents)  ──────┘
+```
+
+Phases 1 and 2 can run in parallel (independent concerns).
+Phase 3 depends on Phase 1 (needs wired status fields).
+Phase 4 depends on Phase 3 (needs new endpoints).
+Phase 5 depends on all phases.
+
+## Total Agent Usage
+
+| Phase | Agents | Focus |
+|-------|--------|-------|
+| 1 | 3 | Status wiring, model fixes, A2A stats |
+| 2 | 3 | Scheduler metrics, non-scheduler metrics, gauge updater |
+| 3 | 4 | Diagnostics endpoints, A2A endpoints, query endpoints, middleware |
+| 4 | 3 | Dashboard data, dashboard alerts, SSE + Grafana |
+| 5 | 2 | Integration tests, documentation |
+| **Total** | **15 agents across 5 phases** | |
+
+## Deliverables Checklist
+
+At the end of all phases, verify:
+- [ ] `/broker/status` returns 7+ new fields (vram_ledger, total_requests_served, swap_rate_level, stall_reason, inflight_models, circuit_breaker, max_vram_gb)
+- [ ] All 17 Prometheus metrics emit data
+- [ ] All 5 OTel spans produce traces
+- [ ] 14 new API endpoints functional and authenticated
+- [ ] RequestID middleware active on all routes
+- [ ] Dashboard shows 12 additional data dimensions
+- [ ] 6 alert conditions trigger visual changes
+- [ ] SSE streaming endpoint operational
+- [ ] Grafana dashboard JSON + Prometheus config shipped
+- [ ] Admin routes rate-limited in two-port mode
+- [ ] All tests pass
+- [ ] Documentation updated
