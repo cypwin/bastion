@@ -38,7 +38,7 @@ class TemperaturePanel(Static):
                 style, status = "yellow", "?"
             else:
                 style, status = "green", "ok"
-            table.add_row("CPU", f"[{style}]{cpu_temp}°C[/]", f"[{style}]{status}[/]")
+            table.add_row("CPU", f"[{style}]{cpu_temp}\u00b0C[/]", f"[{style}]{status}[/]")
 
         if nvme_temps:
             has_any = True
@@ -50,7 +50,7 @@ class TemperaturePanel(Static):
                 else:
                     style, status = "green", "ok"
                 label = f"NVMe{i}" if len(nvme_temps) > 1 else "NVMe"
-                table.add_row(label, f"[{style}]{t}°C[/]", f"[{style}]{status}[/]")
+                table.add_row(label, f"[{style}]{t}\u00b0C[/]", f"[{style}]{status}[/]")
 
         if gpu_temp is not None:
             has_any = True
@@ -60,7 +60,7 @@ class TemperaturePanel(Static):
                 style, status = "dark_orange", "?"
             else:
                 style, status = "green", "ok"
-            table.add_row("GPU", f"[{style}]{gpu_temp}°C[/]", f"[{style}]{status}[/]")
+            table.add_row("GPU", f"[{style}]{gpu_temp}\u00b0C[/]", f"[{style}]{status}[/]")
 
         if not has_any:
             table.add_row("[dim](no sensors)[/]", "", "")
