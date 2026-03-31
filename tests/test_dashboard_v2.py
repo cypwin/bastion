@@ -94,3 +94,52 @@ def test_core_char_critical() -> None:
     char, style = core_char(95.0)
     assert char == "#"
     assert "red" in style
+
+
+# ---------------------------------------------------------------------------
+# SystemDataCollector tests
+# ---------------------------------------------------------------------------
+
+from bastion.dashboard.collectors import SystemDataCollector
+
+
+def test_collector_init() -> None:
+    c = SystemDataCollector()
+    assert len(c.cpu_history) == 0
+    assert len(c.net_recv_history) == 0
+    assert len(c.net_sent_history) == 0
+
+
+def test_collector_get_cpu_data() -> None:
+    c = SystemDataCollector()
+    data = c.get_cpu_data()
+    assert "percent" in data
+    assert "per_core" in data
+    assert "load_avg" in data
+    assert isinstance(data["per_core"], list)
+
+
+def test_collector_get_network_data() -> None:
+    c = SystemDataCollector()
+    data1 = c.get_network_data()
+    assert "recv_rate" in data1
+    assert "sent_rate" in data1
+    assert "recv_total_gb" in data1
+    assert "sent_total_gb" in data1
+
+
+def test_collector_get_memory_data() -> None:
+    c = SystemDataCollector()
+    data = c.get_memory_data()
+    if data is not None:
+        assert "total_gb" in data
+        assert "used_gb" in data
+        assert "percent" in data
+
+
+def test_collector_cpu_per_core_chars() -> None:
+    c = SystemDataCollector()
+    data = c.get_cpu_data()
+    text = c.cpu_per_core_text()
+    assert text is not None
+    assert len(text) > 0
