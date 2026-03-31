@@ -24,8 +24,8 @@ class SafetyLimitsBar(Static):
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        self.max_vram_gb: float = max_vram_gb
-        self.max_temp_c: int = max_temp_c
+        self._max_vram_gb: float = max_vram_gb
+        self._max_temp_c: int = max_temp_c
 
     def update_limits(
         self,
@@ -34,16 +34,16 @@ class SafetyLimitsBar(Static):
     ) -> None:
         """Update threshold values.  ``None`` or zero leaves unchanged."""
         if max_vram_gb is not None and max_vram_gb > 0:
-            self.max_vram_gb = max_vram_gb
+            self._max_vram_gb = max_vram_gb
         if max_temp_c is not None and max_temp_c > 0:
-            self.max_temp_c = max_temp_c
+            self._max_temp_c = max_temp_c
 
     def render(self) -> Text:  # type: ignore[override]
         """Return a dim reference line with safe operating thresholds."""
-        throttle = self.max_temp_c + 5
+        throttle = self._max_temp_c + 5
         return Text(
-            f"VRAM: <{self.max_vram_gb}GB safe"
-            f" | GPU: <{self.max_temp_c}\u00b0C OK,"
+            f"VRAM: <{self._max_vram_gb}GB safe"
+            f" | GPU: <{self._max_temp_c}\u00b0C OK,"
             f" {throttle}\u00b0C throttle"
             " | CPU: <85\u00b0C sustained, <95\u00b0C spike",
             style="dim",
