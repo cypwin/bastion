@@ -27,24 +27,31 @@ import subprocess
 import sys
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import httpx
 from rich.table import Table
 from rich.text import Text
+
+try:
+    import psutil
+
+    _HAS_PSUTIL = True
+except ImportError:
+    psutil = None  # type: ignore[assignment]
+    _HAS_PSUTIL = False
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Header, Label, Static
-
+from textual.widgets import Button, Footer, Label, Static
 
 # ---------------------------------------------------------------------------
 # Color helpers
 # ---------------------------------------------------------------------------
 
-def temp_color(temp: Optional[int]) -> str:
+def temp_color(temp: int | None) -> str:
     """Return a rich color string for GPU temperature."""
     if temp is None:
         return "dim"
@@ -57,7 +64,7 @@ def temp_color(temp: Optional[int]) -> str:
     return "red bold"
 
 
-def usage_color(pct: Optional[float]) -> str:
+def usage_color(pct: float | None) -> str:
     """Return a rich color string for utilization percentage."""
     if pct is None:
         return "dim"
@@ -149,7 +156,7 @@ def sparkline(values: list[float], width: int = 20) -> str:
     return "".join(blocks[min(int((v - lo) / span * 8), 8)] for v in recent)
 
 
-def vram_bar(used_mb: Optional[int], total_mb: Optional[int], width: int = 16) -> Text:
+def vram_bar(used_mb: int | None, total_mb: int | None, width: int = 16) -> Text:
     """Render a VRAM usage bar with color."""
     if used_mb is None or total_mb is None or total_mb == 0:
         return Text("no data", style="dim")
@@ -164,14 +171,14 @@ def vram_bar(used_mb: Optional[int], total_mb: Optional[int], width: int = 16) -
     return bar
 
 
-def format_bytes_gb(b: Optional[int]) -> str:
+def format_bytes_gb(b: int | None) -> str:
     """Format bytes as GB string."""
     if b is None:
         return "n/a"
     return f"{b / (1024 * 1024 * 1024):.1f}GB"
 
 
-def format_bytes_mb(b: Optional[int]) -> str:
+def format_bytes_mb(b: int | None) -> str:
     """Format bytes as MB string."""
     if b is None:
         return "n/a"
@@ -182,11 +189,15 @@ def format_bytes_mb(b: Optional[int]) -> str:
 # Fan control constants
 # ---------------------------------------------------------------------------
 
-FAN_WRAPPER_PATH = Path(__file__).resolve().parent.parent.parent / "scripts" / "gpu_fan_control_wrapper.py"
+FAN_WRAPPER_PATH = (
+    Path(__file__).resolve().parent.parent.parent
+    / "scripts"
+    / "gpu_fan_control_wrapper.py"
+)
 FAN_PYTHON_PATH = Path(sys.executable)
 
 
-def _read_cpu_temp() -> Optional[float]:
+def _read_cpu_temp() -> float | None:
     """Read CPU temperature from sysfs (k10temp AMD or coretemp Intel)."""
     try:
         hwmon_path = Path("/sys/class/hwmon")
@@ -201,6 +212,79 @@ def _read_cpu_temp() -> Optional[float]:
     except Exception:
         pass
     return None
+
+
+def _read_nvme_temps() -> list[tuple[str, float]]:
+    """Read NVMe drive temperatures from sysfs hwmon."""
+    temps: list[tuple[str, float]] = []
+    try:
+        hwmon_path = Path("/sys/class/hwmon")
+        for hwmon in sorted(hwmon_path.iterdir()):
+            name_file = hwmon / "name"
+            if name_file.exists():
+                name = name_file.read_text().strip()
+                if name == "nvme":
+                    temp_file = hwmon / "temp1_input"
+                    if temp_file.exists():
+                        temp_c = int(temp_file.read_text().strip()) / 1000
+                        # Try to get a descriptive label from device model
+                        label = hwmon.name
+                        model_file = hwmon / "device" / "model"
+                        if model_file.exists():
+                            label = model_file.read_text().strip()[:12]
+                        temps.append((label, temp_c))
+    except Exception:
+        pass
+    return temps
+
+
+def _read_system_memory() -> dict[str, float] | None:
+    """Read system RAM and swap usage via psutil."""
+    if not _HAS_PSUTIL:
+        return None
+    try:
+        mem = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        return {
+            "total_gb": mem.total / (1024**3),
+            "used_gb": mem.used / (1024**3),
+            "available_gb": mem.available / (1024**3),
+            "percent": mem.percent,
+            "swap_used_gb": swap.used / (1024**3),
+            "swap_percent": swap.percent,
+        }
+    except Exception:
+        return None
+
+
+def _get_top_cpu_processes(n: int = 8) -> list[dict[str, Any]]:
+    """Get top *n* CPU-consuming processes via psutil."""
+    if not _HAS_PSUTIL:
+        return []
+    processes: list[dict[str, Any]] = []
+    try:
+        for proc in psutil.process_iter(
+            ["pid", "name", "cpu_percent", "memory_percent", "memory_info"],
+        ):
+            try:
+                info = proc.info
+                if info["cpu_percent"] is not None and info["cpu_percent"] > 0.1:
+                    mem_mb = 0.0
+                    if info.get("memory_info"):
+                        mem_mb = info["memory_info"].rss / (1024**2)
+                    processes.append({
+                        "pid": info["pid"],
+                        "name": (info["name"] or "?")[:18],
+                        "cpu_percent": info["cpu_percent"],
+                        "mem_percent": info["memory_percent"] or 0,
+                        "mem_mb": mem_mb,
+                    })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        processes.sort(key=lambda x: x["cpu_percent"], reverse=True)
+    except Exception:
+        pass
+    return processes[:n]
 
 
 def _query_gpu_processes() -> list[dict[str, str]]:
@@ -265,7 +349,7 @@ class BastionClient:
             headers["Authorization"] = f"Bearer {api_key}"
         self._client = httpx.AsyncClient(timeout=5.0, headers=headers)
 
-    async def poll(self) -> Dict[str, Any]:
+    async def poll(self) -> dict[str, Any]:
         """Fetch /broker/status and return parsed JSON."""
         resp = await self._client.get(f"{self.base_url}/broker/status")
         resp.raise_for_status()
@@ -353,7 +437,7 @@ class BastionClient:
 class GPUPanel(Static):
     """GPU temperature, VRAM, and power status."""
 
-    def render_data(self, data: Dict[str, Any]) -> Table:
+    def render_data(self, data: dict[str, Any]) -> Table:
         gpu = data.get("gpu", {})
         temp = gpu.get("temperature_c")
         used = gpu.get("vram_used_mb")
@@ -380,9 +464,15 @@ class GPUPanel(Static):
         # Sparkline rows for VRAM and temperature history
         app = self.app
         if hasattr(app, "vram_history") and app.vram_history:
-            table.add_row("VRAM  \u2581\u2582", Text(sparkline(list(app.vram_history)), style="cyan"))
+            table.add_row(
+                "VRAM  \u2581\u2582",
+                Text(sparkline(list(app.vram_history)), style="cyan"),
+            )
         if hasattr(app, "temp_history") and app.temp_history:
-            table.add_row("Temp  \u2581\u2582", Text(sparkline(list(app.temp_history)), style=temp_color(temp)))
+            table.add_row(
+                "Temp  \u2581\u2582",
+                Text(sparkline(list(app.temp_history)), style=temp_color(temp)),
+            )
 
         return table
 
@@ -390,7 +480,7 @@ class GPUPanel(Static):
 class ModelsPanel(Static):
     """Currently loaded models in Ollama."""
 
-    def render_data(self, data: Dict[str, Any]) -> Table:
+    def render_data(self, data: dict[str, Any]) -> Table:
         loaded = data.get("loaded_models", [])
         current = data.get("current_model")
 
@@ -418,7 +508,7 @@ class ModelsPanel(Static):
 class QueuePanel(Static):
     """Queue depth by model, scheduler state, and stall diagnostics."""
 
-    def render_data(self, data: Dict[str, Any], queue_diag: Optional[Dict[str, Any]] = None) -> Table:
+    def render_data(self, data: dict[str, Any], queue_diag: dict[str, Any] | None = None) -> Table:
         by_model = data.get("queue_by_model", {})
         total = data.get("queue_depth", 0)
         state = data.get("state", "unknown")
@@ -470,7 +560,7 @@ class QueuePanel(Static):
 class SchedulerPanel(Static):
     """Scheduler uptime, requests served, model swaps."""
 
-    def render_data(self, data: Dict[str, Any]) -> Table:
+    def render_data(self, data: dict[str, Any]) -> Table:
         uptime = data.get("uptime_seconds", 0)
         served = data.get("total_requests_served", 0)
         swaps = data.get("total_model_swaps", 0)
@@ -495,23 +585,23 @@ class ConnectionPanel(Static):
         super().__init__(**kwargs)
         self.url = url
         self.connected = False
-        self.last_ok: Optional[str] = None
-        self.last_error: Optional[str] = None
+        self.last_ok: str | None = None
+        self.last_error: str | None = None
         self.consecutive_failures: int = 0
-        self.next_retry_at: Optional[float] = None
+        self.next_retry_at: float | None = None
 
     def render_data(
         self,
         connected: bool,
-        error: Optional[str] = None,
+        error: str | None = None,
         consecutive_failures: int = 0,
-        next_retry_at: Optional[float] = None,
+        next_retry_at: float | None = None,
     ) -> Table:
         self.connected = connected
         self.consecutive_failures = consecutive_failures
         self.next_retry_at = next_retry_at
         if connected:
-            self.last_ok = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            self.last_ok = datetime.now(UTC).strftime("%H:%M:%S")
             self.last_error = None
         else:
             self.last_error = error or "connection failed"
@@ -572,7 +662,7 @@ class AlertPanel(Static):
         "critical": "CRIT",
     }
 
-    def render_data(self, alerts: List[Dict[str, Any]]) -> Table:
+    def render_data(self, alerts: list[dict[str, Any]]) -> Table:
         """Render active alerts as a severity-colored table."""
         table = Table(
             title="Alerts",
@@ -597,13 +687,36 @@ class AlertPanel(Static):
 
 
 class SafetyLimitsBar(Static):
-    """VRAM budget visualization bar (26 GB budget)."""
+    """VRAM budget visualization bar.
 
-    VRAM_BUDGET_GB = 26.0  # Total minus headroom
+    Budget is read from the ``/broker/status`` response field
+    ``max_vram_gb`` (``GPUConfig.max_vram_gb``).  Falls back to
+    ``_DEFAULT_VRAM_BUDGET_GB`` when the field is absent (backward
+    compatibility with older BASTION versions).
+    """
+
+    _DEFAULT_VRAM_BUDGET_GB: float = 26.0  # Fallback when API field missing
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.vram_budget_gb: float = self._DEFAULT_VRAM_BUDGET_GB
+
+    def update_budget(self, max_vram_gb: float | None) -> None:
+        """Update the VRAM budget from the ``/broker/status`` response.
+
+        Parameters
+        ----------
+        max_vram_gb : float | None
+            Value of ``max_vram_gb`` from the API.  ``None`` or zero
+            leaves the budget unchanged (backward-compat fallback).
+        """
+        if max_vram_gb is not None and max_vram_gb > 0:
+            self.vram_budget_gb = max_vram_gb
 
     def render_data(self, used_gb: float) -> Text:
         """Render a colored horizontal bar showing VRAM budget usage."""
-        pct = (used_gb / self.VRAM_BUDGET_GB * 100) if self.VRAM_BUDGET_GB > 0 else 0.0
+        budget = self.vram_budget_gb
+        pct = (used_gb / budget * 100) if budget > 0 else 0.0
         pct = min(pct, 100.0)
 
         bar_width = 30
@@ -625,7 +738,7 @@ class SafetyLimitsBar(Static):
         bar.append("=" * filled, style=color)
         bar.append("-" * empty, style="dim")
         bar.append("] ")
-        bar.append(f"{used_gb:.1f}/{self.VRAM_BUDGET_GB:.1f} GB", style=color)
+        bar.append(f"{used_gb:.1f}/{budget:.1f} GB", style=color)
         return bar
 
 
@@ -636,7 +749,7 @@ class SafetyLimitsBar(Static):
 class CircuitBreakerPanel(Static):
     """Circuit breaker state, failure count, and recovery countdown."""
 
-    def render_data(self, health_data: Dict[str, Any]) -> Table:
+    def render_data(self, health_data: dict[str, Any]) -> Table:
         circuit_state = health_data.get("circuit", "n/a")
         healthy = health_data.get("healthy")
         reason = health_data.get("reason", "")
@@ -668,7 +781,7 @@ class CircuitBreakerPanel(Static):
 class VRAMLedgerPanel(Static):
     """VRAM budget panel showing VRAMManager's allocated/reserved ledger."""
 
-    def render_data(self, ledger: Dict[str, Any]) -> Table:
+    def render_data(self, ledger: dict[str, Any]) -> Table:
         table = Table(title="VRAM Ledger", expand=True, show_edge=False, pad_edge=False)
         table.add_column("key", style="bold", width=12)
         table.add_column("value")
@@ -716,7 +829,10 @@ class VRAMLedgerPanel(Static):
             status_style = "green" if committed else "yellow"
             table.add_row(
                 Text(f"  {model[:10]}", style="dim"),
-                Text(f"{format_bytes_mb(vram_bytes)} {status_str} ({age:.0f}s)", style=status_style),
+                Text(
+                    f"{format_bytes_mb(vram_bytes)} {status_str} ({age:.0f}s)",
+                    style=status_style,
+                ),
             )
 
         return table
@@ -725,7 +841,7 @@ class VRAMLedgerPanel(Static):
 class A2ATaskPanel(Static):
     """Active A2A tasks display showing state and skill types."""
 
-    def render_data(self, status_data: Dict[str, Any]) -> Table:
+    def render_data(self, status_data: dict[str, Any]) -> Table:
         table = Table(title="A2A Tasks", expand=True, show_edge=False, pad_edge=False)
         table.add_column("key", style="bold", width=10)
         table.add_column("value")
@@ -773,7 +889,7 @@ class A2ATaskPanel(Static):
 class LeasePanel(Static):
     """Active model leases/reservations panel."""
 
-    def render_data(self, status_data: Dict[str, Any]) -> Table:
+    def render_data(self, status_data: dict[str, Any]) -> Table:
         table = Table(title="Leases", expand=True, show_edge=False, pad_edge=False)
         table.add_column("key", style="bold", width=12)
         table.add_column("value")
@@ -870,7 +986,7 @@ class AuditStreamPanel(Static):
 class WatchdogPanel(Static):
     """Process monitor status: Ollama health and GPU responsiveness."""
 
-    def render_data(self, watchdog_data: Dict[str, Any]) -> Table:
+    def render_data(self, watchdog_data: dict[str, Any]) -> Table:
         table = Table(title="Watchdog", expand=True, show_edge=False, pad_edge=False)
         table.add_column("key", style="bold", width=12)
         table.add_column("value")
@@ -927,10 +1043,179 @@ class WatchdogPanel(Static):
         last_check = watchdog_data.get("last_check")
         if last_check is not None:
             try:
-                dt = datetime.fromtimestamp(last_check, tz=timezone.utc)
+                dt = datetime.fromtimestamp(last_check, tz=UTC)
                 table.add_row("Checked", dt.strftime("%H:%M:%S"))
             except (ValueError, OSError, TypeError):
                 pass
+
+        return table
+
+
+# ---------------------------------------------------------------------------
+# System monitoring panels (ported from PHENOTYPE System Monitor v3)
+# ---------------------------------------------------------------------------
+
+
+class TemperaturePanel(Static):
+    """System-wide component temperature monitoring (CPU, NVMe, GPU)."""
+
+    def render_data(self, gpu_temp: int | None = None) -> Table:
+        table = Table(
+            title="Temperatures", expand=True, show_edge=False, pad_edge=False,
+        )
+        table.add_column("Component", style="cyan", ratio=2)
+        table.add_column("Temp", justify="right", ratio=1)
+        table.add_column("", width=3)
+
+        has_data = False
+
+        # CPU temperature
+        cpu_temp = _read_cpu_temp()
+        if cpu_temp is not None:
+            has_data = True
+            if cpu_temp >= 90:
+                color, status = "red bold", "!"
+            elif cpu_temp >= 75:
+                color, status = "yellow", "?"
+            else:
+                color, status = "green", "ok"
+            table.add_row("CPU", Text(f"{cpu_temp:.1f}\u00b0C", style=color), status)
+
+        # NVMe drives
+        nvme_temps = _read_nvme_temps()
+        for model, temp in nvme_temps:
+            has_data = True
+            if temp >= 75:
+                color, status = "red bold", "!"
+            elif temp >= 60:
+                color, status = "yellow", "?"
+            else:
+                color, status = "green", "ok"
+            table.add_row(model, Text(f"{temp:.1f}\u00b0C", style=color), status)
+
+        # GPU temperature (from BASTION API data)
+        if gpu_temp is not None:
+            has_data = True
+            if gpu_temp >= 85:
+                color, status = "red bold", "!"
+            elif gpu_temp >= 75:
+                color, status = "dark_orange", "?"
+            else:
+                color, status = "green", "ok"
+            table.add_row("GPU", Text(f"{gpu_temp}\u00b0C", style=color), status)
+
+        if not has_data:
+            table.add_row(Text("(no sensors)", style="dim"), "", "")
+
+        return table
+
+
+class MemoryPanel(Static):
+    """System RAM and swap usage panel."""
+
+    def render_data(self) -> Table:
+        table = Table(
+            title="Memory", expand=True, show_edge=False, pad_edge=False,
+        )
+        table.add_column("Metric", style="cyan", ratio=2)
+        table.add_column("Value", justify="right", ratio=1)
+
+        mem = _read_system_memory()
+        if mem is None:
+            table.add_row(Text("(psutil not available)", style="dim"), "")
+            return table
+
+        color = usage_color(mem["percent"])
+        table.add_row(
+            "RAM",
+            Text(
+                f"{mem['used_gb']:.1f}/{mem['total_gb']:.0f}GB ({mem['percent']:.0f}%)",
+                style=color,
+            ),
+        )
+        table.add_row(
+            "Available",
+            Text(f"{mem['available_gb']:.1f} GB", style="green"),
+        )
+
+        if mem["swap_used_gb"] > 0.01:
+            swap_color = usage_color(mem["swap_percent"])
+            table.add_row(
+                "Swap",
+                Text(
+                    f"{mem['swap_used_gb']:.2f} GB ({mem['swap_percent']:.0f}%)",
+                    style=swap_color,
+                ),
+            )
+
+        return table
+
+
+class CPUInfoPanel(Static):
+    """CPU overview with load, frequency, cores, and top processes."""
+
+    def render_data(self) -> Table:
+        table = Table(
+            title="CPU / Processes", expand=True, show_edge=False, pad_edge=False,
+        )
+        table.add_column("", ratio=2)
+        table.add_column("", justify="right", ratio=1)
+
+        if not _HAS_PSUTIL:
+            table.add_row(Text("(psutil not available)", style="dim"), "")
+            return table
+
+        # Overall CPU usage
+        cpu_pct = psutil.cpu_percent(interval=None)
+        color = usage_color(cpu_pct)
+        table.add_row(Text("Overall", style="bold"), Text(f"{cpu_pct:.0f}%", style=color))
+
+        # Load average
+        try:
+            load1, load5, load15 = psutil.getloadavg()
+            table.add_row(
+                Text("Load", style="bold"),
+                f"{load1:.1f} {load5:.1f} {load15:.1f}",
+            )
+        except (AttributeError, OSError):
+            pass
+
+        # Core count
+        cores = psutil.cpu_count(logical=True)
+        if cores:
+            table.add_row(Text("Cores", style="bold"), str(cores))
+
+        # Frequency
+        try:
+            freq = psutil.cpu_freq()
+            if freq:
+                table.add_row(
+                    Text("Freq", style="bold"), f"{freq.current:.0f} MHz",
+                )
+        except Exception:
+            pass
+
+        # Separator before process list
+        table.add_row("", "")
+
+        # Top CPU processes
+        procs = _get_top_cpu_processes(6)
+        if procs:
+            table.add_row(
+                Text("Process", style="bold cyan"),
+                Text("CPU    MEM", style="bold cyan"),
+            )
+            for proc in procs:
+                cpu_color = usage_color(proc["cpu_percent"])
+                table.add_row(
+                    proc["name"],
+                    Text(
+                        f"{proc['cpu_percent']:5.1f}% {proc['mem_mb']:5.0f}MB",
+                        style=cpu_color,
+                    ),
+                )
+        else:
+            table.add_row(Text("(no active processes)", style="dim"), "")
 
         return table
 
@@ -1301,10 +1586,10 @@ class StatusBar(Static):
 
     def render_status(
         self,
-        data: Optional[Dict[str, Any]],
+        data: dict[str, Any] | None,
         connected: bool,
         stale: bool = False,
-        last_ok_time: Optional[str] = None,
+        last_ok_time: str | None = None,
     ) -> Text:
         now = datetime.now().strftime("%H:%M:%S")
         line = Text()
@@ -1477,6 +1762,24 @@ WatchdogPanel {
     min-height: 6;
     border: round darkorange;
 }
+
+TemperaturePanel {
+    height: auto;
+    min-height: 6;
+    border: round red;
+}
+
+MemoryPanel {
+    height: auto;
+    min-height: 5;
+    border: round green;
+}
+
+CPUInfoPanel {
+    height: auto;
+    min-height: 10;
+    border: round blue;
+}
 """
 
 
@@ -1505,7 +1808,7 @@ class BastionDashboard(App):
         super().__init__(**kwargs)
         self.client = BastionClient(url, api_key=api_key)
         self.interval = interval
-        self.last_data: Optional[Dict[str, Any]] = None
+        self.last_data: dict[str, Any] | None = None
         self.connected = False
         self.vram_history: deque[float] = deque(maxlen=60)
         self.temp_history: deque[float] = deque(maxlen=60)
@@ -1514,10 +1817,10 @@ class BastionDashboard(App):
         self.audit_events: deque[dict] = deque(maxlen=50)
         # Connection health tracking (B5)
         self._consecutive_failures: int = 0
-        self._next_retry_at: Optional[float] = None
+        self._next_retry_at: float | None = None
         self._backoff_base: float = 2.0
         self._backoff_max: float = 60.0
-        self._last_ok_time: Optional[str] = None
+        self._last_ok_time: str | None = None
         # Auto-fan: CPU-triggered GPU fan escalation (S12)
         self._auto_fan_enabled: bool = True
         self._auto_fan_state: str = "idle"  # "idle" or "active"
@@ -1530,15 +1833,17 @@ class BastionDashboard(App):
         with Horizontal(id="main"):
             with VerticalScroll(id="left-col"):
                 yield GPUPanel(id="gpu")
+                yield TemperaturePanel(id="temperatures")
+                yield MemoryPanel(id="memory")
+                yield CPUInfoPanel(id="cpu-info")
                 yield ModelsPanel(id="models")
-                yield SafetyLimitsBar(id="safety-bar")
-                yield AlertPanel(id="alerts")
             with VerticalScroll(id="mid-col"):
                 yield QueuePanel(id="queue")
                 yield SchedulerPanel(id="scheduler")
                 yield CircuitBreakerPanel(id="circuit-breaker")
                 yield WatchdogPanel(id="watchdog")
                 yield VRAMLedgerPanel(id="vram-ledger")
+                yield AlertPanel(id="alerts")
             with VerticalScroll(id="right-col"):
                 yield TracePanel(id="trace")
                 yield A2ATaskPanel(id="a2a-tasks")
@@ -1548,6 +1853,9 @@ class BastionDashboard(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        # Prime psutil CPU measurement so first poll returns meaningful values
+        if _HAS_PSUTIL:
+            psutil.cpu_percent(interval=None)
         self.set_interval(self.interval, self.refresh_data)
         # Immediately fire one poll
         self.call_later(self.refresh_data)
@@ -1562,7 +1870,7 @@ class BastionDashboard(App):
 
     async def refresh_data(self) -> None:
         """Poll BASTION and update all panels."""
-        error_msg: Optional[str] = None
+        error_msg: str | None = None
         health_data: dict = {}
         vram_ledger: dict = {}
         watchdog_data: dict = {}
@@ -1580,7 +1888,7 @@ class BastionDashboard(App):
             self.connected = True
             self._consecutive_failures = 0
             self._next_retry_at = None
-            self._last_ok_time = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            self._last_ok_time = datetime.now(UTC).strftime("%H:%M:%S")
 
             # Accumulate history for sparklines
             gpu = data.get("gpu", {})
@@ -1623,6 +1931,17 @@ class BastionDashboard(App):
         if data:
             gpu_panel.update(gpu_panel.render_data(data))
 
+        # Update system monitoring panels (temperatures, memory, CPU/processes)
+        gpu_temp = data.get("gpu", {}).get("temperature_c") if data else None
+        temp_panel: TemperaturePanel = self.query_one("#temperatures", TemperaturePanel)
+        temp_panel.update(temp_panel.render_data(gpu_temp=gpu_temp))
+
+        mem_panel: MemoryPanel = self.query_one("#memory", MemoryPanel)
+        mem_panel.update(mem_panel.render_data())
+
+        cpu_panel: CPUInfoPanel = self.query_one("#cpu-info", CPUInfoPanel)
+        cpu_panel.update(cpu_panel.render_data())
+
         models_panel: ModelsPanel = self.query_one("#models", ModelsPanel)
         if data:
             models_panel.update(models_panel.render_data(data))
@@ -1646,14 +1965,6 @@ class BastionDashboard(App):
         # Update alert panel
         alert_panel: AlertPanel = self.query_one("#alerts", AlertPanel)
         alert_panel.update(alert_panel.render_data(list(self.alert_history)))
-
-        # Update safety limits bar
-        safety_bar: SafetyLimitsBar = self.query_one("#safety-bar", SafetyLimitsBar)
-        if data:
-            gpu_data = data.get("gpu", {})
-            used_mb = gpu_data.get("vram_used_mb")
-            if used_mb is not None:
-                safety_bar.update(safety_bar.render_data(used_mb / 1024))
 
         # Update request trace panel
         trace_panel: TracePanel = self.query_one("#trace", TracePanel)
@@ -1710,7 +2021,7 @@ class BastionDashboard(App):
         for req in recent[:10]:
             ts = req.get("timestamp", 0)
             try:
-                iso_ts = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+                iso_ts = datetime.fromtimestamp(ts, tz=UTC).isoformat()
             except (ValueError, OSError, TypeError):
                 iso_ts = str(ts)
             events.append({
@@ -1723,7 +2034,11 @@ class BastionDashboard(App):
             })
         return events
 
-    def _evaluate_alerts(self, data: Dict[str, Any], queue_diag: Optional[Dict[str, Any]] = None) -> None:
+    def _evaluate_alerts(
+        self,
+        data: dict[str, Any],
+        queue_diag: dict[str, Any] | None = None,
+    ) -> None:
         """Check thresholds and manage alert lifecycle."""
         now = time.monotonic()
 
@@ -1757,7 +2072,11 @@ class BastionDashboard(App):
                     "timestamp": now,
                     "key": "vram_crit",
                 })
-            elif vram_pct >= AlertPanel.VRAM_WARN_PCT and vram_pct < AlertPanel.VRAM_CRIT_PCT and "vram_warn" not in active_keys:
+            elif (
+                vram_pct >= AlertPanel.VRAM_WARN_PCT
+                and vram_pct < AlertPanel.VRAM_CRIT_PCT
+                and "vram_warn" not in active_keys
+            ):
                 active.append({
                     "severity": AlertPanel.SEVERITY_WARN,
                     "message": f"VRAM high: {vram_pct:.1f}% used",
@@ -1777,7 +2096,11 @@ class BastionDashboard(App):
                     "timestamp": now,
                     "key": "temp_crit",
                 })
-            elif temp >= AlertPanel.TEMP_WARN_C and temp < AlertPanel.TEMP_CRIT_C and "temp_warn" not in active_keys:
+            elif (
+                temp >= AlertPanel.TEMP_WARN_C
+                and temp < AlertPanel.TEMP_CRIT_C
+                and "temp_warn" not in active_keys
+            ):
                 active.append({
                     "severity": AlertPanel.SEVERITY_WARN,
                     "message": f"GPU temp high: {temp} C",
@@ -1805,7 +2128,11 @@ class BastionDashboard(App):
                 "timestamp": now,
                 "key": "queue_crit",
             })
-        elif queue_depth >= AlertPanel.QUEUE_WARN and queue_depth < AlertPanel.QUEUE_CRIT and "queue_warn" not in active_keys:
+        elif (
+            queue_depth >= AlertPanel.QUEUE_WARN
+            and queue_depth < AlertPanel.QUEUE_CRIT
+            and "queue_warn" not in active_keys
+        ):
             active.append({
                 "severity": AlertPanel.SEVERITY_WARN,
                 "message": f"Queue growing: {queue_depth} pending{stall_suffix}",
@@ -2039,7 +2366,7 @@ class BastionDashboard(App):
                         f"Restart failed (rc={proc.returncode}): {error}",
                         severity="error",
                     )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 self.notify("Restart timed out after 15s", severity="error")
             except Exception as exc:
                 self.notify(f"Restart failed: {exc}", severity="error")
@@ -2108,15 +2435,15 @@ def main() -> None:
     parser.add_argument(
         "--api-key",
         default=None,
-        help="API key for authentication (optional, reads from BASTION_API_KEY env if not provided)",
+        help=(
+            "API key for authentication (optional, reads from"
+            " BASTION_API_KEY env if not provided)"
+        ),
     )
     args = parser.parse_args()
 
     # Determine the admin URL for polling
-    if args.admin_url:
-        url = args.admin_url
-    else:
-        url = _detect_admin_url(args.url)
+    url = args.admin_url or _detect_admin_url(args.url)
 
     # Get API key from args or environment
     import os
