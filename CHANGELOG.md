@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `BASTION_DATA_DIR` / `BASTION_CONFIG_DIR` environment variable overrides
 - GPU auto-detection via nvidia-smi (VRAM, TDP) when `total_vram_gb: 0` in config
 - `--init-config` CLI flag to generate a starter config file
+- `--detect-models` CLI flag to discover installed Ollama models and generate YAML config
+- `bastion.discovery` module for model discovery with user guidance
+- `bastion.gpu` package — GPU backend abstraction with pluggable providers
+  - `GPUBackend` protocol, `NvidiaBackend` (nvidia-smi), `StubBackend` (no-op)
+  - Auto-detection via `detect_backend()` factory
+- 11 `BASTION_*` environment variable overrides for Docker/CI configuration
 - Graceful degradation for fan control (hidden when prerequisites absent)
 - `fan_control_available()` helper for checking fan control prerequisites
 - Python 3.13 to CI test matrix
@@ -22,11 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Default `total_vram_gb` from 32 (RTX 5090-specific) to 0 (auto-detect)
 - Default `max_power_watts` from 450 to 300 (conservative; auto-detect overrides)
 - Default `max_temperature_c` from 82 to 83
-- Default `headroom_gb` from 6 to 6 (unchanged, but example config updated from 8)
 - Config search path: `/etc/bastion/` only included on Linux (`sys.platform` guard)
 - Audit log path: from hardcoded `/tmp/bastion-audit.jsonl` to `~/.local/share/bastion/`
 - VRAM journal path: from hardcoded `/tmp/bastion-vram-journal.jsonl` to `~/.local/share/bastion/`
-- Config info log when no config file found now suggests `bastion --init-config`
+- `health.py` delegates to `gpu.get_backend()` instead of calling nvidia-smi directly
+- `watchdog.py` GPU check uses GPU backend abstraction
+- `dashboard/collectors.py` GPU process query uses GPU backend
+- Example config ships with empty `models: {}` and guidance comments
+- Startup messages improved: Ollama not running, no models, nvidia-smi missing
 - Version bumped to 0.3.0
 
 ### Fixed
