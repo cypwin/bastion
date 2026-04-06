@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 
-from bastion.models import BrokerConfig, GPUConfig, GPUStatus, LoadedModel, ModelInfo, SchedulerConfig
+from bastion.models import (
+    BrokerConfig,
+    GPUConfig,
+    GPUStatus,
+    LoadedModel,
+    ModelInfo,
+)
 from bastion.vram import ResidencyCache, VRAMTracker
 
 
@@ -63,7 +69,11 @@ class TestGetLoadedModels:
     @pytest.mark.asyncio
     async def test_connection_failure_returns_empty(self, vram_config):
         tracker = VRAMTracker(vram_config)
-        with patch.object(tracker._http, "get", new_callable=AsyncMock, side_effect=httpx.ConnectError("refused")):
+        with patch.object(
+            tracker._http, "get",
+            new_callable=AsyncMock,
+            side_effect=httpx.ConnectError("refused"),
+        ):
             models = await tracker.get_loaded_models()
 
         assert models == []
@@ -86,7 +96,10 @@ class TestCanLoadModel:
             request=httpx.Request("GET", "http://mock"),
         )
         with patch.object(tracker._http, "get", new_callable=AsyncMock, return_value=mock_resp), \
-             patch("bastion.vram.query_gpu_status", AsyncMock(return_value=GPUStatus(temperature_c=50))):
+             patch(
+                 "bastion.vram.query_gpu_status",
+                 AsyncMock(return_value=GPUStatus(temperature_c=50)),
+             ):
             can, reason = await tracker.can_load_model("qwen3:14b")
         assert can is True
         assert "already loaded" in reason.lower()
@@ -100,7 +113,10 @@ class TestCanLoadModel:
             request=httpx.Request("GET", "http://mock"),
         )
         with patch.object(tracker._http, "get", new_callable=AsyncMock, return_value=mock_resp), \
-             patch("bastion.vram.query_gpu_status", AsyncMock(return_value=GPUStatus(temperature_c=50))), \
+             patch(
+                 "bastion.vram.query_gpu_status",
+                 AsyncMock(return_value=GPUStatus(temperature_c=50)),
+             ), \
              patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=None)):
             can, reason = await tracker.can_load_model("qwen3:14b")
         assert can is True
@@ -118,7 +134,10 @@ class TestCanLoadModel:
             request=httpx.Request("GET", "http://mock"),
         )
         with patch.object(tracker._http, "get", new_callable=AsyncMock, return_value=mock_resp), \
-             patch("bastion.vram.query_gpu_status", AsyncMock(return_value=GPUStatus(temperature_c=50))):
+             patch(
+                 "bastion.vram.query_gpu_status",
+                 AsyncMock(return_value=GPUStatus(temperature_c=50)),
+             ):
             can, reason = await tracker.can_load_model("qwen3:14b")
         # qwen3:14b is already loaded, so it should pass
         assert can is True
@@ -126,7 +145,10 @@ class TestCanLoadModel:
     @pytest.mark.asyncio
     async def test_gpu_too_hot(self, vram_config):
         tracker = VRAMTracker(vram_config)
-        with patch("bastion.vram.query_gpu_status", AsyncMock(return_value=GPUStatus(temperature_c=90))):
+        with patch(
+            "bastion.vram.query_gpu_status",
+            AsyncMock(return_value=GPUStatus(temperature_c=90)),
+        ):
             can, reason = await tracker.can_load_model("qwen3:14b")
         assert can is False
         assert "hot" in reason.lower()
@@ -147,7 +169,11 @@ class TestUnloadModel:
     @pytest.mark.asyncio
     async def test_failed_unload(self, vram_config):
         tracker = VRAMTracker(vram_config)
-        with patch.object(tracker._http, "post", new_callable=AsyncMock, side_effect=httpx.ConnectError("refused")):
+        with patch.object(
+            tracker._http, "post",
+            new_callable=AsyncMock,
+            side_effect=httpx.ConnectError("refused"),
+        ):
             success = await tracker.unload_model("qwen3:14b")
         assert success is False
 
@@ -269,7 +295,10 @@ class TestNvidiaSmiHardGate:
             request=httpx.Request("GET", "http://mock"),
         )
         with patch.object(tracker._http, "get", new_callable=AsyncMock, return_value=mock_resp), \
-             patch("bastion.vram.query_gpu_status", AsyncMock(return_value=GPUStatus(temperature_c=50))), \
+             patch(
+                 "bastion.vram.query_gpu_status",
+                 AsyncMock(return_value=GPUStatus(temperature_c=50)),
+             ), \
              patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=5.0)):
             can, reason = await tracker.can_load_model("qwen3:14b")
 
@@ -287,14 +316,19 @@ class TestNvidiaSmiHardGate:
         )
         # qwen3:14b needs 9.3 + 2.0 = 11.3 GB free. We report 15 GB free.
         with patch.object(tracker._http, "get", new_callable=AsyncMock, return_value=mock_resp), \
-             patch("bastion.vram.query_gpu_status", AsyncMock(return_value=GPUStatus(temperature_c=50))), \
+             patch(
+                 "bastion.vram.query_gpu_status",
+                 AsyncMock(return_value=GPUStatus(temperature_c=50)),
+             ), \
              patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=15.0)):
             can, reason = await tracker.can_load_model("qwen3:14b")
 
         assert can is True
 
     @pytest.mark.asyncio
-    async def test_hard_gate_skipped_when_nvidia_smi_unavailable(self, vram_config: BrokerConfig) -> None:
+    async def test_hard_gate_skipped_when_nvidia_smi_unavailable(
+        self, vram_config: BrokerConfig,
+    ) -> None:
         """When nvidia-smi returns None, the hard gate is skipped (no block)."""
         tracker = VRAMTracker(vram_config)
         mock_resp = httpx.Response(
@@ -302,7 +336,10 @@ class TestNvidiaSmiHardGate:
             request=httpx.Request("GET", "http://mock"),
         )
         with patch.object(tracker._http, "get", new_callable=AsyncMock, return_value=mock_resp), \
-             patch("bastion.vram.query_gpu_status", AsyncMock(return_value=GPUStatus(temperature_c=50))), \
+             patch(
+                 "bastion.vram.query_gpu_status",
+                 AsyncMock(return_value=GPUStatus(temperature_c=50)),
+             ), \
              patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=None)):
             can, reason = await tracker.can_load_model("qwen3:14b")
 
@@ -382,7 +419,10 @@ class TestUnloadModelPolling:
         )
 
         with patch.object(tracker._http, "post", new_callable=AsyncMock, return_value=post_resp), \
-             patch.object(tracker._http, "get", new_callable=AsyncMock, return_value=still_loaded_resp):
+             patch.object(
+                 tracker._http, "get",
+                 new_callable=AsyncMock, return_value=still_loaded_resp,
+             ):
             success = await tracker.unload_model("qwen3:14b")
 
         # Still returns True (proceeds anyway), but model wasn't confirmed removed

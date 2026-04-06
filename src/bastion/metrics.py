@@ -59,11 +59,11 @@ logger = logging.getLogger(__name__)
 # Try to import prometheus_client — if unavailable, create no-op stubs
 try:
     from prometheus_client import (
+        CONTENT_TYPE_LATEST,
         Counter,
         Gauge,
         Histogram,
         generate_latest,
-        CONTENT_TYPE_LATEST,
     )
     PROMETHEUS_AVAILABLE = True
     logger.info("prometheus-client imported successfully")
@@ -77,7 +77,7 @@ except ImportError:
     # No-op stubs that match the prometheus_client API
     class _NoOpMetric:
         """Base no-op metric that ignores all method calls."""
-        def labels(self, **kwargs: Any) -> "_NoOpMetric":
+        def labels(self, **kwargs: Any) -> _NoOpMetric:
             return self
         def inc(self, amount: float = 1.0) -> None:
             pass

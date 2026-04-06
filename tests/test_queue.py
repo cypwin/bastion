@@ -4,12 +4,9 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
-from bastion.models import PriorityTier, QueuedRequest, SchedulerConfig
+from bastion.models import PriorityTier
 from bastion.queue import AffinityQueue
 from tests.conftest import make_request
-
 
 # ---------------------------------------------------------------------------
 # Basic operations
@@ -51,7 +48,7 @@ class TestEnqueueDequeue:
 class TestQueueFull:
     def test_reject_when_full(self, small_config):
         q = AffinityQueue(small_config.scheduler)  # max_queue_size=4
-        for i in range(4):
+        for _i in range(4):
             assert q.enqueue(make_request(model="tiny:1b")) is True
         assert q.enqueue(make_request(model="tiny:1b")) is False
         assert q.total_size == 4

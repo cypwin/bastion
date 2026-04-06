@@ -5,10 +5,8 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from bastion_client import BastionClient, IntentRequest, IntentResponse, VRAMInfo
 from bastion_client.client import TIER_MAP
-
 
 # ---------------------------------------------------------------------------
 # TIER_MAP resolution

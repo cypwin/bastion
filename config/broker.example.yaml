@@ -21,12 +21,12 @@ server:
   # admin_port: 9999       # Uncomment for two-port mode (admin on separate port)
 
 # ── GPU safety thresholds ───────────────────────────────────────────
-# Adjust total_vram_gb and headroom_gb for your GPU.
+# Set total_vram_gb to 0 (default) to auto-detect from nvidia-smi.
 # Usable VRAM = total_vram_gb - headroom_gb
 gpu:
-  total_vram_gb: 32        # Change to match your GPU (e.g., 24 for RTX 4090)
-  headroom_gb: 8           # Reserved for OS, display, CUDA overhead
-  max_temperature_c: 82    # Block model loads above this temperature
+  total_vram_gb: 0         # 0 = auto-detect from nvidia-smi
+  headroom_gb: 6           # Reserved for OS, display, CUDA overhead
+  max_temperature_c: 83    # Block model loads above this temperature
 
 # ── Scheduling algorithm ────────────────────────────────────────────
 scheduler:
@@ -48,18 +48,24 @@ priorities:
   background: 10           # Background jobs
 
 # ── Known models ────────────────────────────────────────────────────
-# Register your models with measured VRAM usage for accurate scheduling.
-# VRAM should be measured with nvidia-smi while the model is loaded.
-models:
-  "llama3.1:8b":
-    vram_gb: 4.5
-    default_num_ctx: 4096
-    tags: ["general"]
-
-  "nomic-embed-text":
-    vram_gb: 0.4
-    always_allowed: true   # Never counts toward VRAM budget
-    tags: ["embedding"]
+# Register your models with VRAM usage for accurate scheduling.
+# Run `bastion --detect-models` to auto-discover installed Ollama models.
+#
+# Don't have models yet?  Browse https://ollama.com/library and install with:
+#   ollama pull llama3.1:8b
+#   ollama pull nomic-embed-text
+#
+# Example entries (uncomment and adjust vram_gb after measuring):
+# models:
+#   "llama3.1:8b":
+#     vram_gb: 4.5
+#     default_num_ctx: 4096
+#     tags: ["general"]
+#   "nomic-embed-text":
+#     vram_gb: 0.4
+#     always_allowed: true   # Never counts toward VRAM budget
+#     tags: ["embedding"]
+models: {}
 
 # ── Safety overrides ────────────────────────────────────────────────
 # Injected into ALL Ollama API requests.

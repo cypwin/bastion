@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 import yaml
@@ -64,7 +63,8 @@ class TestLoadConfig:
         config = load_config(path)
         assert config.scheduler.cooldown_seconds == 5.0
         assert config.scheduler.aging_rate == 2.0  # default
-        assert config.gpu.total_vram_gb == 32.0  # default
+        # total_vram_gb is auto-detected; falls back to 8.0 when nvidia-smi absent
+        assert config.gpu.total_vram_gb > 0  # resolved by auto-detect or fallback
 
     def test_admin_port_default_zero(self, tmp_path, monkeypatch):
         """admin_port defaults to 0 (disabled / same port as proxy)."""
@@ -109,5 +109,5 @@ class TestLoadConfig:
             return  # Skip if not running from project root
         config = load_config(path)
         assert len(config.models) >= 10
-        assert config.gpu.max_vram_gb == 24.0  # 32 total - 8 headroom
+        assert config.gpu.max_vram_gb > 0  # total - headroom must be positive
         assert config.request_overrides.use_mmap is False

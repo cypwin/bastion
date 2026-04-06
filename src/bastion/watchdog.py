@@ -17,13 +17,13 @@ Reference: https://www.freedesktop.org/software/systemd/man/sd_notify.html
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import socket
-import subprocess
 import time
-from enum import Enum
-from typing import Any, Dict, Optional
+from enum import StrEnum
+from typing import Any
 
 import httpx
 from pydantic import BaseModel, Field
@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 # Systemd sd_notify (unchanged from original)
 # ---------------------------------------------------------------------------
 
-_socket: Optional[socket.socket] = None
-_notify_addr: Optional[str] = None
+_socket: socket.socket | None = None
+_notify_addr: str | None = None
 
 
 def init_watchdog() -> bool:
@@ -55,10 +55,7 @@ def init_watchdog() -> bool:
     try:
         _socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         # Abstract socket (starts with @) — replace @ with null byte
-        if notify_path.startswith("@"):
-            _notify_addr = "\0" + notify_path[1:]
-        else:
-            _notify_addr = notify_path
+        _notify_addr = "\x00" + notify_path[1:] if notify_path.startswith("@") else notify_path
         logger.info("Watchdog initialized (NOTIFY_SOCKET=%s)", notify_path)
         return True
     except Exception as e:
@@ -102,14 +99,14 @@ def _send(message: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-class OllamaState(str, Enum):
+class OllamaState(StrEnum):
     """Ollama backend state as seen by the watchdog."""
     HEALTHY = "healthy"
     UNHEALTHY = "unhealthy"
     UNKNOWN = "unknown"
 
 
-class GPUState(str, Enum):
+class GPUState(StrEnum):
     """GPU state as seen by the watchdog."""
     RESPONSIVE = "responsive"
     TIMEOUT = "timeout"
@@ -120,8 +117,8 @@ class WatchdogStatus(BaseModel):
     """Snapshot of watchdog checks — returned by /broker/watchdog."""
     ollama_state: OllamaState = OllamaState.UNKNOWN
     gpu_state: GPUState = GPUState.UNAVAILABLE
-    ollama_latency_ms: Optional[float] = None
-    gpu_query_latency_ms: Optional[float] = None
+    ollama_latency_ms: float | None = None
+    gpu_query_latency_ms: float | None = None
     last_check: float = Field(default_factory=time.time)
     consecutive_ollama_failures: int = 0
     consecutive_gpu_timeouts: int = 0
@@ -161,8 +158,8 @@ class ProcessMonitor:
         ollama_timeout: float = 5.0,
         gpu_timeout: int = 5,
         failure_threshold: int = 3,
-        on_unhealthy: Optional[Any] = None,
-        on_healthy: Optional[Any] = None,
+        on_unhealthy: Any | None = None,
+        on_healthy: Any | None = None,
     ) -> None:
         self._ollama_url = ollama_url
         self._check_interval = check_interval
@@ -174,7 +171,7 @@ class ProcessMonitor:
 
         self._status = WatchdogStatus()
         self._running = False
-        self._task: Optional[asyncio.Task] = None
+        self._task: asyncio.Task | None = None
         self._is_healthy = True
 
     @property
@@ -204,10 +201,8 @@ class ProcessMonitor:
         self._running = False
         if self._task:
             self._task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
             self._task = None
 
     async def _loop(self) -> None:
@@ -279,52 +274,37 @@ class ProcessMonitor:
             logger.warning("Ollama health check failed (%.0fms): %s", elapsed_ms, e)
 
     async def _check_gpu(self) -> None:
-        """Run nvidia-smi with timeout to detect GPU lockups.
+        """Check GPU responsiveness via the GPU backend.
 
-        A lockup (nvidia-smi hangs > gpu_timeout seconds) is a strong signal
-        the GPU driver is wedged, which often precedes or accompanies an
+        A lockup (query hangs > gpu_timeout seconds) is a strong signal
+        the GPU driver is wedged, which often precedes or accompanies a
         GPU crash.
         """
-        start = time.monotonic()
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                stdout, _ = await asyncio.wait_for(
-                    proc.communicate(), timeout=self._gpu_timeout
-                )
-                elapsed_ms = (time.monotonic() - start) * 1000
-                self._status.gpu_query_latency_ms = round(elapsed_ms, 1)
+        from bastion.gpu import get_backend
+        from bastion.gpu.nvidia import NvidiaBackend
 
-                if proc.returncode == 0 and stdout.strip():
-                    self._status.gpu_state = GPUState.RESPONSIVE
-                    self._status.consecutive_gpu_timeouts = 0
-                else:
-                    self._status.gpu_state = GPUState.UNAVAILABLE
-                    # Don't count a clean failure as a timeout
-            except asyncio.TimeoutError:
-                elapsed_ms = (time.monotonic() - start) * 1000
-                self._status.gpu_query_latency_ms = round(elapsed_ms, 1)
+        backend = get_backend()
+        start = time.monotonic()
+
+        if isinstance(backend, NvidiaBackend):
+            result = await backend.check_gpu_responsive(self._gpu_timeout)
+            elapsed_ms = (time.monotonic() - start) * 1000
+            self._status.gpu_query_latency_ms = round(elapsed_ms, 1)
+
+            if result is True:
+                self._status.gpu_state = GPUState.RESPONSIVE
+                self._status.consecutive_gpu_timeouts = 0
+            elif result is False:
                 self._status.gpu_state = GPUState.TIMEOUT
                 self._status.consecutive_gpu_timeouts += 1
                 logger.warning(
-                    "nvidia-smi timed out after %ds — possible GPU lockup",
+                    "GPU query timed out after %ds \u2014 possible GPU lockup",
                     self._gpu_timeout,
                 )
-                # Kill the hung process
-                try:
-                    proc.kill()
-                    await proc.wait()
-                except Exception:
-                    pass
-        except FileNotFoundError:
+            else:
+                self._status.gpu_state = GPUState.UNAVAILABLE
+                self._status.gpu_query_latency_ms = None
+        else:
+            # Stub or other backend — no GPU monitoring
             self._status.gpu_state = GPUState.UNAVAILABLE
             self._status.gpu_query_latency_ms = None
-        except Exception as e:
-            elapsed_ms = (time.monotonic() - start) * 1000
-            self._status.gpu_query_latency_ms = round(elapsed_ms, 1)
-            self._status.gpu_state = GPUState.UNAVAILABLE
-            logger.debug("GPU check error: %s", e)

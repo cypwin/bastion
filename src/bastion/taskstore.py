@@ -9,20 +9,20 @@ Design based on docs fd51af18 (in-memory stores) and 26621baa (memory management
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Dict, List, Optional, Set
+from dataclasses import dataclass
+from enum import StrEnum
 
 from bastion.models import A2ATaskRecord, A2ATaskState
 
 logger = logging.getLogger(__name__)
 
 
-class BackpressureLevel(str, Enum):
+class BackpressureLevel(StrEnum):
     NORMAL = "normal"
     PRESSURE = "pressure"
     OVERLOADED = "overloaded"
@@ -41,7 +41,7 @@ class CompactedResult:
     task_id: str
     status: str  # A2ATaskState value
     result_summary: str  # Truncated to 500 chars
-    error: Optional[str]
+    error: str | None
     completed_at: float  # monotonic timestamp
     output_artifacts: tuple  # Immutable copy of output_artifacts
 
@@ -82,7 +82,7 @@ class TaskStoreFullError(Exception):
         super().__init__(f"Task store full. Retry after {retry_after}s.")
 
 
-_VALID_TRANSITIONS: Dict[A2ATaskState, Set[A2ATaskState]] = {
+_VALID_TRANSITIONS: dict[A2ATaskState, set[A2ATaskState]] = {
     A2ATaskState.SUBMITTED: {A2ATaskState.WORKING, A2ATaskState.CANCELED, A2ATaskState.FAILED},
     A2ATaskState.WORKING: {A2ATaskState.COMPLETED, A2ATaskState.FAILED, A2ATaskState.CANCELED},
     A2ATaskState.COMPLETED: set(),  # Terminal
@@ -127,19 +127,19 @@ class TaskStore:
         self._cleanup_interval = cleanup_interval_seconds
 
         # Dual store
-        self._active: Dict[str, A2ATaskRecord] = {}
-        self._active_timestamps: Dict[str, float] = {}  # task_id -> monotonic creation time
+        self._active: dict[str, A2ATaskRecord] = {}
+        self._active_timestamps: dict[str, float] = {}  # task_id -> monotonic creation time
         self._completed: OrderedDict[str, CompactedResult] = OrderedDict()
         self._tombstones: OrderedDict[str, float] = OrderedDict()  # task_id -> eviction time
 
         # Subscribers for SSE fan-out
-        self._subscribers: Dict[str, List[asyncio.Queue]] = {}
+        self._subscribers: dict[str, list[asyncio.Queue]] = {}
 
         # Backpressure state
         self._pressure_level = BackpressureLevel.NORMAL
 
         # Cleanup task reference (prevent GC)
-        self._cleanup_tasks: Set[asyncio.Task] = set()
+        self._cleanup_tasks: set[asyncio.Task] = set()
         self._cleanup_running = False
 
     # --- Public API ---
@@ -159,7 +159,7 @@ class TaskStore:
         self._update_pressure_level()
         return record.task_id
 
-    def get(self, task_id: str) -> Optional[A2ATaskRecord | CompactedResult]:
+    def get(self, task_id: str) -> A2ATaskRecord | CompactedResult | None:
         """Retrieve a task by ID. Checks active, completed, then tombstones.
 
         Returns None if truly not found. Performs lazy TTL eviction.
@@ -229,7 +229,7 @@ class TaskStore:
 
         return record
 
-    def get_active(self, task_id: str) -> Optional[A2ATaskRecord]:
+    def get_active(self, task_id: str) -> A2ATaskRecord | None:
         """Get a task only from the active store (for mutation)."""
         return self._active.get(task_id)
 
@@ -244,10 +244,8 @@ class TaskStore:
     def unsubscribe(self, task_id: str, queue: asyncio.Queue) -> None:
         """Remove a subscriber queue."""
         if task_id in self._subscribers:
-            try:
+            with contextlib.suppress(ValueError):
                 self._subscribers[task_id].remove(queue)
-            except ValueError:
-                pass
             if not self._subscribers[task_id]:
                 del self._subscribers[task_id]
 
@@ -265,14 +263,15 @@ class TaskStore:
                 queue.put_nowait(event)
             except asyncio.QueueFull:
                 # Drop oldest, then insert new
-                try:
+                with contextlib.suppress(asyncio.QueueEmpty):
                     queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
                 try:
                     queue.put_nowait(event)
                 except asyncio.QueueFull:
-                    logger.warning("SSE subscriber queue still full after drop for task %s", task_id)
+                    logger.warning(
+                        "SSE subscriber queue still full after drop for task %s",
+                        task_id,
+                    )
 
     def has_task(self, task_id: str) -> bool:
         """Check if a task exists in any store (active, completed, or tombstones)."""

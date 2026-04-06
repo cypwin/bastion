@@ -21,8 +21,9 @@ All functions are no-ops when:
 from __future__ import annotations
 
 import logging
+from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Any, Dict, Generator, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +32,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 try:
-    from opentelemetry import context as otel_context
     from opentelemetry import trace
-    from opentelemetry.context.contextvars_context import ContextVarsRuntimeContext
+    from opentelemetry.propagate import extract, inject
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import (
@@ -42,8 +42,6 @@ try:
         SimpleSpanProcessor,
     )
     from opentelemetry.trace import Link, SpanKind, StatusCode
-    from opentelemetry.trace.propagation import get_current_span
-    from opentelemetry.propagate import extract, inject
 
     OTEL_AVAILABLE = True
 except ImportError:
@@ -189,7 +187,7 @@ def is_enabled() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def inject_trace_context() -> Dict[str, str]:
+def inject_trace_context() -> dict[str, str]:
     """Serialize current trace context into a carrier dict.
 
     Used at task submission time to capture traceparent/tracestate
@@ -203,12 +201,12 @@ def inject_trace_context() -> Dict[str, str]:
     """
     if not is_enabled():
         return {}
-    carrier: Dict[str, str] = {}
+    carrier: dict[str, str] = {}
     inject(carrier)
     return carrier
 
 
-def extract_trace_context(carrier: Dict[str, str]) -> Any:
+def extract_trace_context(carrier: dict[str, str]) -> Any:
     """Extract trace context from a carrier dict.
 
     Used at task processing time to recover the context from submission.
@@ -237,7 +235,7 @@ def record_task_submit(
     task_id: str,
     skill_id: str,
     model: str = "",
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """Create a PRODUCER span for A2A task submission.
 
     Parameters
@@ -278,7 +276,7 @@ def record_task_process(
     task_id: str,
     skill_id: str,
     model: str = "",
-    trace_context: Optional[Dict[str, str]] = None,
+    trace_context: dict[str, str] | None = None,
 ) -> Any:
     """Create a CONSUMER span for A2A task processing, linked to the producer.
 
@@ -363,7 +361,7 @@ def record_queue_wait(
 
 @contextmanager
 def record_model_swap(
-    from_model: Optional[str],
+    from_model: str | None,
     to_model: str,
 ) -> Generator[None, None, None]:
     """Context manager span for model swap (load/unload) time.
@@ -384,7 +382,7 @@ def record_model_swap(
         yield
         return
 
-    attrs: Dict[str, Any] = {
+    attrs: dict[str, Any] = {
         "bastion.swap.to_model": to_model,
     }
     if from_model:
@@ -403,7 +401,7 @@ def record_inference(
     model: str,
     operation: str = "generate",
     endpoint: str = "/api/generate",
-) -> Generator[Optional[Any], None, None]:
+) -> Generator[Any | None, None, None]:
     """Context manager span for an Ollama inference call (CLIENT span).
 
     Parameters
@@ -442,8 +440,8 @@ def record_inference(
 
 def set_inference_tokens(
     span: Any,
-    input_tokens: Optional[int] = None,
-    output_tokens: Optional[int] = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
 ) -> None:
     """Set token usage attributes on an inference span.
 
@@ -465,7 +463,7 @@ def set_inference_tokens(
         span.set_attribute(_GENAI_USAGE_OUTPUT_TOKENS, output_tokens)
 
 
-def end_span(span: Any, error: Optional[str] = None) -> None:
+def end_span(span: Any, error: str | None = None) -> None:
     """End a span, optionally recording an error.
 
     Parameters

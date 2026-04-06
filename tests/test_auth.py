@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, FastAPI
 from fastapi.testclient import TestClient
 
-from bastion.auth import make_admin_key_dependency, make_a2a_token_dependency
+from bastion.auth import make_a2a_token_dependency, make_admin_key_dependency
 from bastion.models import A2AConfig, AuthConfig
 
 

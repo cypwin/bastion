@@ -10,4 +10,4 @@ Architecture:
   Layer 3: A2A agent interface (/.well-known/agent-card.json)
 """
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"

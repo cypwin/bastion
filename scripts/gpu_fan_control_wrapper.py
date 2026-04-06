@@ -16,9 +16,9 @@ Origin: Adapted from PHENOTYPE project for BASTION standalone use.
 
 from __future__ import annotations
 
-import sys
-import subprocess
 import os
+import subprocess
+import sys
 
 # Only these values are allowed - no arbitrary input
 VALID_SPEEDS = {'30', '50', '70', '90', '100', 'auto'}
@@ -87,8 +87,10 @@ def set_fan_speed(speed: str) -> bool:
                 )
                 # Set fan speed (handle multiple fans per GPU)
                 for fan_id in range(2):  # Most GPUs have 1-2 fans
+                    fan_idx = gpu_id * 2 + fan_id
+                    fan_arg = f"[fan:{fan_idx}]/GPUTargetFanSpeed={speed}"
                     subprocess.run(
-                        ["nvidia-settings", "-a", f"[fan:{gpu_id * 2 + fan_id}]/GPUTargetFanSpeed={speed}"],
+                        ["nvidia-settings", "-a", fan_arg],
                         env=env,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,

@@ -18,11 +18,12 @@ Forensic log written to /tmp/bastion-stress-test.jsonl (JSONL, one event per lin
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sys
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -82,17 +83,17 @@ class StressLog:
 
         # Rotate previous log if it exists
         if self._path.exists():
-            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
             rotated = self._path.with_suffix(f".jsonl.{ts}")
             self._path.rename(rotated)
             print(f"[STRESS] Rotated previous log to {rotated}", file=sys.stderr)
 
-        self._fh = open(self._path, "w", encoding="utf-8")
+        self._fh = open(self._path, "w", encoding="utf-8")  # noqa: SIM115
         print(f"[STRESS] Logging to {self._path}", file=sys.stderr)
 
     def log(self, event: str, data: dict | None = None) -> None:
         """Write one JSON line and echo a summary to stderr."""
-        ts = datetime.now(timezone.utc).isoformat()
+        ts = datetime.now(UTC).isoformat()
         record = {"timestamp": ts, "event": event, "data": data or {}}
         self._fh.write(json.dumps(record, default=str) + "\n")
         self._fh.flush()
@@ -115,7 +116,9 @@ class StressLog:
     def __enter__(self) -> StressLog:
         return self
 
-    def __exit__(self, exc_type: type | None, exc_val: BaseException | None, exc_tb: object) -> None:
+    def __exit__(
+        self, exc_type: type | None, exc_val: BaseException | None, exc_tb: object,
+    ) -> None:
         self.close()
 
 
@@ -168,10 +171,8 @@ class VRAMMonitor:
     ) -> None:
         if self._task is not None:
             self._task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
         self._stress_log.log("vram_monitor_stopped", {
             "total_samples": len(self.samples),
             "peak_vram_gb": round(self.peak_vram_gb, 2),
@@ -214,7 +215,7 @@ class VRAMMonitor:
             "queue_depth": queue_depth,
             "temperature_c": temperature_c,
             "power_w": power_w,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }
         self.samples.append(sample)
 
@@ -262,7 +263,11 @@ class VRAMMonitor:
         print(f"\n{'=' * 60}", file=sys.stderr)
         print(f"VRAM Monitor Summary ({n} samples)", file=sys.stderr)
         print(f"{'=' * 60}", file=sys.stderr)
-        print(f"  Peak VRAM used:   {self.peak_vram_gb:.2f} GB / {VRAM_BUDGET_GB:.1f} GB budget", file=sys.stderr)
+        print(
+            f"  Peak VRAM used:   {self.peak_vram_gb:.2f} GB"
+            f" / {VRAM_BUDGET_GB:.1f} GB budget",
+            file=sys.stderr,
+        )
         print(f"  Peak queue depth: {self.peak_queue_depth}", file=sys.stderr)
         if self.samples:
             first_ts = self.samples[0]["timestamp"]
@@ -470,9 +475,9 @@ class StressClient:
         """Assert that no result has a server error (5xx) or an error string."""
         failures: list[dict] = []
         for r in self.results:
-            if r.get("error") is not None:
-                failures.append(r)
-            elif r.get("status_code") is not None and r["status_code"] >= 500:
+            if (r.get("error") is not None
+                    or r.get("status_code") is not None
+                    and r["status_code"] >= 500):
                 failures.append(r)
         if failures:
             summary = "\n".join(
@@ -708,7 +713,9 @@ class TestSingleModelSerialization:
         stress_log.log("test_start", {"test": "test_concurrent_nonstreaming"})
         try:
             model = _pick_smallest_model(model_categories, available_models)
-            stress_log.log("model_selected", {"model": model, "test": "test_concurrent_nonstreaming"})
+            stress_log.log("model_selected", {
+                "model": model, "test": "test_concurrent_nonstreaming",
+            })
 
             async with VRAMMonitor(bastion_url, stress_log) as monitor:
                 client = StressClient(bastion_url, stress_log, client_id="serial-ns")
@@ -798,7 +805,9 @@ class TestModelSwapSafety:
         stress_log.log("test_start", {"test": "test_two_model_alternation"})
         try:
             models = _pick_swap_models(model_categories, available_models, count=2)
-            stress_log.log("models_selected", {"models": models, "test": "test_two_model_alternation"})
+            stress_log.log("models_selected", {
+                "models": models, "test": "test_two_model_alternation",
+            })
 
             async with VRAMMonitor(bastion_url, stress_log) as monitor:
                 client = StressClient(bastion_url, stress_log, client_id="swap-2")
@@ -841,7 +850,9 @@ class TestModelSwapSafety:
                 pytest.skip(f"Need at least 3 non-embedding models, have {len(non_embedding)}")
 
             models = _pick_swap_models(model_categories, available_models, count=3)
-            stress_log.log("models_selected", {"models": models, "test": "test_three_model_rotation"})
+            stress_log.log("models_selected", {
+                "models": models, "test": "test_three_model_rotation",
+            })
 
             async with VRAMMonitor(bastion_url, stress_log) as monitor:
                 client = StressClient(bastion_url, stress_log, client_id="swap-3")
@@ -877,7 +888,10 @@ class TestModelSwapSafety:
         stress_log.log("test_start", {"test": "test_vram_stays_within_budget"})
         try:
             models = _pick_swap_models(model_categories, available_models, count=2)
-            stress_log.log("models_selected", {"models": models, "test": "test_vram_stays_within_budget"})
+            stress_log.log("models_selected", {
+                "models": models,
+                "test": "test_vram_stays_within_budget",
+            })
 
             async with VRAMMonitor(bastion_url, stress_log) as monitor:
                 client = StressClient(bastion_url, stress_log, client_id="vram-check")
@@ -886,7 +900,7 @@ class TestModelSwapSafety:
                     {"model": models[i % 2], "prompt": f"Count to {i + 1}"}
                     for i in range(5)
                 ]
-                results = await client.generate_many(specs, concurrency=1)
+                await client.generate_many(specs, concurrency=1)
                 client.assert_all_succeeded()
 
                 # Primary assertion: VRAM never exceeded budget
@@ -917,18 +931,25 @@ class TestPriorityUnderLoad:
         stress_log.log("test_start", {"test": "test_interactive_served_first"})
         try:
             model = _pick_smallest_model(model_categories, available_models)
-            stress_log.log("model_selected", {"model": model, "test": "test_interactive_served_first"})
+            stress_log.log("model_selected", {
+                "model": model,
+                "test": "test_interactive_served_first",
+            })
 
             async with VRAMMonitor(bastion_url, stress_log) as monitor:
                 # Background client sends a medium-length prompt first
                 bg_client = StressClient(bastion_url, stress_log, client_id="priority-bg")
-                interactive_client = StressClient(bastion_url, stress_log, client_id="priority-interactive")
+                interactive_client = StressClient(
+                    bastion_url, stress_log,
+                    client_id="priority-interactive",
+                )
 
                 # Fire background request first (medium prompt to occupy model)
                 bg_task = asyncio.create_task(
                     bg_client.generate(
                         model,
-                        "Explain the theory of relativity in detail with examples and historical context.",
+                        "Explain the theory of relativity in detail"
+                        " with examples and historical context.",
                         stream=False,
                         priority_tier="background",
                         timeout=REQUEST_TIMEOUT,
@@ -1069,7 +1090,10 @@ class TestConcurrentClientBurst:
         stress_log.log("test_start", {"test": "test_20_client_burst_same_model"})
         try:
             model = _pick_smallest_model(model_categories, available_models)
-            stress_log.log("model_selected", {"model": model, "test": "test_20_client_burst_same_model"})
+            stress_log.log("model_selected", {
+                "model": model,
+                "test": "test_20_client_burst_same_model",
+            })
 
             async with VRAMMonitor(bastion_url, stress_log) as monitor:
                 client = StressClient(bastion_url, stress_log, client_id="burst-same")
@@ -1090,7 +1114,10 @@ class TestConcurrentClientBurst:
                 "total_requests": len(results),
             })
         except Exception:
-            stress_log.log("test_end", {"test": "test_20_client_burst_same_model", "result": "fail"})
+            stress_log.log("test_end", {
+                "test": "test_20_client_burst_same_model",
+                "result": "fail",
+            })
             raise
 
     async def test_20_client_burst_mixed_models(
@@ -1110,8 +1137,14 @@ class TestConcurrentClientBurst:
             if len(non_embedding) < 2:
                 pytest.skip(f"Need at least 2 non-embedding models, have {len(non_embedding)}")
 
-            models = _pick_swap_models(model_categories, available_models, count=min(3, len(non_embedding)))
-            stress_log.log("models_selected", {"models": models, "test": "test_20_client_burst_mixed_models"})
+            models = _pick_swap_models(
+                model_categories, available_models,
+                count=min(3, len(non_embedding)),
+            )
+            stress_log.log("models_selected", {
+                "models": models,
+                "test": "test_20_client_burst_mixed_models",
+            })
 
             priorities = ["interactive", "agent", "pipeline", "background"]
 
@@ -1140,7 +1173,10 @@ class TestConcurrentClientBurst:
                 "models_used": models,
             })
         except Exception:
-            stress_log.log("test_end", {"test": "test_20_client_burst_mixed_models", "result": "fail"})
+            stress_log.log("test_end", {
+                "test": "test_20_client_burst_mixed_models",
+                "result": "fail",
+            })
             raise
 
 
@@ -1166,21 +1202,24 @@ class TestSustainedMixedWorkload:
             # Cap to 3 models max — keeps swap rate under critical threshold (6/min).
             # With 50 requests across 3 models, affinity clustering reduces swaps to
             # ~15-20 (only when switching models), staying under 6/min sustained rate.
-            MAX_SUSTAINED_MODELS = 3
-            if len(non_embedding) > MAX_SUSTAINED_MODELS:
+            max_sustained_models = 3
+            if len(non_embedding) > max_sustained_models:
                 # Prefer models from different size categories for realistic mix
                 capped: list[str] = []
                 for cat in ("small", "medium", "large"):
                     for m in model_categories.get(cat, []):
                         if m not in capped:
                             capped.append(m)
-                        if len(capped) >= MAX_SUSTAINED_MODELS:
+                        if len(capped) >= max_sustained_models:
                             break
-                    if len(capped) >= MAX_SUSTAINED_MODELS:
+                    if len(capped) >= max_sustained_models:
                         break
                 non_embedding = capped
 
-            stress_log.log("models_selected", {"models": non_embedding, "test": "test_sustained_50_requests"})
+            stress_log.log("models_selected", {
+                "models": non_embedding,
+                "test": "test_sustained_50_requests",
+            })
 
             prompts = [
                 "What is 2+2?", "Say hello", "Count to 3", "Name a color",
@@ -1201,7 +1240,7 @@ class TestSustainedMixedWorkload:
 
             # Timeout accounts for swap rate limiter extending cooldowns when
             # swap velocity approaches crash thresholds (critical=6/min → 10s cooldown).
-            SUSTAINED_TIMEOUT = 240.0  # 4 minutes for 50 requests with throttled swaps
+            sustained_timeout = 240.0  # 4 minutes for 50 requests with throttled swaps
 
             async with VRAMMonitor(bastion_url, stress_log) as monitor:
                 client = StressClient(bastion_url, stress_log, client_id="sustained")
@@ -1211,14 +1250,14 @@ class TestSustainedMixedWorkload:
                         "prompt": prompts[i],
                         "stream": i % 2 == 0,
                         "priority_tier": priorities[i % len(priorities)],
-                        "timeout": SUSTAINED_TIMEOUT,
+                        "timeout": sustained_timeout,
                     }
                     for i in range(50)
                 ]
                 results = await client.generate_many(specs, concurrency=20)
 
                 client.assert_all_succeeded()
-                client.assert_no_timeouts(timeout=SUSTAINED_TIMEOUT)
+                client.assert_no_timeouts(timeout=sustained_timeout)
 
                 # Zero 5xx failures
                 server_errors = [r for r in results if r.get("status_code", 0) >= 500]
@@ -1230,8 +1269,10 @@ class TestSustainedMixedWorkload:
                 # VRAM budget is the scheduler's target, not a hard physical ceiling.
                 # Transient spikes occur during model load transitions (new model
                 # loading before Ollama fully frees the old one). Allow 15% overshoot.
-                VRAM_TRANSIENT_TOLERANCE = 1.15
-                monitor.assert_vram_within_budget(VRAM_BUDGET_GB * VRAM_TRANSIENT_TOLERANCE)
+                vram_transient_tolerance = 1.15
+                monitor.assert_vram_within_budget(
+                    VRAM_BUDGET_GB * vram_transient_tolerance,
+                )
                 monitor.print_summary()
 
             stress_log.log("test_end", {
@@ -1439,7 +1480,10 @@ class TestLongRunningQueueBehavior:
             async with VRAMMonitor(bastion_url, stress_log) as monitor:
                 long_client = StressClient(bastion_url, stress_log, client_id="long-blocker")
                 bg_client = StressClient(bastion_url, stress_log, client_id="bg-priority")
-                interactive_client = StressClient(bastion_url, stress_log, client_id="interactive-priority")
+                interactive_client = StressClient(
+                    bastion_url, stress_log,
+                    client_id="interactive-priority",
+                )
 
                 # 1. Fire long-running request to occupy the model
                 long_task = asyncio.create_task(
@@ -1488,13 +1532,19 @@ class TestLongRunningQueueBehavior:
 
                 # 7. Compare average latencies
                 avg_bg = sum(r["latency_s"] for r in bg_results) / len(bg_results)
-                avg_interactive = sum(r["latency_s"] for r in interactive_results) / len(interactive_results)
+                avg_interactive = (
+                    sum(r["latency_s"] for r in interactive_results)
+                    / len(interactive_results)
+                )
 
                 stress_log.log("priority_latency_comparison", {
                     "avg_interactive_latency_s": avg_interactive,
                     "avg_background_latency_s": avg_bg,
                     "long_request_latency_s": long_result["latency_s"],
-                    "interactive_results": [{"latency_s": r["latency_s"]} for r in interactive_results],
+                    "interactive_results": [
+                        {"latency_s": r["latency_s"]}
+                        for r in interactive_results
+                    ],
                     "background_results": [{"latency_s": r["latency_s"]} for r in bg_results],
                 })
 
@@ -1685,7 +1735,11 @@ class TestCouncilConcurrentDispatch:
                 specs = [
                     {
                         "model": council[i % len(council)],
-                        "prompt": f"{self._SHORT_PROMPT} (model={council[i % len(council)]}, req={i})",
+                        "prompt": (
+                            f"{self._SHORT_PROMPT}"
+                            f" (model={council[i % len(council)]},"
+                            f" req={i})"
+                        ),
                         "stream": False,
                         "priority_tier": "pipeline",
                     }
@@ -1702,7 +1756,7 @@ class TestCouncilConcurrentDispatch:
                 client.assert_no_timeouts()
 
                 # No swaps should have occurred — all models were co-resident
-                swap_events = [
+                [
                     s for s in monitor.samples
                     if set(council).issubset({n for n in s.get("loaded_models", [])})
                 ]

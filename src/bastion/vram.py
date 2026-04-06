@@ -13,9 +13,8 @@ import json
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 
@@ -41,10 +40,10 @@ class ResidencyCache:
         Time-to-live for cached data (default: 1.0).
     """
 
-    def __init__(self, vram_tracker: "VRAMTracker", ttl_seconds: float = 1.0) -> None:
+    def __init__(self, vram_tracker: VRAMTracker, ttl_seconds: float = 1.0) -> None:
         self._vram_tracker = vram_tracker
         self._ttl_seconds = ttl_seconds
-        self._cache: Optional[List[LoadedModel]] = None
+        self._cache: list[LoadedModel] | None = None
         self._cache_timestamp: float = 0.0
         self._lock = asyncio.Lock()
 
@@ -110,7 +109,7 @@ class VRAMTracker:
         cache_ttl = getattr(config.scheduler, "residency_cache_ttl_seconds", 1.0)
         self.residency_cache = ResidencyCache(self, ttl_seconds=cache_ttl)
 
-    async def get_loaded_models(self) -> List[LoadedModel]:
+    async def get_loaded_models(self) -> list[LoadedModel]:
         """Query Ollama /api/ps for currently loaded models."""
         try:
             resp = await self._http.get(f"{self.config.ollama.base_url}/api/ps")
@@ -176,8 +175,14 @@ class VRAMTracker:
 
         # Check GPU health
         gpu_status = await query_gpu_status()
-        if gpu_status.temperature_c and gpu_status.temperature_c > self.config.gpu.max_temperature_c:
-            return False, f"GPU too hot: {gpu_status.temperature_c}°C > {self.config.gpu.max_temperature_c}°C"
+        if (
+            gpu_status.temperature_c
+            and gpu_status.temperature_c > self.config.gpu.max_temperature_c
+        ):
+            return False, (
+                f"GPU too hot: {gpu_status.temperature_c}\u00b0C"
+                f" > {self.config.gpu.max_temperature_c}\u00b0C"
+            )
 
         # Check VRAM budget
         loaded = await self.get_loaded_models()
@@ -270,8 +275,11 @@ class VRAMTracker:
             logger.warning("Failed to unload model '%s': %s", model_name, e)
             return False
 
-    async def log_vram_snapshot(self, event: str, extra: Optional[Dict[str, Any]] = None) -> None:
-        """Write VRAM snapshot to /tmp/bastion-vram-journal.jsonl for crash forensics.
+    async def log_vram_snapshot(self, event: str, extra: dict[str, Any] | None = None) -> None:
+        """Write VRAM snapshot to the VRAM journal for crash forensics.
+
+        The journal path is resolved by :func:`bastion.paths.vram_journal_path`
+        (default ``~/.local/share/bastion/bastion-vram-journal.jsonl``).
 
         Parameters
         ----------
@@ -281,10 +289,12 @@ class VRAMTracker:
             Additional event-specific data.
         """
         try:
+            from bastion.paths import vram_journal_path
+
             gpu = await query_gpu_status()
             loaded = await self.get_loaded_models()
             snapshot = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
                 "event": event,
                 "gpu_vram_used_mb": gpu.vram_used_mb,
                 "gpu_vram_free_mb": gpu.vram_free_mb,
@@ -294,8 +304,8 @@ class VRAMTracker:
             }
             if extra:
                 snapshot.update(extra)
-            journal_path = Path("/tmp/bastion-vram-journal.jsonl")
-            with journal_path.open("a") as f:
+            journal = vram_journal_path()
+            with journal.open("a") as f:
                 f.write(json.dumps(snapshot) + "\n")
         except Exception as e:
             logger.debug("VRAM journal write failed: %s", e)
@@ -320,7 +330,9 @@ class VRAMTracker:
 class VRAMReservation:
     """Represents a pending VRAM reservation."""
 
-    def __init__(self, reservation_id: str, model: str, vram_bytes: int, ttl: float = 120.0) -> None:
+    def __init__(
+        self, reservation_id: str, model: str, vram_bytes: int, ttl: float = 120.0,
+    ) -> None:
         self.reservation_id = reservation_id
         self.model = model
         self.vram_bytes = vram_bytes
@@ -366,8 +378,8 @@ class VRAMManager:
 
         self._allocated: int = 0      # Confirmed (model loaded successfully)
         self._reserved: int = 0       # Pending (loading in progress)
-        self._reservations: Dict[str, VRAMReservation] = {}
-        self._model_allocations: Dict[str, int] = {}  # Per-model committed bytes
+        self._reservations: dict[str, VRAMReservation] = {}
+        self._model_allocations: dict[str, int] = {}  # Per-model committed bytes
         self._lock = asyncio.Lock()
         self._load_semaphore = asyncio.Semaphore(1)  # Serialize GPU I/O
 
@@ -380,7 +392,7 @@ class VRAMManager:
 
     @property
     def available_vram(self) -> int:
-        """Available VRAM in bytes after accounting for allocations, reservations, and safety margin."""
+        """Available VRAM after allocations, reservations, and safety margin."""
         return max(0, self._total - self._safety_margin - self._allocated - self._reserved)
 
     @property

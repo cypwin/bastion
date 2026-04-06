@@ -19,17 +19,18 @@ Implements use_mmap fix and SOCKS5 proxy detection.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
-from typing import Awaitable, Callable, Optional, Tuple
+from collections.abc import Awaitable, Callable
 
 import httpx
 from fastapi import Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from bastion import audit
-from bastion.circuitbreaker import CircuitBreaker, CircuitBreakerConfig, CircuitOpenError
+from bastion.circuitbreaker import CircuitBreaker
 from bastion.models import BrokerConfig, PriorityTier, QueuedRequest
 
 logger = logging.getLogger(__name__)
@@ -60,11 +61,15 @@ class OllamaProxy:
     def __init__(
         self,
         config: BrokerConfig,
-        enqueue_fn: Optional[
-            Callable[[QueuedRequest], Awaitable[Tuple[asyncio.Event, Callable[[], None], Callable[[], None]]]]
-        ] = None,
-        record_fn: Optional[Callable[..., None]] = None,
-        intent_lookup_fn: Optional[Callable[[str], Optional[Tuple[PriorityTier, list]]]] = None,
+        enqueue_fn: (
+            Callable[
+                [QueuedRequest],
+                Awaitable[tuple[asyncio.Event, Callable[[], None], Callable[[], None]]],
+            ]
+            | None
+        ) = None,
+        record_fn: Callable[..., None] | None = None,
+        intent_lookup_fn: Callable[[str], tuple[PriorityTier, list] | None] | None = None,
     ) -> None:
         self.config = config
         self._backend_url = config.ollama.base_url
@@ -112,7 +117,8 @@ class OllamaProxy:
         # Request body size validation
         if len(body) > self._max_body_bytes:
             return JSONResponse(
-                {"error": f"Request body too large ({len(body)} bytes, max {self._max_body_bytes})"},
+                {"error": f"Request body too large ({len(body)} bytes, "
+                 f"max {self._max_body_bytes})"},
                 status_code=413,
             )
 
@@ -142,9 +148,8 @@ class OllamaProxy:
 
         # Inject safety overrides
         options = payload.get("options", {})
-        if self.config.request_overrides.use_mmap is False:
-            if "use_mmap" not in options:
-                options["use_mmap"] = False
+        if self.config.request_overrides.use_mmap is False and "use_mmap" not in options:
+            options["use_mmap"] = False
 
         # Inject default num_ctx if client didn't set one
         if "num_ctx" not in options:
@@ -171,7 +176,7 @@ class OllamaProxy:
         modified_body = json.dumps(payload).encode()
 
         # If scheduler is active, enqueue and await grant
-        done_fn: Optional[Callable[[], None]] = None
+        done_fn: Callable[[], None] | None = None
         queue_wait_seconds = 0.0
 
         if self._enqueue_fn is not None:
@@ -209,9 +214,12 @@ class OllamaProxy:
             # Wait for scheduler to grant this request (model loaded and ready)
             try:
                 await asyncio.wait_for(grant_event.wait(), timeout=self._queue_timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 cancel_fn()  # Remove from queue + pending grants + pending completions
-                logger.warning("Request %s timed out in queue after %.0fs", queued.id, self._queue_timeout)
+                logger.warning(
+                    "Request %s timed out in queue after %.0fs",
+                    queued.id, self._queue_timeout,
+                )
                 return JSONResponse(
                     {"error": "Request timed out waiting in scheduler queue"},
                     status_code=504,
@@ -241,7 +249,9 @@ class OllamaProxy:
                 )
                 done_fn = None  # Generator owns done_fn now; prevent double-call in finally
             else:
-                result = await self._forward_response(request, target_url, modified_body, model, path, tier)
+                result = await self._forward_response(
+                    request, target_url, modified_body, model, path, tier,
+                )
         finally:
             # Non-streaming: call done_fn here (after _forward_response returns).
             # Streaming: done_fn was handed to the generator; only call here if
@@ -273,12 +283,20 @@ class OllamaProxy:
 
         return result
 
+    # Endpoints that stream NDJSON progress (model pull/push/create).
+    # These must be proxied with streaming, not buffered.
+    _STREAMING_PASSTHROUGH = {"/api/pull", "/api/push", "/api/create"}
+
     async def _handle_passthrough(
         self, request: Request, path: str, body: bytes,
     ) -> StreamingResponse | JSONResponse:
         """Forward request to Ollama without scheduling."""
         target_url = f"{self._backend_url}{path}"
         method = request.method.upper()
+
+        # Streaming passthrough for long-running NDJSON endpoints
+        if path in self._STREAMING_PASSTHROUGH and method == "POST":
+            return await self._stream_passthrough(request, target_url, body)
 
         try:
             headers = self._forward_headers(request)
@@ -289,17 +307,19 @@ class OllamaProxy:
 
             # Cache /api/tags response for graceful degradation
             if path == "/api/tags" and resp.status_code == 200 and self.circuit_breaker:
-                try:
+                with contextlib.suppress(Exception):
                     self.circuit_breaker.set_cached_tags(resp.json())
-                except Exception:
-                    pass
 
             # Record success for circuit breaker
             if self.circuit_breaker:
                 await self.circuit_breaker.record_success()
 
             return JSONResponse(
-                content=resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"raw": resp.text},
+                content=(
+                    resp.json()
+                    if resp.headers.get("content-type", "").startswith("application/json")
+                    else {"raw": resp.text}
+                ),
                 status_code=resp.status_code,
             )
         except Exception as e:
@@ -317,10 +337,45 @@ class OllamaProxy:
 
             return JSONResponse({"error": f"Ollama backend unavailable: {e}"}, status_code=502)
 
+    async def _stream_passthrough(
+        self, request: Request, url: str, body: bytes,
+    ) -> StreamingResponse | JSONResponse:
+        """Stream a passthrough response (for /api/pull, /api/push, /api/create).
+
+        These endpoints return NDJSON progress updates over long-running
+        operations (model downloads can be tens of GB). Buffering the full
+        response would make the client appear frozen.
+        """
+        headers = self._forward_headers(request)
+        cb = self.circuit_breaker
+
+        async def generate():
+            try:
+                async with self._http.stream(
+                    "POST", url, content=body, headers=headers,
+                ) as resp:
+                    async for chunk in resp.aiter_bytes():
+                        yield chunk
+                if cb:
+                    await cb.record_success()
+            except Exception as e:
+                logger.error("Streaming passthrough error: %s", e)
+                if cb:
+                    await cb.record_failure()
+                error_json = json.dumps({"error": str(e)}).encode() + b"\n"
+                yield error_json
+            finally:
+                self._requests_served += 1
+
+        return StreamingResponse(
+            generate(),
+            media_type="application/x-ndjson",
+        )
+
     async def _stream_response(
         self, request: Request, url: str, body: bytes,
         model: str = "", path: str = "", tier: PriorityTier = PriorityTier.AGENT,
-        done_fn: Optional[Callable[[], None]] = None,
+        done_fn: Callable[[], None] | None = None,
     ) -> StreamingResponse:
         """Stream Ollama's NDJSON response back to the client.
 

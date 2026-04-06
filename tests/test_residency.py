@@ -1,4 +1,7 @@
-"""Tests for residency-aware scheduling — co-resident transitions, cache expiry, affinity interaction."""
+"""Tests for residency-aware scheduling.
+
+Covers co-resident transitions, cache expiry, affinity interaction.
+"""
 
 from __future__ import annotations
 
@@ -222,7 +225,9 @@ class TestResidencyState:
 
 class TestCoResidentSkipCooldown:
     @pytest.mark.asyncio
-    async def test_alternating_coresident_models_skip_cooldown(self, residency_config, dispatch_log):
+    async def test_alternating_coresident_models_skip_cooldown(
+        self, residency_config, dispatch_log,
+    ):
         """Alternating requests between two co-resident models should NOT trigger cooldown."""
         log, dispatch_fn = dispatch_log
         queue = AffinityQueue(residency_config.scheduler)
@@ -239,15 +244,21 @@ class TestCoResidentSkipCooldown:
         queue.enqueue(make_request(model="mistral-nemo:12b", tier=PriorityTier.INTERACTIVE))
         queue.enqueue(make_request(model="qwen3:14b", tier=PriorityTier.INTERACTIVE))
 
-        with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=loaded_models), \
-             patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))), \
-             patch.object(tracker, "can_load_model", new_callable=AsyncMock, return_value=(True, "OK")):
+        with (
+            patch.object(tracker, "get_loaded_models",
+                         new_callable=AsyncMock, return_value=loaded_models),
+            patch("bastion.scheduler.check_gpu_safe",
+                  AsyncMock(return_value=(True, "OK"))),
+            patch.object(tracker, "can_load_model",
+                         new_callable=AsyncMock, return_value=(True, "OK")),
+        ):
             sched = Scheduler(residency_config, queue, tracker, dispatch_fn)
             await sched.start()
             sched.notify()
 
             # Wait for all requests to dispatch
-            # Without residency-aware scheduling, this would take 0.2s * 2 swaps = 0.4s+
+            # Without residency-aware scheduling, this would take
+            # 0.2s * 2 swaps = 0.4s+
             # With residency-aware, should complete quickly (no cooldown)
             for _ in range(100):
                 await asyncio.sleep(0.02)
@@ -282,9 +293,14 @@ class TestEvictionTriggersSwap:
 
         start_time = time.time()
 
-        with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=loaded_models), \
-             patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))), \
-             patch.object(tracker, "can_load_model", new_callable=AsyncMock, return_value=(True, "OK")):
+        with (
+            patch.object(tracker, "get_loaded_models",
+                         new_callable=AsyncMock, return_value=loaded_models),
+            patch("bastion.scheduler.check_gpu_safe",
+                  AsyncMock(return_value=(True, "OK"))),
+            patch.object(tracker, "can_load_model",
+                         new_callable=AsyncMock, return_value=(True, "OK")),
+        ):
             sched = Scheduler(residency_config, queue, tracker, dispatch_fn)
             await sched.start()
             sched.notify()
@@ -331,9 +347,14 @@ class TestResidencyWithAffinity:
         queue.enqueue(make_request(model="mistral-nemo:12b", tier=PriorityTier.AGENT))
         queue.enqueue(make_request(model="qwen3:14b", tier=PriorityTier.AGENT))
 
-        with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=loaded_models), \
-             patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))), \
-             patch.object(tracker, "can_load_model", new_callable=AsyncMock, return_value=(True, "OK")):
+        with (
+            patch.object(tracker, "get_loaded_models",
+                         new_callable=AsyncMock, return_value=loaded_models),
+            patch("bastion.scheduler.check_gpu_safe",
+                  AsyncMock(return_value=(True, "OK"))),
+            patch.object(tracker, "can_load_model",
+                         new_callable=AsyncMock, return_value=(True, "OK")),
+        ):
             sched = Scheduler(residency_config, queue, tracker, dispatch_fn)
             await sched.start()
             sched.notify()

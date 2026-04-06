@@ -22,8 +22,9 @@ import json
 import logging
 import time
 from collections import deque
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator, Callable, Dict
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, FastAPI, Request
@@ -31,7 +32,8 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import bastion
 from bastion import audit
-from bastion.auth import make_admin_key_dependency, make_a2a_token_dependency
+from bastion.auth import make_a2a_token_dependency, make_admin_key_dependency
+from bastion.circuitbreaker import CircuitBreakerTransport
 from bastion.health import check_gpu_safe, query_gpu_status
 from bastion.metrics import CONTENT_TYPE_LATEST, PROMETHEUS_AVAILABLE, get_metrics_text
 from bastion.middleware import MetricsMiddleware
@@ -43,7 +45,6 @@ from bastion.models import (
     PriorityTier,
     QueuedRequest,
 )
-from bastion.circuitbreaker import CircuitBreakerTransport
 from bastion.proxy import OllamaProxy
 from bastion.queue import AffinityQueue
 from bastion.ratelimit import RateLimitMiddleware
@@ -74,26 +75,26 @@ _start_time: float = 0.0
 
 # Maps request ID -> asyncio.Event that the scheduler sets when the request
 # is granted (model loaded, ready to forward to Ollama).
-_pending_grants: Dict[str, asyncio.Event] = {}
+_pending_grants: dict[str, asyncio.Event] = {}
 
 # Maps request ID -> asyncio.Event set by the proxy when the Ollama response
 # completes. _dispatch_request awaits this to block the scheduler until one
 # request finishes before granting the next — prevents concurrent Ollama access
 # which can crash the GPU under sustained load.
-_pending_completions: Dict[str, asyncio.Event] = {}
+_pending_completions: dict[str, asyncio.Event] = {}
 
 # Tracks models with in-flight (actively running) inference requests.
 # Used by the scheduler to decide whether concurrent dispatch is safe:
 # - Different co-resident models → dispatch concurrently
 # - Same model already in-flight → serialize (OLLAMA_NUM_PARALLEL=1)
-_inflight_models: Dict[str, int] = {}  # model -> count of in-flight requests
+_inflight_models: dict[str, int] = {}  # model -> count of in-flight requests
 _inflight_lock: asyncio.Lock | None = None  # initialized in lifespan
 
 # S6: Active intent declarations (intent_id -> IntentDeclaration)
-_active_intents: Dict[str, IntentDeclaration] = {}
+_active_intents: dict[str, IntentDeclaration] = {}
 
 # S6: Resolved intent metadata (intent_id -> (PriorityTier, model_sequence))
-_resolved_intents: Dict[str, tuple] = {}
+_resolved_intents: dict[str, tuple] = {}
 
 
 def _lookup_intent(intent_id: str):
@@ -292,7 +293,7 @@ async def _dispatch_request(request: QueuedRequest, needs_swap: bool = True) -> 
             timeout = (_config.proxy.inference_timeout_seconds if _config else 300.0) + 60.0
             try:
                 await asyncio.wait_for(done_event.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(
                     "Completion event timed out for request %s (%.0fs) — "
                     "client may have disconnected or Ollama hung",
@@ -319,7 +320,7 @@ async def _dispatch_request(request: QueuedRequest, needs_swap: bool = True) -> 
                 timeout = (_config.proxy.inference_timeout_seconds if _config else 300.0) + 60.0
                 try:
                     await asyncio.wait_for(original_done_event.wait(), timeout=timeout)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     logger.warning(
                         "Completion event timed out for non-blocking request %s (%.0fs)",
                         request.id, timeout,
@@ -394,32 +395,50 @@ async def _startup_self_test(config: BrokerConfig) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator:
     """Manage proxy, tracker, queue, and scheduler lifecycle."""
-    global _proxy, _vram_tracker, _vram_manager, _queue, _scheduler, _a2a_handler, _start_time
+    global _proxy, _vram_tracker, _vram_manager, _queue, _scheduler, _a2a_handler, _a2a_http_client, _start_time
 
     config: BrokerConfig = app.state.config
 
-    # Initialize audit logger (tier from config)
+    # Initialize audit logger (tier from config, path from bastion.paths)
+    from bastion.paths import audit_log_path as _audit_path
+
+    _resolved_audit = _audit_path()
     audit.init_audit_logger(
-        log_path="/tmp/bastion-audit.jsonl",
+        log_path=_resolved_audit,
         max_bytes=10 * 1024 * 1024,
         backup_count=5,
         tier=config.audit.tier,
     )
-    logger.info("Audit logging initialized: /tmp/bastion-audit.jsonl (tier=%d)", config.audit.tier)
+    logger.info("Audit logging initialized: %s (tier=%d)", _resolved_audit, config.audit.tier)
 
     # Pre-flight: check Ollama connectivity (non-blocking, warn-only)
     try:
         async with httpx.AsyncClient(timeout=5.0) as preflight:
             resp = await preflight.get(f"{config.ollama.base_url}/api/tags")
             resp.raise_for_status()
-            tag_count = len(resp.json().get("models", []))
-            logger.info(
-                "Ollama pre-flight OK: %s reachable (%d models available)",
-                config.ollama.base_url, tag_count,
-            )
+            data = resp.json()
+            tag_count = len(data.get("models", []))
+            if tag_count == 0:
+                logger.info(
+                    "Ollama reachable at %s but has no models installed. "
+                    "Pull models from https://ollama.com/library — e.g.: "
+                    "ollama pull llama3.1:8b",
+                    config.ollama.base_url,
+                )
+            else:
+                logger.info(
+                    "Ollama pre-flight OK: %s reachable (%d model%s available)",
+                    config.ollama.base_url, tag_count, "" if tag_count == 1 else "s",
+                )
+    except httpx.ConnectError:
+        logger.warning(
+            "Cannot connect to Ollama at %s. Is Ollama running? "
+            "Start it with: OLLAMA_HOST=127.0.0.1:%d ollama serve",
+            config.ollama.base_url, config.ollama.port,
+        )
     except Exception as e:
         logger.warning(
-            "Ollama pre-flight FAILED: %s — BASTION will start anyway, "
+            "Ollama pre-flight failed: %s \u2014 BASTION will start anyway, "
             "but proxy requests will fail until Ollama is available. Error: %s",
             config.ollama.base_url, e,
         )
@@ -573,7 +592,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
     # Metrics recording
     app.add_middleware(MetricsMiddleware)
 
-    # ── Auth dependencies from config ─────────────────────────────────
+    # ── Auth dependencies from config ────────────────────────────────
     verify_admin = make_admin_key_dependency(config.auth)
     verify_a2a = make_a2a_token_dependency(config.a2a)
 
@@ -581,14 +600,19 @@ def create_app(config: BrokerConfig) -> FastAPI:
     broker_router = APIRouter(prefix="/broker", dependencies=[Depends(verify_admin)])
     a2a_router = APIRouter(prefix="/a2a", dependencies=[Depends(verify_a2a)])
 
-    # ── Admin API routes (/broker/*) ──────────────────────────────────
+    # ── Admin API routes (/broker/*) ─────────────────────────────────
 
     @broker_router.get("/status")
-    async def broker_status() -> BrokerStatus:
-        """Get broker status: queue depth, loaded models, GPU health."""
+    async def broker_status() -> dict[str, Any]:
+        """Get broker status: queue depth, loaded models, GPU health.
+
+        Returns the base BrokerStatus fields plus additional observability
+        fields (total_dispatched, swap_rate_level, stall diagnostics,
+        inflight models, circuit breaker state, GPU safety, VRAM budget).
+        """
         loaded = await _vram_tracker.get_loaded_models() if _vram_tracker else []
         gpu = await query_gpu_status()
-        return BrokerStatus(
+        status = BrokerStatus(
             uptime_seconds=time.time() - _start_time,
             queue_depth=_queue.total_size if _queue else 0,
             queue_by_model=_queue.queue_depth_by_model() if _queue else {},
@@ -600,6 +624,46 @@ def create_app(config: BrokerConfig) -> FastAPI:
             state="draining" if (_scheduler and _scheduler.is_draining) else "running",
             vram_ledger=_vram_manager.status() if _vram_manager else None,
         )
+        result = status.model_dump()
+
+        # -- Observability fields (Phase 1: wire hidden data) --
+
+        # T1-02: total_dispatched (distinct from total_requests_served)
+        result["total_dispatched"] = _scheduler.total_dispatched if _scheduler else 0
+
+        # T1-03: swap_rate_level (normal / warn / critical)
+        result["swap_rate_level"] = _scheduler._swap_rate_level if _scheduler else "normal"
+
+        # T1-04: stall diagnostics
+        result["stall_reason"] = _scheduler.stall_reason if _scheduler else ""
+        if _scheduler and _scheduler.stall_reason and _scheduler.stall_time > 0:
+            result["stall_duration_seconds"] = round(
+                time.time() - _scheduler.stall_time, 2,
+            )
+        else:
+            result["stall_duration_seconds"] = None
+
+        # T1-05: inflight models dict
+        result["inflight_models"] = dict(_inflight_models)
+
+        # T1-08: circuit breaker state
+        if _proxy and hasattr(_proxy, "circuit_breaker") and _proxy.circuit_breaker:
+            cb = _proxy.circuit_breaker
+            result["circuit_breaker"] = {
+                "state": cb.state,
+                "consecutive_failures": cb._consecutive_failures,
+                "opened_at": cb._opened_at if cb._opened_at > 0 else None,
+            }
+        else:
+            result["circuit_breaker"] = None
+
+        # T1-10: max_vram_gb from config
+        result["max_vram_gb"] = config.gpu.max_vram_gb
+
+        # T1-06: gpu_is_safe computed from GPUStatus.is_safe(config.gpu)
+        result["gpu_is_safe"] = gpu.is_safe(config.gpu)
+
+        return result
 
     @broker_router.get("/queue")
     async def broker_queue():
@@ -656,7 +720,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
             return JSONResponse({"error": "VRAMManager not initialized"}, status_code=503)
         return _vram_manager.status()
 
-    # ── Kubernetes-compatible health probes ───────────────────────────
+    # ── Kubernetes-compatible health probes ──────────────────────────
 
     @broker_router.get("/livez")
     async def broker_livez():
@@ -673,10 +737,13 @@ def create_app(config: BrokerConfig) -> FastAPI:
             return Response(content="not ready: proxy not initialized",
                             status_code=503, media_type="text/plain")
         # Check circuit breaker — if open, we're not ready for proxy traffic
-        if hasattr(_proxy, "circuit_breaker") and _proxy.circuit_breaker:
-            if _proxy.circuit_breaker.state == "open":
-                return Response(content="not ready: circuit breaker open",
-                                status_code=503, media_type="text/plain")
+        if (
+            hasattr(_proxy, "circuit_breaker")
+            and _proxy.circuit_breaker
+            and _proxy.circuit_breaker.state == "open"
+        ):
+            return Response(content="not ready: circuit breaker open",
+                            status_code=503, media_type="text/plain")
         return Response(content="ok", media_type="text/plain")
 
     @broker_router.post("/preload")
@@ -747,7 +814,10 @@ def create_app(config: BrokerConfig) -> FastAPI:
             return JSONResponse(
                 {
                     "error": "Metrics not available",
-                    "details": "prometheus-client not installed. Install with: pip install bastion[metrics]",
+                    "details": (
+                        "prometheus-client not installed."
+                        " Install with: pip install bastion[metrics]"
+                    ),
                 },
                 status_code=501,
             )
@@ -758,7 +828,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
             media_type=CONTENT_TYPE_LATEST,
         )
 
-    # ── Watchdog status (S11: Process Monitor) ─────────────────────────
+    # ── Watchdog status (S11: Process Monitor) ──────────────────────
 
     @broker_router.get("/watchdog")
     async def broker_watchdog():
@@ -767,14 +837,14 @@ def create_app(config: BrokerConfig) -> FastAPI:
             return JSONResponse({"error": "Process monitor not initialized"}, status_code=503)
         return _process_monitor.status.model_dump()
 
-    # ── Recent Requests (S5: Dashboard Evolution) ─────────────────────
+    # ── Recent Requests (S5: Dashboard Evolution) ──────────────────
 
     @broker_router.get("/recent")
     async def broker_recent():
         """Return last 50 completed requests for dashboard trace viewer."""
         return list(_recent_requests)
 
-    # ── S6: Model Intent API ─────────────────────────────────────────
+    # ── S6: Model Intent API ────────────────────────────────────────
 
     @broker_router.post("/intent")
     async def broker_intent(request: Request):
@@ -860,7 +930,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
         logger.info("Intent deleted: %s", intent_id)
         return {"status": "deleted", "intent_id": intent_id}
 
-    # ── A2A Interface Routes ─────────────────────────────────────────
+    # ── A2A Interface Routes ────────────────────────────────────────
 
     async def _sse_wrapper(generator: AsyncGenerator[dict, None]) -> AsyncGenerator[bytes, None]:
         """Wrap A2A events as SSE-formatted bytes.
@@ -878,6 +948,13 @@ def create_app(config: BrokerConfig) -> FastAPI:
                 continue
             data = json.dumps(event)
             yield f"data: {data}\n\n".encode()
+
+    @a2a_router.get("/stats")
+    async def a2a_stats():
+        """Task store statistics for monitoring."""
+        if not _a2a_handler:
+            return JSONResponse({"error": "A2A interface not enabled"}, status_code=501)
+        return _a2a_handler._store.stats()
 
     @a2a_router.post("/tasks")
     async def a2a_create_task(request: Request):
@@ -932,7 +1009,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
             return JSONResponse({"error": "Task not found or not cancelable"}, status_code=404)
         return {"status": "canceled", "task_id": task_id}
 
-    # ── Lease Management (Hybrid Lease Model) ────────────────────────
+    # ── Lease Management (Hybrid Lease Model) ───────────────────────
 
     @a2a_router.post("/leases/{lease_id}/heartbeat")
     async def a2a_lease_heartbeat(lease_id: str, request: Request):
@@ -972,7 +1049,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
             return JSONResponse({"error": "Lease not found"}, status_code=404)
         return {"status": "released", "lease_id": lease_id}
 
-    # ── Agent Card (A2A Protocol) — Three-Tier Disclosure ─────────────
+    # ── Agent Card (A2A Protocol) -- Three-Tier Disclosure ─────────
 
     @app.get("/.well-known/agent-card.json")
     async def agent_card():
@@ -1011,7 +1088,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
             "security": [{"BearerToken": []}],
         }
 
-    # ── Tier 2: Extended Card (authenticated A2A agents) ─────────────
+    # ── Tier 2: Extended Card (authenticated A2A agents) ────────────
 
     @a2a_router.get("/extended-card")
     async def a2a_extended_card():
@@ -1026,7 +1103,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
 
         return await _a2a_handler.build_extended_card()
 
-    # ── Ollama proxy routes (catch-all) ───────────────────────────────
+    # ── Ollama proxy routes (catch-all) ──────────────────────────────
     # These MUST be last so /broker/* and /.well-known/* match first
 
     @app.api_route(
@@ -1039,20 +1116,33 @@ def create_app(config: BrokerConfig) -> FastAPI:
             return JSONResponse({"error": "Proxy not initialized"}, status_code=503)
         return await _proxy.handle_request(request)
 
+    # OpenAI-compatible endpoints — Ollama serves /v1/chat/completions,
+    # /v1/completions, /v1/embeddings, /v1/models. Passthrough to Ollama.
+    @app.api_route(
+        "/v1/{path:path}",
+        methods=["GET", "POST", "PUT", "DELETE", "HEAD"],
+    )
+    async def proxy_ollama_v1(request: Request, path: str):
+        """Proxy all /v1/* requests to Ollama backend (OpenAI-compatible API)."""
+        if not _proxy:
+            return JSONResponse({"error": "Proxy not initialized"}, status_code=503)
+        return await _proxy.handle_request(request)
+
     # Root endpoint — Ollama returns "Ollama is running"
-    @app.get("/")
+    # HEAD is needed because the ollama CLI sends HEAD / to check connectivity
+    @app.api_route("/", methods=["GET", "HEAD"])
     async def root():
         """Mimic Ollama's root response (some clients check this)."""
         return "Ollama is running"
 
-    # ── Include routers ──────────────────────────────────────────────
+    # ── Include routers ─────────────────────────────────────────────
     app.include_router(broker_router)
     app.include_router(a2a_router)
 
     return app
 
 
-# ── Two-port mode: separate proxy and admin apps ─────────────────
+# ── Two-port mode: separate proxy and admin apps ────────────────
 # When config.server.two_port_mode is True, BASTION runs two uvicorn
 # servers sharing the same module-level state (scheduler, queue, VRAM).
 
@@ -1098,7 +1188,7 @@ def create_proxy_app(config: BrokerConfig) -> FastAPI:
     app.add_middleware(RateLimitMiddleware, config=config.rate_limit)
     app.add_middleware(MetricsMiddleware)
 
-    # ── Ollama proxy routes ──────────────────────────────────────────
+    # ── Ollama proxy routes ─────────────────────────────────────────
 
     @app.api_route(
         "/api/{path:path}",
@@ -1110,7 +1200,17 @@ def create_proxy_app(config: BrokerConfig) -> FastAPI:
             return JSONResponse({"error": "Proxy not initialized"}, status_code=503)
         return await _proxy.handle_request(request)
 
-    @app.get("/")
+    @app.api_route(
+        "/v1/{path:path}",
+        methods=["GET", "POST", "PUT", "DELETE", "HEAD"],
+    )
+    async def proxy_ollama_v1(request: Request, path: str) -> Response:
+        """Proxy all /v1/* requests to Ollama backend (OpenAI-compatible API)."""
+        if not _proxy:
+            return JSONResponse({"error": "Proxy not initialized"}, status_code=503)
+        return await _proxy.handle_request(request)
+
+    @app.api_route("/", methods=["GET", "HEAD"])
     async def root() -> str:
         """Mimic Ollama's root response (some clients check this)."""
         return "Ollama is running"
@@ -1164,21 +1264,26 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
     # Metrics middleware only (no proxy-style rate limiting on admin port)
     app.add_middleware(MetricsMiddleware)
 
-    # ── Auth dependencies ─────────────────────────────────────────────
+    # ── Auth dependencies ──────────────────────────────────────────
     verify_admin = make_admin_key_dependency(config.auth)
     verify_a2a = make_a2a_token_dependency(config.a2a)
 
     broker_router = APIRouter(prefix="/broker", dependencies=[Depends(verify_admin)])
     a2a_router = APIRouter(prefix="/a2a", dependencies=[Depends(verify_a2a)])
 
-    # ── Admin API routes (/broker/*) ──────────────────────────────────
+    # ── Admin API routes (/broker/*) ─────────────────────────────────
 
     @broker_router.get("/status")
-    async def broker_status() -> BrokerStatus:
-        """Get broker status: queue depth, loaded models, GPU health."""
+    async def broker_status() -> dict[str, Any]:
+        """Get broker status: queue depth, loaded models, GPU health.
+
+        Returns the base BrokerStatus fields plus additional observability
+        fields (total_dispatched, swap_rate_level, stall diagnostics,
+        inflight models, circuit breaker state, GPU safety, VRAM budget).
+        """
         loaded = await _vram_tracker.get_loaded_models() if _vram_tracker else []
         gpu = await query_gpu_status()
-        return BrokerStatus(
+        status = BrokerStatus(
             uptime_seconds=time.time() - _start_time,
             queue_depth=_queue.total_size if _queue else 0,
             queue_by_model=_queue.queue_depth_by_model() if _queue else {},
@@ -1190,6 +1295,46 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
             state="draining" if (_scheduler and _scheduler.is_draining) else "running",
             vram_ledger=_vram_manager.status() if _vram_manager else None,
         )
+        result = status.model_dump()
+
+        # -- Observability fields (Phase 1: wire hidden data) --
+
+        # T1-02: total_dispatched (distinct from total_requests_served)
+        result["total_dispatched"] = _scheduler.total_dispatched if _scheduler else 0
+
+        # T1-03: swap_rate_level (normal / warn / critical)
+        result["swap_rate_level"] = _scheduler._swap_rate_level if _scheduler else "normal"
+
+        # T1-04: stall diagnostics
+        result["stall_reason"] = _scheduler.stall_reason if _scheduler else ""
+        if _scheduler and _scheduler.stall_reason and _scheduler.stall_time > 0:
+            result["stall_duration_seconds"] = round(
+                time.time() - _scheduler.stall_time, 2,
+            )
+        else:
+            result["stall_duration_seconds"] = None
+
+        # T1-05: inflight models dict
+        result["inflight_models"] = dict(_inflight_models)
+
+        # T1-08: circuit breaker state
+        if _proxy and hasattr(_proxy, "circuit_breaker") and _proxy.circuit_breaker:
+            cb = _proxy.circuit_breaker
+            result["circuit_breaker"] = {
+                "state": cb.state,
+                "consecutive_failures": cb._consecutive_failures,
+                "opened_at": cb._opened_at if cb._opened_at > 0 else None,
+            }
+        else:
+            result["circuit_breaker"] = None
+
+        # T1-10: max_vram_gb from config
+        result["max_vram_gb"] = config.gpu.max_vram_gb
+
+        # T1-06: gpu_is_safe computed from GPUStatus.is_safe(config.gpu)
+        result["gpu_is_safe"] = gpu.is_safe(config.gpu)
+
+        return result
 
     @broker_router.get("/queue")
     async def broker_queue():
@@ -1249,10 +1394,13 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
         if not _proxy:
             return Response(content="not ready: proxy not initialized",
                             status_code=503, media_type="text/plain")
-        if hasattr(_proxy, "circuit_breaker") and _proxy.circuit_breaker:
-            if _proxy.circuit_breaker.state == "open":
-                return Response(content="not ready: circuit breaker open",
-                                status_code=503, media_type="text/plain")
+        if (
+            hasattr(_proxy, "circuit_breaker")
+            and _proxy.circuit_breaker
+            and _proxy.circuit_breaker.state == "open"
+        ):
+            return Response(content="not ready: circuit breaker open",
+                            status_code=503, media_type="text/plain")
         return Response(content="ok", media_type="text/plain")
 
     @broker_router.post("/preload")
@@ -1314,7 +1462,10 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
             return JSONResponse(
                 {
                     "error": "Metrics not available",
-                    "details": "prometheus-client not installed. Install with: pip install bastion[metrics]",
+                    "details": (
+                        "prometheus-client not installed."
+                        " Install with: pip install bastion[metrics]"
+                    ),
                 },
                 status_code=501,
             )
@@ -1398,7 +1549,7 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
         logger.info("Intent deleted: %s", intent_id)
         return {"status": "deleted", "intent_id": intent_id}
 
-    # ── A2A Interface Routes ─────────────────────────────────────────
+    # ── A2A Interface Routes ────────────────────────────────────────
 
     async def _sse_wrapper_admin(
         generator: AsyncGenerator[dict, None],
@@ -1412,6 +1563,13 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
                 continue
             data = json.dumps(event)
             yield f"data: {data}\n\n".encode()
+
+    @a2a_router.get("/stats")
+    async def a2a_stats():
+        """Task store statistics for monitoring."""
+        if not _a2a_handler:
+            return JSONResponse({"error": "A2A interface not enabled"}, status_code=501)
+        return _a2a_handler._store.stats()
 
     @a2a_router.post("/tasks")
     async def a2a_create_task(request: Request):
@@ -1492,7 +1650,7 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
             return JSONResponse({"error": "Lease not found"}, status_code=404)
         return {"status": "released", "lease_id": lease_id}
 
-    # ── Agent Card (Three-Tier Disclosure) ────────────────────────────
+    # ── Agent Card (Three-Tier Disclosure) ───────────────────────────
 
     @app.get("/.well-known/agent-card.json")
     async def agent_card():
@@ -1528,7 +1686,7 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
             "security": [{"BearerToken": []}],
         }
 
-    # ── Tier 2: Extended Card (authenticated A2A agents) ─────────────
+    # ── Tier 2: Extended Card (authenticated A2A agents) ────────────
 
     @a2a_router.get("/extended-card")
     async def a2a_extended_card():
@@ -1540,7 +1698,7 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
             return JSONResponse({"error": "A2A interface not enabled"}, status_code=501)
         return await _a2a_handler.build_extended_card()
 
-    # ── Include routers ──────────────────────────────────────────────
+    # ── Include routers ─────────────────────────────────────────────
     app.include_router(broker_router)
     app.include_router(a2a_router)
 

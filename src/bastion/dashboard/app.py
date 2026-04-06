@@ -22,6 +22,7 @@ from bastion.dashboard.modals import (
     GPUProcessListModal,
     HelpModal,
     ModelSelectModal,
+    fan_control_available,
     set_fan_speed,
 )
 from bastion.dashboard.panels_broker import (
@@ -73,7 +74,7 @@ class BastionDashboard(App):
     }
 
     SafetyLimitsBar {
-        height: 1;
+        height: 2;
         dock: top;
         background: $boost;
     }
@@ -108,6 +109,10 @@ class BastionDashboard(App):
         Binding("1", "layout_compact", "Compact"),
         Binding("2", "layout_standard", "Standard"),
         Binding("3", "layout_full", "Full"),
+        Binding("plus,equal", "sparkline_wider", "+Spark", show=False),
+        Binding("minus,underscore", "sparkline_narrower", "-Spark", show=False),
+        Binding("right_square_bracket", "history_longer", "+Hist", show=False),
+        Binding("left_square_bracket", "history_shorter", "-Hist", show=False),
     ]
 
     def __init__(
@@ -130,11 +135,22 @@ class BastionDashboard(App):
         self._client = BastionClient(url, api_key=api_key)
         self._collector = SystemDataCollector()
 
-        # History deques
-        self.vram_history: deque[float] = deque(maxlen=60)
-        self.temp_history: deque[float] = deque(maxlen=60)
-        self.queue_history: deque[float] = deque(maxlen=60)
+        # History deques (length configurable via helpers.HISTORY_LEN)
+        from bastion.dashboard.helpers import HISTORY_LEN
+        self.vram_history: deque[float] = deque(maxlen=HISTORY_LEN)
+        self.temp_history: deque[float] = deque(maxlen=HISTORY_LEN)
+        self.queue_history: deque[float] = deque(maxlen=HISTORY_LEN)
+        self.power_history: deque[float] = deque(maxlen=HISTORY_LEN)
+        self.throughput_history: deque[float] = deque(maxlen=HISTORY_LEN)
+        self.swap_rate_history: deque[float] = deque(maxlen=HISTORY_LEN)
+        self.latency_p50_history: deque[float] = deque(maxlen=HISTORY_LEN)
+        self.latency_p95_history: deque[float] = deque(maxlen=HISTORY_LEN)
+        self.ollama_latency_history: deque[float] = deque(maxlen=HISTORY_LEN)
         self.alert_history: deque[dict[str, Any]] = deque(maxlen=100)
+
+        # Previous counters for rate computation (delta between polls)
+        self._prev_requests_served: int | None = None
+        self._prev_model_swaps: int | None = None
 
         # Connection tracking
         self._connected: bool = False
@@ -171,11 +187,11 @@ class BastionDashboard(App):
                 yield MemoryPanel(id="memory")
                 yield NetworkPanel(id="network")
                 yield CPUPanel(id="cpu")
+                yield AlertPanel(id="alerts")
             with VerticalScroll(id="third-col"):
                 yield SchedulerPanel(id="scheduler")
                 yield WatchdogPanel(id="watchdog")
                 yield CircuitBreakerPanel(id="circuit-breaker")
-                yield AlertPanel(id="alerts")
                 yield TracePanel(id="trace")
                 yield A2ATaskPanel(id="a2a-tasks")
                 yield LeasePanel(id="leases")
@@ -207,9 +223,10 @@ class BastionDashboard(App):
         right_col = self.query_one("#right-col")
         third_col = self.query_one("#third-col")
 
-        # Secondary panels in the third column
-        secondary_ids = {"trace", "a2a-tasks", "leases", "audit-stream"}
-        non_secondary_ids = {"scheduler", "watchdog", "circuit-breaker", "alerts"}
+        # Secondary panels: hidden by default, shown with [t] toggle
+        secondary_ids = {"a2a-tasks", "leases", "audit-stream"}
+        # Always visible in full mode (trace is request history — essential)
+        non_secondary_ids = {"scheduler", "watchdog", "circuit-breaker", "trace"}
 
         if self._layout_mode == "compact":
             right_col.display = False
@@ -298,8 +315,28 @@ class BastionDashboard(App):
         if temp is not None:
             self.temp_history.append(float(temp))
 
+        power = gpu.get("power_draw_watts")
+        if power is not None:
+            self.power_history.append(float(power))
+
         queue_depth = data.get("queue_depth", 0)
         self.queue_history.append(float(queue_depth))
+
+        # Throughput rate (requests/poll interval → requests/min)
+        served = data.get("total_requests_served", 0)
+        if self._prev_requests_served is not None:
+            delta = served - self._prev_requests_served
+            rate_per_min = delta * (60.0 / self._interval) if self._interval > 0 else 0
+            self.throughput_history.append(rate_per_min)
+        self._prev_requests_served = served
+
+        # Swap rate (swaps/poll interval → swaps/min)
+        swaps = data.get("total_model_swaps", 0)
+        if self._prev_model_swaps is not None:
+            delta = swaps - self._prev_model_swaps
+            rate_per_min = delta * (60.0 / self._interval) if self._interval > 0 else 0
+            self.swap_rate_history.append(rate_per_min)
+        self._prev_model_swaps = swaps
 
         # Auto-fan and alert evaluation
         self._check_auto_fan(data)
@@ -328,6 +365,24 @@ class BastionDashboard(App):
             queue_diag = {}
         if isinstance(recent, BaseException):
             recent = []
+
+        # Compute latency percentiles from recent requests
+        if isinstance(recent, list) and recent:
+            durations = sorted(
+                r.get("duration_s", 0) for r in recent if isinstance(r, dict)
+            )
+            if durations:
+                n = len(durations)
+                p50 = durations[n // 2]
+                p95 = durations[min(int(n * 0.95), n - 1)]
+                self.latency_p50_history.append(p50)
+                self.latency_p95_history.append(p95)
+
+        # Track Ollama response latency from watchdog
+        if isinstance(watchdog_data, dict):
+            ollama_ms = watchdog_data.get("ollama_latency_ms")
+            if ollama_ms is not None:
+                self.ollama_latency_history.append(float(ollama_ms))
 
         # Update safety limits from broker config if available
         safety_bar = self.query_one("#safety-bar", SafetyLimitsBar)
@@ -360,13 +415,21 @@ class BastionDashboard(App):
 
         # Update left-col panels
         gpu_panel = self.query_one("#gpu", GPUPanel)
-        gpu_panel.update(gpu_panel.render_data(data))
+        gpu_panel.update(gpu_panel.render_data(
+            data,
+            power_history=list(self.power_history),
+        ))
 
         models_panel = self.query_one("#models", ModelsPanel)
         models_panel.update(models_panel.render_data(data))
 
         queue_panel = self.query_one("#queue", QueuePanel)
-        queue_panel.update(queue_panel.render_data(data, queue_diag=queue_diag))
+        queue_panel.update(queue_panel.render_data(
+            data,
+            queue_diag=queue_diag,
+            latency_p50_history=list(self.latency_p50_history),
+            latency_p95_history=list(self.latency_p95_history),
+        ))
 
         vram_panel = self.query_one("#vram-ledger", VRAMLedgerPanel)
         vram_panel.update(vram_panel.render_data(vram_ledger))
@@ -413,10 +476,17 @@ class BastionDashboard(App):
 
         # Update third-col panels
         sched_panel = self.query_one("#scheduler", SchedulerPanel)
-        sched_panel.update(sched_panel.render_data(data))
+        sched_panel.update(sched_panel.render_data(
+            data,
+            throughput_history=list(self.throughput_history),
+            swap_rate_history=list(self.swap_rate_history),
+        ))
 
         wd_panel = self.query_one("#watchdog", WatchdogPanel)
-        wd_panel.update(wd_panel.render_data(watchdog_data))
+        wd_panel.update(wd_panel.render_data(
+            watchdog_data,
+            ollama_latency_history=list(self.ollama_latency_history),
+        ))
 
         cb_panel = self.query_one("#circuit-breaker", CircuitBreakerPanel)
         cb_panel.update(cb_panel.render_data(health_data))
@@ -517,7 +587,7 @@ class BastionDashboard(App):
 
     def _check_auto_fan(self, data: dict[str, Any]) -> None:
         """Check CPU temperature and trigger fan speed escalation if needed."""
-        if not self._auto_fan_enabled:
+        if not self._auto_fan_enabled or not fan_control_available():
             return
 
         cpu_temp = self._collector.read_cpu_temp()
@@ -558,6 +628,49 @@ class BastionDashboard(App):
         self._show_secondary = not self._show_secondary
         if self._layout_mode == "full":
             self._apply_layout()
+
+    def action_sparkline_wider(self) -> None:
+        """Increase sparkline width by 5 chars."""
+        from bastion.dashboard import helpers
+        helpers.SPARKLINE_WIDTH = min(helpers.SPARKLINE_WIDTH + 5, 60)
+        self.notify(f"Sparkline width: {helpers.SPARKLINE_WIDTH} chars")
+
+    def action_sparkline_narrower(self) -> None:
+        """Decrease sparkline width by 5 chars."""
+        from bastion.dashboard import helpers
+        helpers.SPARKLINE_WIDTH = max(helpers.SPARKLINE_WIDTH - 5, 5)
+        self.notify(f"Sparkline width: {helpers.SPARKLINE_WIDTH} chars")
+
+    def action_history_longer(self) -> None:
+        """Increase history length by 30 samples."""
+        from bastion.dashboard import helpers
+        helpers.HISTORY_LEN = min(helpers.HISTORY_LEN + 30, 600)
+        self._resize_histories(helpers.HISTORY_LEN)
+        self.notify(f"History: {helpers.HISTORY_LEN} samples (~{helpers.HISTORY_LEN * self._interval:.0f}s)")
+
+    def action_history_shorter(self) -> None:
+        """Decrease history length by 30 samples."""
+        from bastion.dashboard import helpers
+        helpers.HISTORY_LEN = max(helpers.HISTORY_LEN - 30, 30)
+        self._resize_histories(helpers.HISTORY_LEN)
+        self.notify(f"History: {helpers.HISTORY_LEN} samples (~{helpers.HISTORY_LEN * self._interval:.0f}s)")
+
+    def _resize_histories(self, new_maxlen: int) -> None:
+        """Resize all history deques to a new maxlen, preserving data."""
+        for attr in (
+            "vram_history", "temp_history", "queue_history",
+            "power_history", "throughput_history", "swap_rate_history",
+            "latency_p50_history", "latency_p95_history",
+            "ollama_latency_history",
+        ):
+            old = getattr(self, attr)
+            new = deque(old, maxlen=new_maxlen)
+            setattr(self, attr, new)
+        # Also resize collector histories
+        for attr in ("cpu_history", "net_recv_history", "net_sent_history"):
+            old = getattr(self._collector, attr)
+            new = deque(old, maxlen=new_maxlen)
+            setattr(self._collector, attr, new)
 
     async def action_refresh(self) -> None:
         """Force an immediate data refresh."""

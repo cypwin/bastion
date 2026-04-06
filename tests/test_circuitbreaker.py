@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -306,7 +306,9 @@ class TestCircuitBreakerTransport:
         assert breaker._consecutive_failures == 1
 
     @pytest.mark.asyncio
-    async def test_connect_error_records_failure_and_reraises(self, breaker: CircuitBreaker) -> None:
+    async def test_connect_error_records_failure_and_reraises(
+        self, breaker: CircuitBreaker,
+    ) -> None:
         """ConnectError should record failure and re-raise."""
         inner = AsyncMock()
         inner.handle_async_request = AsyncMock(side_effect=httpx.ConnectError("refused"))

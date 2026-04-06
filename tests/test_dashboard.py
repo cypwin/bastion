@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
 from rich.text import Text
 
 from bastion.dashboard import (
@@ -17,7 +16,6 @@ from bastion.dashboard import (
     usage_color,
     vram_bar,
 )
-
 
 # ---------------------------------------------------------------------------
 # sparkline tests

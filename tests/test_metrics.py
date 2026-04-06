@@ -10,13 +10,12 @@ Validates:
 
 from __future__ import annotations
 
+import contextlib
 import json
-import time
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import FastAPI, Request, Response
-from starlette.middleware.base import BaseHTTPMiddleware
 
 
 class TestMetricsNoOpFallback:
@@ -25,12 +24,13 @@ class TestMetricsNoOpFallback:
     def test_import_failure_creates_noop_stubs(self):
         """When prometheus-client import fails, all metrics become no-ops."""
         # Simulate import failure by patching the module before import
-        import sys
         import importlib
+        import sys
+
         from prometheus_client import REGISTRY
 
         # Save original module so we can restore it
-        original_module = sys.modules.get("bastion.metrics")
+        sys.modules.get("bastion.metrics")
 
         # Unregister bastion metrics from the global registry so reload won't collide
         collectors_to_restore = []
@@ -40,10 +40,8 @@ class TestMetricsNoOpFallback:
                 if collector not in collectors_to_restore:
                     collectors_to_restore.append(collector)
         for collector in collectors_to_restore:
-            try:
+            with contextlib.suppress(Exception):
                 REGISTRY.unregister(collector)
-            except Exception:
-                pass
 
         # Remove metrics from cache if already loaded
         if "bastion.metrics" in sys.modules:
@@ -81,7 +79,6 @@ class TestMetricsNoOpFallback:
             if "bastion.metrics" in sys.modules:
                 del sys.modules["bastion.metrics"]
             # Fresh import re-registers metrics cleanly in the global registry
-            import bastion.metrics  # noqa: F811
 
 
 class TestMetricsIncrement:
@@ -92,7 +89,7 @@ class TestMetricsIncrement:
         from bastion.metrics import REQUESTS_TOTAL, record_request
 
         # Get initial count (may not be zero if other tests ran)
-        initial_metric = REQUESTS_TOTAL.labels(
+        REQUESTS_TOTAL.labels(
             endpoint="/api/generate",
             status_code="200",
             tier="interactive",
@@ -143,7 +140,7 @@ class TestMetricsIncrement:
 
     def test_queue_depth_gauge_updates(self):
         """QUEUE_DEPTH gauge should update current queue size."""
-        from bastion.metrics import QUEUE_DEPTH, update_queue_depth
+        from bastion.metrics import update_queue_depth
 
         update_queue_depth("qwen3:14b", 3)
         update_queue_depth("qwen3:14b", 7)
@@ -205,7 +202,7 @@ class TestPrometheusExposition:
 
     def test_get_metrics_text_returns_bytes(self):
         """get_metrics_text() should return bytes in Prometheus format."""
-        from bastion.metrics import get_metrics_text, PROMETHEUS_AVAILABLE
+        from bastion.metrics import PROMETHEUS_AVAILABLE, get_metrics_text
 
         result = get_metrics_text()
         assert isinstance(result, bytes)
@@ -369,7 +366,7 @@ class TestMiddlewareIntegration:
 
         # Patch record_request in the middleware module where it's imported
         with patch("bastion.middleware.record_request") as mock_record:
-            response = await middleware.dispatch(request, mock_call_next)
+            await middleware.dispatch(request, mock_call_next)
 
             # Verify record_request was called
             mock_record.assert_called_once()
@@ -384,8 +381,9 @@ class TestMiddlewareIntegration:
     @pytest.mark.asyncio
     async def test_middleware_measures_duration(self):
         """Middleware should accurately measure request duration."""
-        from bastion.middleware import MetricsMiddleware
         import asyncio
+
+        from bastion.middleware import MetricsMiddleware
 
         app = FastAPI()
         middleware = MetricsMiddleware(app)

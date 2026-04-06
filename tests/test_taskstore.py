@@ -4,18 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import OrderedDict
-from unittest.mock import patch
 
 import pytest
 
 from bastion.models import A2ATaskRecord, A2ATaskState
 from bastion.taskstore import (
+    _VALID_TRANSITIONS,
     BackpressureLevel,
     CompactedResult,
     TaskStore,
     TaskStoreFullError,
-    _VALID_TRANSITIONS,
 )
 
 
@@ -294,7 +292,7 @@ class TestBackpressure:
         store.create(_make_record("t-0"))
         try:
             store.create(_make_record("t-1"))
-            assert False, "Should have raised"
+            raise AssertionError("Should have raised")
         except TaskStoreFullError as e:
             assert e.retry_after == 60
 

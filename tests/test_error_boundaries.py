@@ -9,8 +9,6 @@ Covers:
 
 from __future__ import annotations
 
-import subprocess
-import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -27,11 +25,8 @@ from bastion.models import (
     ModelInfo,
     OllamaConfig,
     ProxyConfig,
-    SchedulerConfig,
-    ServerConfig,
 )
 from bastion.vram import VRAMTracker
-
 
 # ---------------------------------------------------------------------------
 # D3: Invalid config YAML
@@ -59,7 +54,7 @@ class TestInvalidConfig:
         cfg = {"server": {"port": "not-a-number"}}
         path = tmp_path / "bad.yaml"
         path.write_text(yaml.dump(cfg))
-        with pytest.raises(Exception):  # Pydantic ValidationError
+        with pytest.raises((TypeError, ValueError)):  # Pydantic ValidationError
             load_config(path)
 
     def test_negative_cooldown(self, tmp_path: Path) -> None:
@@ -105,40 +100,73 @@ class TestOllamaUnreachable:
         return VRAMTracker(config)
 
     @pytest.mark.asyncio
-    async def test_get_loaded_models_returns_empty_on_connect_error(self, tracker: VRAMTracker) -> None:
-        with patch.object(tracker._http, "get", new_callable=AsyncMock, side_effect=httpx.ConnectError("refused")):
+    async def test_get_loaded_models_returns_empty_on_connect_error(
+        self, tracker: VRAMTracker,
+    ) -> None:
+        with patch.object(
+            tracker._http, "get",
+            new_callable=AsyncMock, side_effect=httpx.ConnectError("refused"),
+        ):
             models = await tracker.get_loaded_models()
         assert models == []
 
     @pytest.mark.asyncio
-    async def test_get_loaded_models_returns_empty_on_timeout(self, tracker: VRAMTracker) -> None:
-        with patch.object(tracker._http, "get", new_callable=AsyncMock, side_effect=httpx.ReadTimeout("timeout")):
+    async def test_get_loaded_models_returns_empty_on_timeout(
+        self, tracker: VRAMTracker,
+    ) -> None:
+        with patch.object(
+            tracker._http, "get",
+            new_callable=AsyncMock, side_effect=httpx.ReadTimeout("timeout"),
+        ):
             models = await tracker.get_loaded_models()
         assert models == []
 
     @pytest.mark.asyncio
-    async def test_unload_model_returns_false_on_error(self, tracker: VRAMTracker) -> None:
-        with patch.object(tracker._http, "post", new_callable=AsyncMock, side_effect=httpx.ConnectError("refused")):
+    async def test_unload_model_returns_false_on_error(
+        self, tracker: VRAMTracker,
+    ) -> None:
+        with patch.object(
+            tracker._http, "post",
+            new_callable=AsyncMock, side_effect=httpx.ConnectError("refused"),
+        ):
             success = await tracker.unload_model("test:7b")
         assert success is False
 
     @pytest.mark.asyncio
-    async def test_get_loaded_vram_returns_zero_on_failure(self, tracker: VRAMTracker) -> None:
-        with patch.object(tracker._http, "get", new_callable=AsyncMock, side_effect=httpx.ConnectError("refused")):
+    async def test_get_loaded_vram_returns_zero_on_failure(
+        self, tracker: VRAMTracker,
+    ) -> None:
+        with patch.object(
+            tracker._http, "get",
+            new_callable=AsyncMock, side_effect=httpx.ConnectError("refused"),
+        ):
             vram = await tracker.get_loaded_vram_gb()
         assert vram == 0.0
 
     @pytest.mark.asyncio
-    async def test_can_load_model_checks_gpu_even_when_ollama_down(self, tracker: VRAMTracker) -> None:
+    async def test_can_load_model_checks_gpu_even_when_ollama_down(
+        self, tracker: VRAMTracker,
+    ) -> None:
         """Even if Ollama is unreachable, GPU temperature check should still work."""
-        with patch.object(tracker._http, "get", new_callable=AsyncMock, side_effect=httpx.ConnectError("refused")), \
-             patch("bastion.vram.query_gpu_status", AsyncMock(return_value=GPUStatus(temperature_c=95))):
+        with (
+            patch.object(
+                tracker._http, "get",
+                new_callable=AsyncMock,
+                side_effect=httpx.ConnectError("refused"),
+            ),
+            patch(
+                "bastion.vram.query_gpu_status",
+                AsyncMock(return_value=GPUStatus(temperature_c=95)),
+            ),
+        ):
             can, reason = await tracker.can_load_model("test:7b")
         assert can is False
         assert "hot" in reason.lower()
 
     @pytest.mark.asyncio
-    async def test_get_loaded_models_returns_empty_on_http_error(self, tracker: VRAMTracker) -> None:
+    async def test_get_loaded_models_returns_empty_on_http_error(
+        self, tracker: VRAMTracker,
+    ) -> None:
         """HTTP 500 from Ollama should return empty list."""
         mock_resp = httpx.Response(
             500,
@@ -162,9 +190,8 @@ class TestGPUQueryFailure:
     @pytest.mark.asyncio
     async def test_nvidia_smi_timeout(self) -> None:
         """nvidia-smi timeout returns empty GPUStatus."""
-        import asyncio
         mock_proc = AsyncMock()
-        mock_proc.communicate.side_effect = asyncio.TimeoutError()
+        mock_proc.communicate.side_effect = TimeoutError()
         mock_proc.kill = MagicMock()
         mock_proc.wait = AsyncMock()
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
@@ -198,7 +225,7 @@ class TestGPUQueryFailure:
         )
         mock_proc.returncode = 0
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
-            status = await query_gpu_status()
+            await query_gpu_status()
         # Should not crash, fields should be None for invalid data
 
     @pytest.mark.asyncio
@@ -218,14 +245,20 @@ class TestGPUQueryFailure:
 
     @pytest.mark.asyncio
     async def test_check_gpu_safe_detects_high_temp(self) -> None:
-        with patch("bastion.health.query_gpu_status", AsyncMock(return_value=GPUStatus(temperature_c=90))):
+        with patch(
+            "bastion.health.query_gpu_status",
+            AsyncMock(return_value=GPUStatus(temperature_c=90)),
+        ):
             safe, reason = await check_gpu_safe(GPUConfig(max_temperature_c=80))
         assert safe is False
         assert "temperature" in reason.lower()
 
     @pytest.mark.asyncio
     async def test_check_gpu_safe_detects_high_power(self) -> None:
-        with patch("bastion.health.query_gpu_status", AsyncMock(return_value=GPUStatus(power_draw_watts=500.0))):
+        with patch(
+            "bastion.health.query_gpu_status",
+            AsyncMock(return_value=GPUStatus(power_draw_watts=500.0)),
+        ):
             safe, reason = await check_gpu_safe(GPUConfig(max_power_watts=400.0))
         assert safe is False
         assert "power" in reason.lower()
@@ -288,7 +321,10 @@ class TestResidencyCacheEdgeCases:
                 request=httpx.Request("GET", "http://mock"),
             )
 
-        with patch.object(tracker._http, "get", new_callable=AsyncMock, side_effect=mock_get_loaded):
+        with patch.object(
+            tracker._http, "get",
+            new_callable=AsyncMock, side_effect=mock_get_loaded,
+        ):
             # First call populates cache
             models = await cache.get_resident_models()
             assert "test:7b" in models

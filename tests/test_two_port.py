@@ -10,8 +10,6 @@ Verifies that:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
-
 import pytest
 from fastapi.testclient import TestClient
 
@@ -22,7 +20,6 @@ from bastion.models import (
     ServerConfig,
 )
 from bastion.server import create_admin_app, create_app, create_proxy_app
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

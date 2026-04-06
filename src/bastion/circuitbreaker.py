@@ -18,8 +18,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from enum import Enum
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from enum import StrEnum
+from typing import Any
 
 import httpx
 from pydantic import BaseModel
@@ -58,7 +59,7 @@ class CircuitOpenError(Exception):
 # States
 # ---------------------------------------------------------------------------
 
-class _State(str, Enum):
+class _State(StrEnum):
     CLOSED = "closed"
     OPEN = "open"
     HALF_OPEN = "half_open"
@@ -83,7 +84,7 @@ class CircuitBreaker:
         self._consecutive_failures: int = 0
         self._opened_at: float = 0.0
         self._lock = asyncio.Lock()
-        self._cached_tags: Optional[dict] = None
+        self._cached_tags: dict | None = None
 
     # -- public properties ---------------------------------------------------
 
@@ -102,7 +103,7 @@ class CircuitBreaker:
         """Store the last successful ``/api/tags`` response."""
         self._cached_tags = response
 
-    def get_cached_tags(self) -> Optional[dict]:
+    def get_cached_tags(self) -> dict | None:
         """Return the cached ``/api/tags`` response, or *None*."""
         return self._cached_tags
 
@@ -236,7 +237,7 @@ class CircuitBreakerTransport(httpx.AsyncBaseTransport):
     def __init__(
         self,
         breaker: CircuitBreaker,
-        inner: Optional[httpx.AsyncBaseTransport] = None,
+        inner: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._breaker = breaker
         self._transport = inner or httpx.AsyncHTTPTransport()

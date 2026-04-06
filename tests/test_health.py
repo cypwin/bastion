@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from bastion.health import query_gpu_status, check_gpu_safe, get_vram_free_gb
+from bastion.health import check_gpu_safe, get_vram_free_gb, query_gpu_status
 from bastion.models import GPUConfig, GPUStatus
 
 
@@ -43,7 +42,7 @@ class TestQueryGPUStatus:
     async def test_handles_timeout(self):
         """Graceful fallback when nvidia-smi hangs."""
         mock_proc = AsyncMock()
-        mock_proc.communicate.side_effect = asyncio.TimeoutError()
+        mock_proc.communicate.side_effect = TimeoutError()
         mock_proc.kill = MagicMock()
         mock_proc.wait = AsyncMock()
 
@@ -79,7 +78,10 @@ class TestQueryGPUStatus:
 class TestCheckGPUSafe:
     @pytest.mark.asyncio
     async def test_safe_conditions(self):
-        safe = GPUStatus(temperature_c=55, vram_used_mb=8000, vram_total_mb=32000, power_draw_watts=180.0)
+        safe = GPUStatus(
+            temperature_c=55, vram_used_mb=8000,
+            vram_total_mb=32000, power_draw_watts=180.0,
+        )
         with patch("bastion.health.query_gpu_status", AsyncMock(return_value=safe)):
             is_safe, reason = await check_gpu_safe(GPUConfig())
         assert is_safe is True

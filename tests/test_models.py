@@ -8,17 +8,12 @@ from bastion.models import (
     BrokerConfig,
     GPUConfig,
     GPUStatus,
-    LoadedModel,
     ModelInfo,
     OllamaConfig,
     PriorityConfig,
     PriorityTier,
     QueuedRequest,
-    RequestOverrides,
-    SchedulerConfig,
-    ServerConfig,
 )
-
 
 # ---------------------------------------------------------------------------
 # Configuration model defaults
@@ -50,7 +45,9 @@ class TestBrokerConfig:
         c = BrokerConfig()
         assert c.server.port == 11434
         assert c.ollama.port == 11435
-        assert c.gpu.max_vram_gb == 26.0
+        # GPU defaults: total_vram_gb=0 (auto-detect), headroom_gb=6
+        assert c.gpu.total_vram_gb == 0.0
+        assert c.gpu.max_vram_gb == -6.0  # 0 - 6; resolve_gpu_defaults() fixes this
         assert c.scheduler.cooldown_seconds == 2.0
         assert c.request_overrides.use_mmap is False
 

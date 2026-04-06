@@ -3,6 +3,12 @@ from __future__ import annotations
 
 from rich.text import Text
 
+# ---------------------------------------------------------------------------
+# Sparkline / history configuration (overridable via CLI --sparkline-width)
+# ---------------------------------------------------------------------------
+
+SPARKLINE_WIDTH: int = 20      # Characters shown per sparkline
+HISTORY_LEN: int = 120         # Samples kept in history deques (~2 min at 1Hz)
 
 # ---------------------------------------------------------------------------
 # Color helpers

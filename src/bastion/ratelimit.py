@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Callable, Dict
+from collections.abc import Callable
 
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
@@ -96,7 +96,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self._config = config or RateLimitConfig()
         self._rate: float = self._config.requests_per_minute / 60.0
         self._burst: int = self._config.burst
-        self._buckets: Dict[str, _TokenBucket] = {}
+        self._buckets: dict[str, _TokenBucket] = {}
         self._lock = asyncio.Lock()
 
     def _get_client_ip(self, request: Request) -> str:

@@ -13,9 +13,10 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -29,7 +30,6 @@ from bastion.models import (
     ModelInfo,
     OllamaConfig,
     PriorityConfig,
-    PriorityTier,
     ProxyConfig,
     QueuedRequest,
     SchedulerConfig,
@@ -39,7 +39,6 @@ from bastion.proxy import OllamaProxy
 from bastion.queue import AffinityQueue
 from bastion.scheduler import Scheduler
 from bastion.vram import VRAMTracker
-
 
 # ---------------------------------------------------------------------------
 # OllamaSimulator — replaces proxy._http (the httpx.AsyncClient)
@@ -52,7 +51,7 @@ class RequestRecord:
 
     model: str
     endpoint: str
-    use_mmap: Optional[bool]
+    use_mmap: bool | None
     streaming: bool
     start_time: float
     end_time: float = 0.0
@@ -69,7 +68,7 @@ class OllamaSimulator:
 
     def __init__(self, latency: float = 0.05) -> None:
         self.latency = latency
-        self.records: List[RequestRecord] = []
+        self.records: list[RequestRecord] = []
         self._concurrent = 0
         self._max_concurrent = 0
         self._lock = asyncio.Lock()
@@ -103,7 +102,7 @@ class OllamaSimulator:
 
     async def post(
         self, url: str, *, content: bytes = b"", headers: dict = None, **kwargs
-    ) -> "_MockResponse":
+    ) -> _MockResponse:
         """Simulate a non-streaming POST (httpx.AsyncClient.post)."""
         body = json.loads(content) if content else {}
         record = await self._enter(body, streaming=False)
@@ -164,7 +163,7 @@ class OllamaSimulator:
                 f"(expected False)"
             )
 
-    def served_models(self) -> List[str]:
+    def served_models(self) -> list[str]:
         """Return list of models served, in order."""
         return [r.model for r in self.records]
 
@@ -286,16 +285,16 @@ class BastionHarness:
         self.vram = VRAMTracker(config)
 
         # Local grant/done state (mirrors server.py module globals)
-        self._pending_grants: Dict[str, asyncio.Event] = {}
-        self._pending_completions: Dict[str, asyncio.Event] = {}
+        self._pending_grants: dict[str, asyncio.Event] = {}
+        self._pending_completions: dict[str, asyncio.Event] = {}
 
         # Created in start()
-        self.proxy: Optional[OllamaProxy] = None
-        self.scheduler: Optional[Scheduler] = None
+        self.proxy: OllamaProxy | None = None
+        self.scheduler: Scheduler | None = None
 
     async def _enqueue_request(
         self, request: QueuedRequest,
-    ) -> Tuple[asyncio.Event, Callable[[], None]]:
+    ) -> tuple[asyncio.Event, Callable[[], None]]:
         """Mirror of server._enqueue_request with local state."""
         grant_event = asyncio.Event()
         done_event = asyncio.Event()
@@ -341,7 +340,7 @@ class BastionHarness:
                 timeout = self.config.proxy.inference_timeout_seconds + 60.0
                 try:
                     await asyncio.wait_for(done_event.wait(), timeout=timeout)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     self._pending_completions.pop(request.id, None)
 
     async def start(self) -> None:
@@ -433,9 +432,9 @@ class BastionHarness:
 
     async def send_many(
         self,
-        specs: List[Tuple[str, float]],
+        specs: list[tuple[str, float]],
         stream: bool = False,
-    ) -> List[Any]:
+    ) -> list[Any]:
         """Send N concurrent requests via asyncio.gather.
 
         specs: List of (model, priority) tuples.
@@ -471,7 +470,8 @@ async def running_harness(
         return resident_names
 
     with patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))), \
-         patch("bastion.scheduler.query_gpu_status", AsyncMock(return_value=GPUStatus(temperature_c=50))), \
+         patch("bastion.scheduler.query_gpu_status",
+               AsyncMock(return_value=GPUStatus(temperature_c=50))), \
          patch("bastion.proxy.audit"), \
          patch("bastion.scheduler.audit"), \
          patch.object(

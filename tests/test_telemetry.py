@@ -12,7 +12,6 @@ import pytest
 
 import bastion.telemetry as telemetry
 
-
 # ---------------------------------------------------------------------------
 # No-op behavior when OTel unavailable
 # ---------------------------------------------------------------------------
@@ -127,7 +126,7 @@ class TestWithMockedOTel:
         mock_tracer.start_as_current_span.return_value.__enter__ = MagicMock(return_value=mock_span)
         mock_tracer.start_as_current_span.return_value.__exit__ = MagicMock(return_value=False)
 
-        result = telemetry.record_task_submit("task-1", "infer", "qwen3:14b")
+        telemetry.record_task_submit("task-1", "infer", "qwen3:14b")
         mock_tracer.start_as_current_span.assert_called_once()
         call_args = mock_tracer.start_as_current_span.call_args
         assert call_args[0][0] == "a2a.task.submit"
@@ -140,7 +139,7 @@ class TestWithMockedOTel:
         mock_span = MagicMock()
         mock_tracer.start_span.return_value = mock_span
 
-        span = telemetry.record_task_process("task-1", "infer", "model")
+        telemetry.record_task_process("task-1", "infer", "model")
         mock_tracer.start_span.assert_called_once()
         call_args = mock_tracer.start_span.call_args
         assert call_args[0][0] == "a2a.task.process"

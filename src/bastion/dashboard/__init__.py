@@ -66,8 +66,28 @@ def main(argv: list[str] | None = None) -> None:
         default="standard",
         help="Initial layout mode (default: standard)",
     )
+    parser.add_argument(
+        "--sparkline-width",
+        type=int,
+        default=None,
+        help="Characters per sparkline (default: 20)",
+    )
+    parser.add_argument(
+        "--history-len",
+        type=int,
+        default=None,
+        help="Samples kept in history deques (default: 120)",
+    )
 
     args = parser.parse_args(argv)
+
+    # Apply sparkline/history overrides before importing app
+    if args.sparkline_width is not None:
+        import bastion.dashboard.helpers as _h
+        _h.SPARKLINE_WIDTH = args.sparkline_width
+    if args.history_len is not None:
+        import bastion.dashboard.helpers as _h
+        _h.HISTORY_LEN = args.history_len
 
     # Determine admin URL
     url = args.admin_url or _detect_admin_url(args.url)

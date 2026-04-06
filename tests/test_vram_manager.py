@@ -202,7 +202,7 @@ class TestExpiredReclamation:
     @pytest.mark.asyncio
     async def test_expired_reservations_reclaimed_on_reserve(self, manager: VRAMManager) -> None:
         """Expired reservations should be reclaimed before checking available VRAM."""
-        r = await manager.reserve("test:7b", 1_000_000_000, ttl=0.01)
+        await manager.reserve("test:7b", 1_000_000_000, ttl=0.01)
         await asyncio.sleep(0.05)  # Let TTL expire
         # The next reserve should reclaim the expired one
         r2 = await manager.reserve("test:7b", 500_000_000)
