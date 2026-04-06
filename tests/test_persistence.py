@@ -355,3 +355,33 @@ class TestPersistentQueue:
             assert inner.total_size == 1
         finally:
             await mgr.close()
+
+
+class TestConfigIntegration:
+    def test_persistence_config_from_yaml(self, tmp_path):
+        import yaml
+        from bastion.config import load_config
+
+        config_file = tmp_path / "broker.yaml"
+        config_file.write_text(yaml.dump({
+            "persistence": {
+                "enabled": True,
+                "persist_audit": True,
+                "persist_tasks": True,
+                "persist_queue": True,
+                "queue_recovery_ttl": 600,
+            }
+        }))
+        config = load_config(config_file)
+        assert config.persistence.enabled is True
+        assert config.persistence.persist_queue is True
+        assert config.persistence.queue_recovery_ttl == 600
+
+    def test_persistence_env_overrides(self, monkeypatch):
+        from bastion.config import load_config
+
+        monkeypatch.setenv("BASTION_PERSISTENCE_ENABLED", "true")
+        monkeypatch.setenv("BASTION_PERSISTENCE_DB_PATH", "/tmp/test.db")
+        config = load_config()
+        assert config.persistence.enabled is True
+        assert config.persistence.database_path == "/tmp/test.db"
