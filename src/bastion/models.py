@@ -137,6 +137,16 @@ class CircuitBreakerConfig(BaseModel):
     recovery_timeout: float = 30.0  # seconds before half-open probe
 
 
+class PersistenceConfig(BaseModel):
+    """Optional SQLite persistence configuration."""
+    enabled: bool = False
+    database_path: str = ""        # empty = auto (XDG data_dir / "bastion.db")
+    persist_audit: bool = True
+    persist_tasks: bool = True
+    persist_queue: bool = False     # opt-in, most users don't need this
+    queue_recovery_ttl: int = 300   # seconds, entries older than this discarded on startup
+
+
 class PriorityConfig(BaseModel):
     """Base priority values for each tier."""
     interactive: float = 100.0
@@ -225,6 +235,7 @@ class BrokerConfig(BaseModel):
     auth: AuthConfig = Field(default_factory=AuthConfig)
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
     circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
+    persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     a2a: A2AConfig = Field(default_factory=lambda: A2AConfig())
     models: dict[str, ModelInfo] = Field(default_factory=dict)

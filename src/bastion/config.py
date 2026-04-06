@@ -250,6 +250,14 @@ def _apply_env_overrides(config: BrokerConfig) -> None:
         config.audit.tier = v
         overrides_applied.append("BASTION_AUDIT_TIER")
 
+    # Persistence
+    if (v := _env_bool("BASTION_PERSISTENCE_ENABLED")) is not None:
+        config.persistence.enabled = v
+        overrides_applied.append("BASTION_PERSISTENCE_ENABLED")
+    if (v := _env_str("BASTION_PERSISTENCE_DB_PATH")) is not None:
+        config.persistence.database_path = v
+        overrides_applied.append("BASTION_PERSISTENCE_DB_PATH")
+
     if overrides_applied:
         logger.info("Config overrides from environment: %s", ", ".join(overrides_applied))
 

@@ -58,3 +58,8 @@ def audit_log_path() -> str:
 def vram_journal_path() -> Path:
     """Return the path to the VRAM crash-forensics journal."""
     return data_dir() / "bastion-vram-journal.jsonl"
+
+
+def database_path() -> Path:
+    """Return the default path to the SQLite persistence database."""
+    return data_dir() / "bastion.db"
