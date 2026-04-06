@@ -13,9 +13,8 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
-from collections import OrderedDict
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -321,10 +320,8 @@ class TestSpawnBackgroundTask:
         task.add_done_callback(bg_tasks.discard)
 
         # Wait for task to complete (with exception)
-        try:
+        with contextlib.suppress(ValueError):
             await task
-        except ValueError:
-            pass
 
         await asyncio.sleep(0.01)
         assert len(bg_tasks) == 0

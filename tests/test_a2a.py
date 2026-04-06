@@ -22,7 +22,6 @@ import pytest
 from bastion.a2a import A2AHandler
 from bastion.models import (
     A2AConfig,
-    A2ATaskState,
     BrokerConfig,
     GPUConfig,
     LoadedModel,
@@ -34,7 +33,6 @@ from bastion.models import (
     ServerConfig,
 )
 from bastion.vram import VRAMTracker
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -737,7 +735,9 @@ class TestAgentCard:
         assert {"BearerToken": []} in card["security"]
 
     @pytest.mark.asyncio
-    async def test_public_card_security_even_without_tokens(self, a2a_config_open, mock_vram_tracker, mock_scheduler):
+    async def test_public_card_security_even_without_tokens(
+        self, a2a_config_open, mock_vram_tracker, mock_scheduler,
+    ):
         """Public card includes securitySchemes even when no tokens configured."""
         async def fake_enqueue(request: QueuedRequest):
             event = asyncio.Event()
@@ -785,7 +785,9 @@ class TestAgentCard:
         assert card["availability"] == "available"
 
     @pytest.mark.asyncio
-    async def test_extended_card_availability_unavailable(self, a2a_config, mock_vram_tracker, mock_scheduler):
+    async def test_extended_card_availability_unavailable(
+        self, a2a_config, mock_vram_tracker, mock_scheduler,
+    ):
         """Extended card shows 'unavailable' when circuit breaker is open."""
         async def fake_enqueue(request: QueuedRequest):
             event = asyncio.Event()
@@ -807,7 +809,9 @@ class TestAgentCard:
         assert card["availability"] == "unavailable"
 
     @pytest.mark.asyncio
-    async def test_extended_card_availability_degraded(self, a2a_config, mock_vram_tracker, mock_scheduler):
+    async def test_extended_card_availability_degraded(
+        self, a2a_config, mock_vram_tracker, mock_scheduler,
+    ):
         """Extended card shows 'degraded' when circuit breaker is half-open."""
         async def fake_enqueue(request: QueuedRequest):
             event = asyncio.Event()
@@ -852,7 +856,9 @@ class TestAgentCard:
         assert {"BearerToken": []} in card["security"]
 
     @pytest.mark.asyncio
-    async def test_extended_card_omits_security_when_no_tokens(self, a2a_config_open, mock_vram_tracker, mock_scheduler):
+    async def test_extended_card_omits_security_when_no_tokens(
+        self, a2a_config_open, mock_vram_tracker, mock_scheduler,
+    ):
         """Extended card omits securitySchemes when no tokens configured."""
         async def fake_enqueue(request: QueuedRequest):
             event = asyncio.Event()
@@ -976,7 +982,10 @@ class TestSSEStreaming:
             events = []
             async for event in a2a_handler.subscribe_task(task_id):
                 events.append(event)
-                if "statusUpdate" in event and event["statusUpdate"]["status"]["state"] == "completed":
+                if (
+                    "statusUpdate" in event
+                    and event["statusUpdate"]["status"]["state"] == "completed"
+                ):
                     break
 
             # Should have artifact updates
@@ -1074,8 +1083,9 @@ class TestReservations:
     async def test_has_active_reservation_false_for_wrong_model(self, a2a_handler):
         """has_active_reservation returns False for different model."""
         # Manually insert a reservation
-        from bastion.models import Reservation
         import time
+
+        from bastion.models import Reservation
 
         reservation = Reservation(
             model="mistral-nemo:12b",
@@ -1091,8 +1101,9 @@ class TestReservations:
     @pytest.mark.asyncio
     async def test_has_active_reservation_true_when_active(self, a2a_handler):
         """has_active_reservation returns True for model with active reservation."""
-        from bastion.models import Reservation
         import time
+
+        from bastion.models import Reservation
 
         reservation = Reservation(
             model="qwen3:14b",
@@ -1108,8 +1119,9 @@ class TestReservations:
     @pytest.mark.asyncio
     async def test_has_active_reservation_false_when_expired(self, a2a_handler):
         """has_active_reservation returns False when reservation expired."""
-        from bastion.models import Reservation
         import time
+
+        from bastion.models import Reservation
 
         reservation = Reservation(
             model="qwen3:14b",
@@ -1125,8 +1137,9 @@ class TestReservations:
     @pytest.mark.asyncio
     async def test_has_active_reservation_false_when_depleted(self, a2a_handler):
         """has_active_reservation returns False when remaining_requests is 0."""
-        from bastion.models import Reservation
         import time
+
+        from bastion.models import Reservation
 
         reservation = Reservation(
             model="qwen3:14b",

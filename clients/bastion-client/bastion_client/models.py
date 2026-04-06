@@ -1,7 +1,7 @@
 """Pydantic models for BASTION client requests and responses."""
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -9,8 +9,8 @@ from pydantic import BaseModel
 class IntentRequest(BaseModel):
     """Request to declare an upcoming model sequence for scheduler optimization."""
 
-    profile: Optional[str] = None
-    model_sequence: Optional[list[str]] = None
+    profile: str | None = None
+    model_sequence: list[str] | None = None
     estimated_requests: int = 10
     client_id: str = "anonymous"
 
@@ -41,6 +41,6 @@ class InferenceResult(BaseModel):
     model: str
     response: str
     done: bool = False
-    total_duration: Optional[int] = None
-    eval_count: Optional[int] = None
-    raw: Dict[str, Any] = {}
+    total_duration: int | None = None
+    eval_count: int | None = None
+    raw: dict[str, Any] = {}

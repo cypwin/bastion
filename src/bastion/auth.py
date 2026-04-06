@@ -8,7 +8,6 @@ streaming responses aren't buffered, no fragile path-exclusion lists.
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
@@ -41,8 +40,8 @@ def make_admin_key_dependency(config: AuthConfig):
 
     async def verify_admin_key(
         request: Request,
-        api_key: Optional[str] = Depends(_admin_api_key_header),
-    ) -> Optional[str]:
+        api_key: str | None = Depends(_admin_api_key_header),
+    ) -> str | None:
         # Skip auth when disabled or no keys configured
         if not config.enabled or not valid_keys:
             return None
@@ -82,8 +81,8 @@ def make_a2a_token_dependency(config: A2AConfig):
 
     async def verify_a2a_token(
         request: Request,
-        credentials: Optional[HTTPAuthorizationCredentials] = Depends(_a2a_bearer),
-    ) -> Optional[str]:
+        credentials: HTTPAuthorizationCredentials | None = Depends(_a2a_bearer),  # noqa: B008
+    ) -> str | None:
         # No tokens configured = open access
         if not valid_tokens:
             return None

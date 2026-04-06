@@ -18,11 +18,21 @@ from bastion.dashboard.collectors import SystemDataCollector
 # ---------------------------------------------------------------------------
 
 FAN_WRAPPER_PATH = (
-    Path(__file__).resolve().parent.parent.parent
+    Path(__file__).resolve().parent.parent.parent.parent
     / "scripts"
     / "gpu_fan_control_wrapper.py"
 )
 FAN_PYTHON_PATH = Path(sys.executable)
+
+
+def fan_control_available() -> bool:
+    """Check whether fan control prerequisites are met.
+
+    Requires the wrapper script to exist on disk.  Fan control also needs
+    ``nvidia-settings``, X11, and sudo NOPASSWD — but those are checked
+    at runtime when the user actually tries to set a speed.
+    """
+    return FAN_WRAPPER_PATH.exists()
 
 
 def set_fan_speed(speed: str) -> tuple[bool, str]:
@@ -33,6 +43,8 @@ def set_fan_speed(speed: str) -> tuple[bool, str]:
     tuple[bool, str]
         ``(success, message)``
     """
+    if not fan_control_available():
+        return False, "fan control wrapper not found (requires source install)"
     try:
         result = subprocess.run(
             ["sudo", str(FAN_PYTHON_PATH), str(FAN_WRAPPER_PATH), speed],
@@ -165,24 +177,36 @@ class HelpModal(ModalScreen[bool]):
     """
 
     def compose(self) -> ComposeResult:
+        from bastion.dashboard.helpers import HISTORY_LEN, SPARKLINE_WIDTH
         with Vertical(id="help-dialog"):
-            yield Label("BASTION Dashboard -- Keyboard Shortcuts", id="help-title")
+            yield Label("BASTION Dashboard v2 -- Keyboard Shortcuts", id="help-title")
             yield Label("")
+            yield Label(" MONITORING")
             yield Label("  [h]  Show this help overlay")
             yield Label("  [r]  Force refresh all panels")
-            yield Label("  [t]  Toggle secondary panels")
-            yield Label("  [1]  Compact layout")
-            yield Label("  [2]  Standard layout")
-            yield Label("  [3]  Full layout")
+            yield Label("  [q]  Quit the dashboard")
+            yield Label("")
+            yield Label(" LAYOUT")
+            yield Label("  [1]  Compact layout (1-column: GPU focused)")
+            yield Label("  [2]  Standard layout (2-column: GPU + system)")
+            yield Label("  [3]  Full layout (3-column: all panels)")
+            yield Label("  [t]  Toggle secondary panels (trace/A2A/leases/audit)")
+            yield Label("")
+            yield Label(" SPARKLINES")
+            yield Label(f"  [+]  Wider sparklines (+5 chars, now {SPARKLINE_WIDTH})")
+            yield Label(f"  [-]  Narrower sparklines (-5 chars, now {SPARKLINE_WIDTH})")
+            yield Label(f"  []]  Longer history (+30 samples, now {HISTORY_LEN})")
+            yield Label(f"  [[]  Shorter history (-30 samples, now {HISTORY_LEN})")
+            yield Label("")
+            yield Label(" GPU / MODELS")
             yield Label("  [f]  GPU fan control (30/50/70/90/100%/auto)")
             yield Label("  [g]  Kill a GPU process")
             yield Label("  [p]  Preload a model into VRAM")
             yield Label("  [u]  Unload a model from VRAM")
+            yield Label("")
+            yield Label(" BROKER")
             yield Label("  [d]  Toggle drain mode (pause/resume scheduling)")
             yield Label("  [s]  Restart bastion.service (requires sudoers)")
-            yield Label("  [a]  Focus A2A tasks view")
-            yield Label("  [c]  Focus circuit breaker details")
-            yield Label("  [q]  Quit the dashboard")
             yield Label("")
             yield Label("  Data refreshes automatically at the configured interval.")
             yield Label("  Connection indicator shows STALE when broker unreachable.")
@@ -231,6 +255,7 @@ class FanControlModal(ModalScreen[str]):
     """
 
     def compose(self) -> ComposeResult:
+        available = fan_control_available()
         auto_fan = getattr(self.app, "_auto_fan_enabled", False)
         auto_state = getattr(self.app, "_auto_fan_state", "idle")
         auto_status = "ON" if auto_fan else "OFF"
@@ -238,25 +263,33 @@ class FanControlModal(ModalScreen[str]):
 
         with Vertical(id="fan-dialog"):
             yield Label("GPU Fan Control", id="fan-title")
-            yield Label("Press a button to set fan speed:")
-            yield Label("")
-            with Horizontal(id="fan-row-low"):
-                yield Button("30%", id="fan-30")
-                yield Button("50%", id="fan-50")
-                yield Button("70%", id="fan-70")
-            with Horizontal(id="fan-row-high"):
-                yield Button("90%", id="fan-90")
-                yield Button("100%", id="fan-100", variant="error")
-                yield Button("Auto", id="fan-auto", variant="success")
-            yield Label("")
-            yield Label(f"Auto-trigger: {auto_status}{auto_detail}")
-            with Horizontal(id="fan-row-actions"):
-                yield Button(
-                    f"Auto-trigger: {auto_status}",
-                    id="fan-toggle-auto",
-                    variant="warning" if auto_fan else "default",
-                )
-                yield Button("Cancel", id="fan-cancel", variant="primary")
+            if not available:
+                yield Label("Fan control unavailable.")
+                yield Label("Requires source install with scripts/ directory,")
+                yield Label("nvidia-settings, X11, and sudo NOPASSWD.")
+                yield Label("")
+                with Horizontal(id="fan-row-actions"):
+                    yield Button("Close", id="fan-cancel", variant="primary")
+            else:
+                yield Label("Press a button to set fan speed:")
+                yield Label("")
+                with Horizontal(id="fan-row-low"):
+                    yield Button("30%", id="fan-30")
+                    yield Button("50%", id="fan-50")
+                    yield Button("70%", id="fan-70")
+                with Horizontal(id="fan-row-high"):
+                    yield Button("90%", id="fan-90")
+                    yield Button("100%", id="fan-100", variant="error")
+                    yield Button("Auto", id="fan-auto", variant="success")
+                yield Label("")
+                yield Label(f"Auto-trigger: {auto_status}{auto_detail}")
+                with Horizontal(id="fan-row-actions"):
+                    yield Button(
+                        f"Auto-trigger: {auto_status}",
+                        id="fan-toggle-auto",
+                        variant="warning" if auto_fan else "default",
+                    )
+                    yield Button("Cancel", id="fan-cancel", variant="primary")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         btn_id = event.button.id

@@ -13,10 +13,9 @@ Covers:
 
 from __future__ import annotations
 
-import asyncio
 import os
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -32,7 +31,6 @@ from bastion.watchdog import (
     notify_stopping,
     notify_watchdog,
 )
-
 
 # ---------------------------------------------------------------------------
 # sd_notify tests
@@ -165,7 +163,11 @@ class TestProcessMonitor:
         """Ollama check records failure on connection error."""
         monitor = ProcessMonitor()
 
-        with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=httpx.ConnectError("refused")):
+        with patch(
+            "httpx.AsyncClient.get",
+            new_callable=AsyncMock,
+            side_effect=httpx.ConnectError("refused"),
+        ):
             await monitor._check_ollama()
 
         assert monitor.status.ollama_state == OllamaState.UNHEALTHY
@@ -176,7 +178,11 @@ class TestProcessMonitor:
         """Consecutive failures increment the counter."""
         monitor = ProcessMonitor()
 
-        with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=httpx.ConnectError("refused")):
+        with patch(
+            "httpx.AsyncClient.get",
+            new_callable=AsyncMock,
+            side_effect=httpx.ConnectError("refused"),
+        ):
             await monitor._check_ollama()
             await monitor._check_ollama()
             await monitor._check_ollama()
@@ -189,7 +195,11 @@ class TestProcessMonitor:
         monitor = ProcessMonitor()
 
         # Fail twice
-        with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=httpx.ConnectError("refused")):
+        with patch(
+            "httpx.AsyncClient.get",
+            new_callable=AsyncMock,
+            side_effect=httpx.ConnectError("refused"),
+        ):
             await monitor._check_ollama()
             await monitor._check_ollama()
 
@@ -223,7 +233,10 @@ class TestProcessMonitor:
         mock_proc.communicate = AsyncMock(return_value=(b"42\n", b""))
         mock_proc.returncode = 0
 
-        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc):
+        with patch(
+            "asyncio.create_subprocess_exec",
+            new_callable=AsyncMock, return_value=mock_proc,
+        ):
             await monitor._check_gpu()
 
         assert monitor.status.gpu_state == GPUState.RESPONSIVE
@@ -235,11 +248,14 @@ class TestProcessMonitor:
         monitor = ProcessMonitor(gpu_timeout=1)
 
         mock_proc = AsyncMock()
-        mock_proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+        mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
         mock_proc.kill = AsyncMock()
         mock_proc.wait = AsyncMock()
 
-        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc):
+        with patch(
+            "asyncio.create_subprocess_exec",
+            new_callable=AsyncMock, return_value=mock_proc,
+        ):
             await monitor._check_gpu()
 
         assert monitor.status.gpu_state == GPUState.TIMEOUT
@@ -251,7 +267,11 @@ class TestProcessMonitor:
         monitor = ProcessMonitor(failure_threshold=2, check_interval=100.0)
 
         # Simulate 2 Ollama failures (threshold=2)
-        with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=httpx.ConnectError("refused")):
+        with patch(
+            "httpx.AsyncClient.get",
+            new_callable=AsyncMock,
+            side_effect=httpx.ConnectError("refused"),
+        ):
             await monitor._check_ollama()
             await monitor._check_ollama()
 

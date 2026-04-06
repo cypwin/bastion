@@ -14,9 +14,8 @@ Covers:
 
 from __future__ import annotations
 
-import asyncio
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -25,7 +24,6 @@ from bastion.models import (
     LeaseState,
     ModelLease,
 )
-
 
 # ---------------------------------------------------------------------------
 # ModelLease model tests
@@ -51,7 +49,6 @@ class TestModelLease:
 
     def test_touch_updates_last_activity(self) -> None:
         lease = ModelLease(model="a", idle_timeout=10.0)
-        before = lease.last_activity
         # Simulate time passing
         lease.last_activity = time.monotonic() - 5.0
         old_activity = lease.last_activity
@@ -310,7 +307,7 @@ class TestA2AHandlerLeases:
     @pytest.mark.asyncio
     async def test_has_active_lease_expired(self) -> None:
         handler = await self._make_handler()
-        lease = handler.create_lease(model="a", ttl_seconds=0.0)
+        handler.create_lease(model="a", ttl_seconds=0.0)
         # TTL=0 means expired immediately
         assert handler.has_active_lease("a") is False
 
@@ -343,12 +340,12 @@ class TestZombieLeaseCleanup:
 
         # Run the cleanup logic once (mirrors _cleanup_expired_reservations)
         expired_leases = [
-            k for k, l in handler._leases.items()
-            if l.should_release()[0]
+            k for k, ls in handler._leases.items()
+            if ls.should_release()[0]
         ]
         for expired_lid in expired_leases:
-            l = handler._leases[expired_lid]
-            l.state = LeaseState.EXPIRED
+            ls = handler._leases[expired_lid]
+            ls.state = LeaseState.EXPIRED
             del handler._leases[expired_lid]
 
         assert lid not in handler._leases
@@ -363,12 +360,12 @@ class TestZombieLeaseCleanup:
 
         # Run cleanup
         expired_leases = [
-            k for k, l in handler._leases.items()
-            if l.should_release()[0]
+            k for k, ls in handler._leases.items()
+            if ls.should_release()[0]
         ]
         for expired_lid in expired_leases:
-            l = handler._leases[expired_lid]
-            l.state = LeaseState.EXPIRED
+            ls = handler._leases[expired_lid]
+            ls.state = LeaseState.EXPIRED
             del handler._leases[expired_lid]
 
         assert lid not in handler._leases
@@ -385,8 +382,8 @@ class TestZombieLeaseCleanup:
         lid = lease.lease_id
 
         expired_leases = [
-            k for k, l in handler._leases.items()
-            if l.should_release()[0]
+            k for k, ls in handler._leases.items()
+            if ls.should_release()[0]
         ]
         for expired_lid in expired_leases:
             del handler._leases[expired_lid]
@@ -402,8 +399,8 @@ class TestZombieLeaseCleanup:
         lid = lease.lease_id
 
         expired_leases = [
-            k for k, l in handler._leases.items()
-            if l.should_release()[0]
+            k for k, ls in handler._leases.items()
+            if ls.should_release()[0]
         ]
         for expired_lid in expired_leases:
             del handler._leases[expired_lid]

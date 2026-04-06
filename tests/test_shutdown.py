@@ -12,15 +12,13 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from bastion.models import BrokerConfig, QueuedRequest, SchedulerConfig, PriorityTier
+from bastion.models import BrokerConfig, PriorityTier, QueuedRequest, SchedulerConfig
 from bastion.queue import AffinityQueue
-
 
 # ---------------------------------------------------------------------------
 # Scheduler stop/drain tests

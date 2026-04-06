@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -64,7 +64,10 @@ def dispatch_log():
 
 
 def _safe_gpu():
-    return GPUStatus(temperature_c=50, vram_used_mb=8000, vram_free_mb=24000, vram_total_mb=32000, power_draw_watts=150.0)
+    return GPUStatus(
+        temperature_c=50, vram_used_mb=8000, vram_free_mb=24000,
+        vram_total_mb=32000, power_draw_watts=150.0,
+    )
 
 
 class TestSchedulerStartStop:
@@ -108,7 +111,10 @@ class TestSchedulerDispatch:
 
         with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=[]), \
              patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))), \
-             patch.object(tracker, "can_load_model", new_callable=AsyncMock, return_value=(True, "OK")):
+             patch.object(
+                 tracker, "can_load_model",
+                 new_callable=AsyncMock, return_value=(True, "OK"),
+             ):
             sched = Scheduler(sched_config, queue, tracker, dispatch_fn)
             await sched.start()
             sched.notify()
@@ -139,9 +145,15 @@ class TestSchedulerDispatch:
         # All three requests see the model as resident, so no swaps occur
         loaded_model = LoadedModel(name="qwen3:14b", size_bytes=0, vram_gb=9.3, details={})
 
-        with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=[loaded_model]), \
+        with patch.object(
+                 tracker, "get_loaded_models",
+                 new_callable=AsyncMock, return_value=[loaded_model],
+             ), \
              patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))), \
-             patch.object(tracker, "can_load_model", new_callable=AsyncMock, return_value=(True, "OK")):
+             patch.object(
+                 tracker, "can_load_model",
+                 new_callable=AsyncMock, return_value=(True, "OK"),
+             ):
             sched = Scheduler(sched_config, queue, tracker, dispatch_fn)
             await sched.start()
             sched.notify()
@@ -169,7 +181,10 @@ class TestGPUGating:
         queue.enqueue(make_request(model="qwen3:14b"))
 
         with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=[]), \
-             patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(False, "GPU too hot"))):
+             patch(
+                 "bastion.scheduler.check_gpu_safe",
+                 AsyncMock(return_value=(False, "GPU too hot")),
+             ):
             sched = Scheduler(sched_config, queue, tracker, dispatch_fn)
             await sched.start()
             sched.notify()
@@ -246,9 +261,15 @@ class TestConcurrentDispatch:
             LoadedModel(name="mistral-nemo:12b", vram_gb=8.1),
         ]
 
-        with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=loaded), \
+        with patch.object(
+                 tracker, "get_loaded_models",
+                 new_callable=AsyncMock, return_value=loaded,
+             ), \
              patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))), \
-             patch.object(tracker, "can_load_model", new_callable=AsyncMock, return_value=(True, "OK")):
+             patch.object(
+                 tracker, "can_load_model",
+                 new_callable=AsyncMock, return_value=(True, "OK"),
+             ):
             sched = Scheduler(concurrent_config, queue, tracker, dispatch_fn)
             await sched.start()
             sched.notify()
@@ -296,16 +317,20 @@ class TestConcurrentDispatch:
 
         # After first dispatch, has_inflight should return True for granite
         def mock_has_inflight(model):
-            if model == "granite3.1-dense:8b" and len(dispatched) >= 1:
-                return True
-            return False
+            return bool(model == "granite3.1-dense:8b" and len(dispatched) >= 1)
 
         def mock_inflight_count():
             return len(dispatched)
 
-        with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=loaded), \
+        with patch.object(
+                 tracker, "get_loaded_models",
+                 new_callable=AsyncMock, return_value=loaded,
+             ), \
              patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))), \
-             patch.object(tracker, "can_load_model", new_callable=AsyncMock, return_value=(True, "OK")):
+             patch.object(
+                 tracker, "can_load_model",
+                 new_callable=AsyncMock, return_value=(True, "OK"),
+             ):
             sched = Scheduler(
                 concurrent_config, queue, tracker, dispatch_fn,
                 has_inflight_fn=mock_has_inflight,
@@ -345,9 +370,15 @@ class TestConcurrentDispatch:
         # No models resident
         loaded = []
 
-        with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=loaded), \
+        with patch.object(
+                 tracker, "get_loaded_models",
+                 new_callable=AsyncMock, return_value=loaded,
+             ), \
              patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))), \
-             patch.object(tracker, "can_load_model", new_callable=AsyncMock, return_value=(True, "OK")):
+             patch.object(
+                 tracker, "can_load_model",
+                 new_callable=AsyncMock, return_value=(True, "OK"),
+             ):
             sched = Scheduler(concurrent_config, queue, tracker, dispatch_fn)
             await sched.start()
             sched.notify()
@@ -390,7 +421,10 @@ class TestConcurrentDispatch:
             # granite is in-flight
             return model == "granite3.1-dense:8b"
 
-        with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=loaded), \
+        with patch.object(
+                 tracker, "get_loaded_models",
+                 new_callable=AsyncMock, return_value=loaded,
+             ), \
              patch.object(tracker, "unload_model", side_effect=mock_unload), \
              patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))):
             sched = Scheduler(
@@ -546,7 +580,9 @@ class TestHandleSwapDispatch:
         )
 
     @pytest.mark.asyncio
-    async def test_reserve_succeeds_dispatch_succeeds_commits(self, swap_config: BrokerConfig) -> None:
+    async def test_reserve_succeeds_dispatch_succeeds_commits(
+        self, swap_config: BrokerConfig,
+    ) -> None:
         """reserve OK -> dispatch OK -> commit reservation."""
         dispatched = []
 
@@ -562,7 +598,10 @@ class TestHandleSwapDispatch:
         queue.enqueue(req)
 
         with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=[]), \
-             patch.object(tracker, "can_load_model", new_callable=AsyncMock, return_value=(True, "OK")), \
+             patch.object(
+                 tracker, "can_load_model",
+                 new_callable=AsyncMock, return_value=(True, "OK"),
+             ), \
              patch.object(tracker, "log_vram_snapshot", new_callable=AsyncMock), \
              patch.object(tracker, "get_loaded_vram_gb", new_callable=AsyncMock, return_value=0.0):
             sched = Scheduler(swap_config, queue, tracker, dispatch_fn, vram_manager=mgr)
@@ -578,7 +617,9 @@ class TestHandleSwapDispatch:
         assert mgr.allocated_bytes > 0
 
     @pytest.mark.asyncio
-    async def test_reserve_succeeds_dispatch_fails_releases(self, swap_config: BrokerConfig) -> None:
+    async def test_reserve_succeeds_dispatch_fails_releases(
+        self, swap_config: BrokerConfig,
+    ) -> None:
         """reserve OK -> dispatch fails -> release reservation."""
 
         async def failing_dispatch(request, needs_swap=True) -> None:
@@ -593,7 +634,10 @@ class TestHandleSwapDispatch:
         queue.enqueue(req)
 
         with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=[]), \
-             patch.object(tracker, "can_load_model", new_callable=AsyncMock, return_value=(True, "OK")), \
+             patch.object(
+                 tracker, "can_load_model",
+                 new_callable=AsyncMock, return_value=(True, "OK"),
+             ), \
              patch.object(tracker, "log_vram_snapshot", new_callable=AsyncMock), \
              patch.object(tracker, "get_loaded_vram_gb", new_callable=AsyncMock, return_value=0.0):
             sched = Scheduler(swap_config, queue, tracker, failing_dispatch, vram_manager=mgr)
@@ -634,7 +678,10 @@ class TestHandleSwapDispatch:
             return True
 
         with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=[]), \
-             patch.object(tracker, "can_load_model", new_callable=AsyncMock, return_value=(True, "OK")), \
+             patch.object(
+                 tracker, "can_load_model",
+                 new_callable=AsyncMock, return_value=(True, "OK"),
+             ), \
              patch.object(tracker, "log_vram_snapshot", new_callable=AsyncMock), \
              patch.object(tracker, "get_loaded_vram_gb", new_callable=AsyncMock, return_value=0.0):
             sched = Scheduler(swap_config, queue, tracker, dispatch_fn, vram_manager=mgr)
@@ -648,7 +695,9 @@ class TestHandleSwapDispatch:
         assert len(dispatched) == 1
 
     @pytest.mark.asyncio
-    async def test_reserve_fails_after_eviction_returns_false(self, swap_config: BrokerConfig) -> None:
+    async def test_reserve_fails_after_eviction_returns_false(
+        self, swap_config: BrokerConfig,
+    ) -> None:
         """reserve fails -> evict fails -> return False."""
 
         async def dispatch_fn(request, needs_swap=True) -> None:
@@ -667,7 +716,10 @@ class TestHandleSwapDispatch:
             return False
 
         with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=[]), \
-             patch.object(tracker, "can_load_model", new_callable=AsyncMock, return_value=(False, "no space")), \
+             patch.object(
+                 tracker, "can_load_model",
+                 new_callable=AsyncMock, return_value=(False, "no space"),
+             ), \
              patch.object(tracker, "log_vram_snapshot", new_callable=AsyncMock), \
              patch.object(tracker, "get_loaded_vram_gb", new_callable=AsyncMock, return_value=0.0):
             sched = Scheduler(swap_config, queue, tracker, dispatch_fn, vram_manager=mgr)
@@ -702,7 +754,9 @@ class TestEvictForModel:
         )
 
     @pytest.mark.asyncio
-    async def test_evicts_model_with_no_queued_requests_first(self, evict_config: BrokerConfig) -> None:
+    async def test_evicts_model_with_no_queued_requests_first(
+        self, evict_config: BrokerConfig,
+    ) -> None:
         """Models with no queued requests should be evicted before those with requests."""
         unloaded = []
 
@@ -732,7 +786,10 @@ class TestEvictForModel:
             unloaded.append(model)
             return True
 
-        with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=loaded), \
+        with patch.object(
+                 tracker, "get_loaded_models",
+                 new_callable=AsyncMock, return_value=loaded,
+             ), \
              patch.object(tracker, "can_load_model", side_effect=mock_can_load), \
              patch.object(tracker, "unload_model", side_effect=mock_unload):
             sched = Scheduler(evict_config, queue, tracker, dispatch_fn)
@@ -766,7 +823,10 @@ class TestEvictForModel:
             unloaded.append(model)
             return True
 
-        with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=loaded), \
+        with patch.object(
+                 tracker, "get_loaded_models",
+                 new_callable=AsyncMock, return_value=loaded,
+             ), \
              patch.object(tracker, "can_load_model", side_effect=mock_can_load), \
              patch.object(tracker, "unload_model", side_effect=mock_unload):
             sched = Scheduler(evict_config, queue, tracker, dispatch_fn)
@@ -802,7 +862,10 @@ class TestEvictForModel:
             unloaded.append(model)
             return True
 
-        with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=loaded), \
+        with patch.object(
+                 tracker, "get_loaded_models",
+                 new_callable=AsyncMock, return_value=loaded,
+             ), \
              patch.object(tracker, "can_load_model", side_effect=mock_can_load), \
              patch.object(tracker, "unload_model", side_effect=mock_unload):
             sched = Scheduler(
@@ -831,7 +894,10 @@ class TestEvictForModel:
         async def mock_can_load(model):
             return (False, "no space")
 
-        with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=loaded), \
+        with patch.object(
+                 tracker, "get_loaded_models",
+                 new_callable=AsyncMock, return_value=loaded,
+             ), \
              patch.object(tracker, "can_load_model", side_effect=mock_can_load), \
              patch.object(tracker, "unload_model", new_callable=AsyncMock):
             sched = Scheduler(evict_config, queue, tracker, dispatch_fn)
@@ -873,7 +939,10 @@ class TestSyncCurrentModel:
             LoadedModel(name="qwen3:14b", vram_gb=9.3),
         ]
 
-        with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=loaded):
+        with patch.object(
+            tracker, "get_loaded_models",
+            new_callable=AsyncMock, return_value=loaded,
+        ):
             sched = Scheduler(sync_config, queue, tracker, dispatch_fn)
             await sched._sync_current_model()
 
@@ -903,7 +972,11 @@ class TestSyncCurrentModel:
         queue = AffinityQueue(sync_config.scheduler)
         tracker = VRAMTracker(sync_config)
 
-        with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, side_effect=RuntimeError("connection refused")):
+        with patch.object(
+            tracker, "get_loaded_models",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("connection refused"),
+        ):
             sched = Scheduler(sync_config, queue, tracker, dispatch_fn)
             await sched._sync_current_model()
 

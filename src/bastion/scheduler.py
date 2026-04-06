@@ -16,18 +16,18 @@ Design rationale (from GPU crash investigation):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections import deque
-
-from bastion.watchdog import notify_watchdog
-from typing import Callable, Optional
+from collections.abc import Callable
 
 from bastion import audit
-from bastion.health import check_gpu_safe, query_gpu_status
+from bastion.health import check_gpu_safe, query_gpu_status  # noqa: F401
 from bastion.models import BrokerConfig, QueuedRequest
 from bastion.queue import AffinityQueue
 from bastion.vram import VRAMManager, VRAMTracker
+from bastion.watchdog import notify_watchdog
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ class Scheduler:
         reservation_check_fn=None,
         has_inflight_fn=None,
         inflight_count_fn=None,
-        vram_manager: Optional[VRAMManager] = None,
+        vram_manager: VRAMManager | None = None,
     ) -> None:
         self.config = config
         self.queue = queue
@@ -75,13 +75,13 @@ class Scheduler:
         self._has_inflight_fn = has_inflight_fn or (lambda model: False)
         self._inflight_count_fn = inflight_count_fn or (lambda: 0)
 
-        self._current_model: Optional[str] = None  # Last dispatched model (for affinity bonus)
+        self._current_model: str | None = None  # Last dispatched model (for affinity bonus)
         self._last_swap_time: float = 0.0
         self._total_swaps: int = 0
         self._total_dispatched: int = 0
         self._running: bool = False
         self._draining: bool = False
-        self._task: Optional[asyncio.Task] = None
+        self._task: asyncio.Task | None = None
 
         # Rolling window of swap timestamps for rate limiting
         self._swap_timestamps: deque[float] = deque()
@@ -91,14 +91,14 @@ class Scheduler:
         self._wake_event = asyncio.Event()
 
         # Dispatch error cleanup callback (set by server.py at startup)
-        self._dispatch_error_fn: Optional[Callable[[str], None]] = None
+        self._dispatch_error_fn: Callable[[str], None] | None = None
 
         # Stall diagnostics (Fix E)
         self._last_stall_reason: str = ""
         self._last_stall_time: float = 0.0
 
     @property
-    def current_model(self) -> Optional[str]:
+    def current_model(self) -> str | None:
         """Last dispatched model (used for affinity bonus and admin API).
 
         S3: This represents the last model we dispatched a request to, which is
@@ -201,7 +201,7 @@ class Scheduler:
         if self._task:
             try:
                 await asyncio.wait_for(self._task, timeout=shutdown_timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("Scheduler did not stop within %.0fs, cancelling", shutdown_timeout)
                 self._task.cancel()
             self._task = None
@@ -217,7 +217,7 @@ class Scheduler:
         self._draining = False
         logger.info("Scheduler resumed from drain mode")
 
-    # ── Main loop ───────────────────────────────────────────────────
+    # ── Main loop ──────────────────────────────────────────────────
 
     async def _loop(self) -> None:
         """Main scheduling loop. Runs until stop() is called."""
@@ -225,17 +225,15 @@ class Scheduler:
             try:
                 # Wait for work or periodic check
                 loop_interval = self.config.scheduler.loop_interval_seconds
-                try:
+                with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self._wake_event.wait(), timeout=loop_interval)
-                except asyncio.TimeoutError:
-                    pass
                 self._wake_event.clear()
 
                 if not self._running:
                     break
 
                 # Process as many requests as possible in this tick
-                processed_any = await self._process_tick()
+                await self._process_tick()
 
                 # If draining and queue is empty, stop
                 if self._draining and self.queue.is_empty:
@@ -301,7 +299,10 @@ class Scheduler:
             # - Must not have in-flight request (same-model serialization)
             # Prefer current model (affinity) to drain it first
             models_with_work.sort(
-                key=lambda m: (0 if m == self._current_model else 1, -self.queue.model_queue_size(m)),
+                key=lambda m: (
+                    0 if m == self._current_model else 1,
+                    -self.queue.model_queue_size(m),
+                ),
             )
 
             dispatched_this_iteration = False
@@ -476,10 +477,7 @@ class Scheduler:
         if self.vram_manager is not None:
             # Look up model VRAM from config, fall back to default estimate
             known = self.config.models.get(candidate.model)
-            if known:
-                vram_gb = known.vram_gb
-            else:
-                vram_gb = self.config.gpu.default_vram_estimate_gb
+            vram_gb = known.vram_gb if known else self.config.gpu.default_vram_estimate_gb
             vram_bytes = int(vram_gb * 1024 * 1024 * 1024)
 
             try:
@@ -544,9 +542,15 @@ class Scheduler:
             excess = [
                 m for m in resident_after
                 if m.name != candidate.model
-                and not (self.config.models.get(m.name) and self.config.models[m.name].always_allowed)
-                and not (self._reservation_check_fn and self._reservation_check_fn(m.name))
-                and not self._has_inflight_fn(m.name)  # Never evict in-flight models
+                and not (
+                    self.config.models.get(m.name)
+                    and self.config.models[m.name].always_allowed
+                )
+                and not (
+                    self._reservation_check_fn
+                    and self._reservation_check_fn(m.name)
+                )
+                and not self._has_inflight_fn(m.name)
             ]
             excess.sort(key=lambda m: (self.queue.model_queue_size(m.name), m.vram_gb))
             evict_count = len(resident_after) - max_loaded
@@ -647,7 +651,7 @@ class Scheduler:
                 self._dispatch_error_fn(request.id)
             return False
 
-    # ── Model management helpers ────────────────────────────────────
+    # ── Model management helpers ───────────────────────────────────
 
     async def _unload_model(self, model: str) -> None:
         """Unload a model from VRAM with logging.

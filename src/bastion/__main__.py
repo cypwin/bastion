@@ -14,10 +14,59 @@ import argparse
 import asyncio
 import logging
 import signal
-import sys
 from pathlib import Path
 
 import uvicorn
+
+
+def _generate_config() -> None:
+    """Generate a starter config with auto-detected GPU values."""
+    import shutil
+
+    from bastion.paths import config_dir
+
+    # Locate the example config bundled with the source
+    example = Path(__file__).resolve().parent.parent.parent / "config" / "broker.example.yaml"
+
+    dest = config_dir() / "broker.yaml"
+    if dest.exists():
+        print(f"Config already exists: {dest}")
+        print("Remove it first if you want to regenerate.")
+        return
+
+    if example.exists():
+        shutil.copy2(example, dest)
+        print(f"Config written to {dest}")
+    else:
+        # Minimal inline config when example file isn't available (pip install)
+        dest.write_text(
+            "# BASTION configuration\n"
+            "# See https://github.com/cyprian-w/bastion for full reference.\n"
+            "\n"
+            "ollama:\n"
+            "  host: \"127.0.0.1\"\n"
+            "  port: 11435\n"
+            "\n"
+            "server:\n"
+            "  host: \"0.0.0.0\"\n"
+            "  port: 11434\n"
+            "\n"
+            "gpu:\n"
+            "  total_vram_gb: 0    # 0 = auto-detect from nvidia-smi\n"
+            "  headroom_gb: 6\n"
+            "  max_temperature_c: 83\n"
+            "\n"
+            "scheduler:\n"
+            "  cooldown_seconds: 2.0\n"
+            "  max_queue_size: 512\n"
+            "\n"
+            "models: {}\n",
+            encoding="utf-8",
+        )
+        print(f"Config written to {dest}")
+
+    print("Edit to customize, then start BASTION with: bastion")
+    print("Run `bastion --detect-models` to discover installed Ollama models.")
 
 
 def main() -> None:
@@ -61,6 +110,18 @@ def main() -> None:
         default="INFO",
         help="Logging level (default: INFO)",
     )
+    parser.add_argument(
+        "--init-config",
+        action="store_true",
+        help="Generate a starter config file at ~/.config/bastion/broker.yaml "
+             "with auto-detected GPU values, then exit.",
+    )
+    parser.add_argument(
+        "--detect-models",
+        action="store_true",
+        help="Discover installed Ollama models and print a YAML models "
+             "section to paste into broker.yaml, then exit.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -69,9 +130,20 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
+    if args.init_config:
+        _generate_config()
+        return
+
+    if args.detect_models:
+        from bastion.discovery import detect_models
+
+        ollama_port = args.ollama_port or 11435
+        detect_models(ollama_port=ollama_port)
+        return
+
     # Lazy import to allow config override before app creation
     from bastion.config import load_config
-    from bastion.server import create_admin_app, create_app, create_proxy_app
+    from bastion.server import create_app
 
     config = load_config(args.config)
 
@@ -106,7 +178,7 @@ def main() -> None:
 
 
 async def _run_two_port(
-    config: "BrokerConfig",  # noqa: F821 — lazy import avoids circular
+    config: BrokerConfig,  # noqa: F821 — lazy import avoids circular
     host: str,
     proxy_port: int,
     admin_port: int,

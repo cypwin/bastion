@@ -39,15 +39,25 @@ class SafetyLimitsBar(Static):
             self._max_temp_c = max_temp_c
 
     def render(self) -> Text:  # type: ignore[override]
-        """Return a dim reference line with safe operating thresholds."""
+        """Return safety thresholds + key binding reminder."""
         throttle = self._max_temp_c + 5
-        return Text(
+        line = Text()
+        line.append(
             f"VRAM: <{self._max_vram_gb}GB safe"
             f" | GPU: <{self._max_temp_c}\u00b0C OK,"
             f" {throttle}\u00b0C throttle"
             " | CPU: <85\u00b0C sustained, <95\u00b0C spike",
             style="dim",
         )
+        line.append("\n")
+        line.append(
+            "[h]elp [f]an [g]pu-kill [p]reload [u]nload"
+            " [d]rain [r]efresh [t]race [s]vc-restart"
+            " [1]compact [2]standard [3]full"
+            " [+/-]spark []/[]hist [q]uit",
+            style="dim italic",
+        )
+        return line
 
 
 class StatusBar(Static):

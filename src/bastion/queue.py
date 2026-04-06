@@ -12,14 +12,12 @@ Design rationale (from GPU crash investigation):
 
 from __future__ import annotations
 
-import heapq
 import logging
-import time
 import threading
+import time
 from collections import defaultdict
-from typing import Dict, List, Optional
 
-from bastion.models import BrokerConfig, PriorityTier, QueuedRequest, SchedulerConfig
+from bastion.models import QueuedRequest, SchedulerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +37,7 @@ class AffinityQueue:
     def __init__(self, config: SchedulerConfig) -> None:
         self.config = config
         self._lock = threading.Lock()
-        self._model_queues: Dict[str, List[QueuedRequest]] = defaultdict(list)
+        self._model_queues: dict[str, list[QueuedRequest]] = defaultdict(list)
         self._total_size = 0
 
     @property
@@ -51,7 +49,7 @@ class AffinityQueue:
     def is_empty(self) -> bool:
         return self._total_size == 0
 
-    def queue_depth_by_model(self) -> Dict[str, int]:
+    def queue_depth_by_model(self) -> dict[str, int]:
         """Return queue depth per model."""
         with self._lock:
             return {model: len(q) for model, q in self._model_queues.items() if q}
@@ -79,7 +77,7 @@ class AffinityQueue:
             )
             return True
 
-    def dequeue_for_model(self, model: str) -> Optional[QueuedRequest]:
+    def dequeue_for_model(self, model: str) -> QueuedRequest | None:
         """Dequeue the highest-priority request for a specific model.
 
         Used when the scheduler decides to drain the current model's queue.
@@ -109,8 +107,8 @@ class AffinityQueue:
 
     def pick_next(
         self,
-        current_model: Optional[str] = None,
-    ) -> Optional[QueuedRequest]:
+        current_model: str | None = None,
+    ) -> QueuedRequest | None:
         """Pick the best next request considering model affinity.
 
         If current_model is loaded, requests for that model get an affinity
@@ -123,7 +121,7 @@ class AffinityQueue:
             if self._total_size == 0:
                 return None
 
-            best: Optional[QueuedRequest] = None
+            best: QueuedRequest | None = None
             best_priority = -1.0
 
             for model, queue in self._model_queues.items():
@@ -141,7 +139,7 @@ class AffinityQueue:
 
             return best
 
-    def get_models_with_requests(self) -> List[str]:
+    def get_models_with_requests(self) -> list[str]:
         """List all models that have pending requests."""
         with self._lock:
             return [model for model, q in self._model_queues.items() if q]
@@ -165,14 +163,14 @@ class AffinityQueue:
                         return True
             return False
 
-    def sweep_stale(self, max_age_seconds: float) -> List[QueuedRequest]:
+    def sweep_stale(self, max_age_seconds: float) -> list[QueuedRequest]:
         """Remove and return all requests older than max_age_seconds."""
         now = time.time()
-        swept: List[QueuedRequest] = []
+        swept: list[QueuedRequest] = []
         with self._lock:
             for model in list(self._model_queues.keys()):
                 queue = self._model_queues[model]
-                remaining: List[QueuedRequest] = []
+                remaining: list[QueuedRequest] = []
                 for req in queue:
                     if (now - req.submitted_at) > max_age_seconds:
                         swept.append(req)
@@ -190,7 +188,7 @@ class AffinityQueue:
             )
         return swept
 
-    def drain_all(self) -> List[QueuedRequest]:
+    def drain_all(self) -> list[QueuedRequest]:
         """Remove and return all queued requests (for shutdown)."""
         with self._lock:
             all_requests = []

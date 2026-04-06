@@ -8,6 +8,7 @@ from rich.text import Text
 from textual.widgets import Static
 
 from bastion.dashboard.helpers import (
+    SPARKLINE_WIDTH,
     format_bytes_gb,
     format_bytes_mb,
     sparkline,
@@ -20,13 +21,18 @@ from bastion.dashboard.helpers import (
 class GPUPanel(Static):
     """GPU temperature, VRAM, and power status."""
 
-    def render_data(self, data: dict[str, Any]) -> Table:
+    def render_data(
+        self,
+        data: dict[str, Any],
+        power_history: list[float] | None = None,
+    ) -> Table:
         gpu = data.get("gpu", {})
         temp = gpu.get("temperature_c")
         used = gpu.get("vram_used_mb")
         total = gpu.get("vram_total_mb")
         power = gpu.get("power_draw_watts")
         pct = (used / total * 100) if used is not None and total else None
+        w = SPARKLINE_WIDTH
 
         table = Table(title="GPU", expand=True, show_header=False, show_edge=False, pad_edge=False)
         table.add_column("key", style="bold", width=8)
@@ -44,17 +50,22 @@ class GPUPanel(Static):
         safe_style = "green bold" if safe else "red bold"
         table.add_row("Safety", Text(safe_str, style=safe_style))
 
-        # Sparkline rows for VRAM and temperature history
+        # Sparkline rows
         app = self.app
         if hasattr(app, "vram_history") and app.vram_history:
             table.add_row(
                 "VRAM  \u2581\u2582",
-                Text(sparkline(list(app.vram_history)), style="cyan"),
+                Text(sparkline(list(app.vram_history), w), style="cyan"),
             )
         if hasattr(app, "temp_history") and app.temp_history:
             table.add_row(
                 "Temp  \u2581\u2582",
-                Text(sparkline(list(app.temp_history)), style=temp_color(temp)),
+                Text(sparkline(list(app.temp_history), w), style=temp_color(temp)),
+            )
+        if power_history:
+            table.add_row(
+                "Power \u2581\u2582",
+                Text(sparkline(power_history, w), style="yellow"),
             )
 
         return table

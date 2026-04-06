@@ -14,8 +14,7 @@ import hashlib
 import json
 from pathlib import Path
 
-import pytest
-
+import bastion.audit
 from bastion.audit import (
     AuditLogger,
     build_audit_event,
@@ -24,9 +23,6 @@ from bastion.audit import (
     hash_identity,
     init_audit_logger,
 )
-
-import bastion.audit
-
 
 # ---------------------------------------------------------------------------
 # Identity and content hashing
@@ -121,7 +117,7 @@ class TestBuildAuditEvent:
 
     def test_details_not_mutated(self) -> None:
         original = {"model": "qwen3:14b"}
-        event = build_audit_event("test", original, source_ip="1.2.3.4")
+        build_audit_event("test", original, source_ip="1.2.3.4")
         # The original dict should not have been modified
         assert "source_ip" not in original
 

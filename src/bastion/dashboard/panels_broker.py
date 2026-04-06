@@ -9,20 +9,29 @@ from rich.text import Text
 from textual.widgets import Static
 
 from bastion.dashboard.helpers import (
+    SPARKLINE_WIDTH,
     cb_state_color,
     format_uptime,
     sparkline,
     state_color,
+    usage_color,
 )
 
 
 class QueuePanel(Static):
     """Queue depth by model, scheduler state, and stall diagnostics."""
 
-    def render_data(self, data: dict[str, Any], queue_diag: dict[str, Any] | None = None) -> Table:
+    def render_data(
+        self,
+        data: dict[str, Any],
+        queue_diag: dict[str, Any] | None = None,
+        latency_p50_history: list[float] | None = None,
+        latency_p95_history: list[float] | None = None,
+    ) -> Table:
         by_model = data.get("queue_by_model", {})
         total = data.get("queue_depth", 0)
         state = data.get("state", "unknown")
+        w = SPARKLINE_WIDTH
 
         table = Table(title="Queue", expand=True, show_edge=False, pad_edge=False)
         table.add_column("Model", ratio=3)
@@ -62,20 +71,41 @@ class QueuePanel(Static):
         if hasattr(self.app, "queue_history") and self.app.queue_history:
             table.add_row(
                 Text("Trend", style="bold"),
-                Text(sparkline(list(self.app.queue_history)), style="yellow"),
+                Text(sparkline(list(self.app.queue_history), w), style="yellow"),
             )
+
+        # Request latency sparklines (p50 / p95)
+        if latency_p50_history:
+            p50_val = latency_p50_history[-1]
+            line = Text()
+            line.append(sparkline(latency_p50_history, w), style="green")
+            line.append(f" {p50_val:.1f}s", style="green")
+            table.add_row(Text("p50 \u2581\u2582", style="bold"), line)
+        if latency_p95_history:
+            p95_val = latency_p95_history[-1]
+            color = "yellow" if p95_val < 10 else "red"
+            line = Text()
+            line.append(sparkline(latency_p95_history, w), style=color)
+            line.append(f" {p95_val:.1f}s", style=color)
+            table.add_row(Text("p95 \u2581\u2582", style="bold"), line)
 
         return table
 
 
 class SchedulerPanel(Static):
-    """Scheduler uptime, requests served, model swaps."""
+    """Scheduler uptime, requests served, model swaps, throughput and swap rate sparklines."""
 
-    def render_data(self, data: dict[str, Any]) -> Table:
+    def render_data(
+        self,
+        data: dict[str, Any],
+        throughput_history: list[float] | None = None,
+        swap_rate_history: list[float] | None = None,
+    ) -> Table:
         uptime = data.get("uptime_seconds", 0)
         served = data.get("total_requests_served", 0)
         swaps = data.get("total_model_swaps", 0)
         state = data.get("state", "unknown")
+        w = SPARKLINE_WIDTH
 
         table = Table(title="Scheduler", expand=True, show_edge=False, pad_edge=False)
         table.add_column("key", style="bold", width=10)
@@ -85,6 +115,23 @@ class SchedulerPanel(Static):
         table.add_row("Served", str(served))
         table.add_row("Swaps", str(swaps))
         table.add_row("State", Text(state, style=state_color(state)))
+
+        # Throughput sparkline (requests/min)
+        if throughput_history:
+            rate = throughput_history[-1]
+            line = Text()
+            line.append(sparkline(throughput_history, w), style="cyan")
+            line.append(f" {rate:.1f}/min", style="cyan")
+            table.add_row("Thru \u2581\u2582", line)
+
+        # Swap rate sparkline (swaps/min)
+        if swap_rate_history:
+            rate = swap_rate_history[-1]
+            color = "green" if rate < 4 else ("yellow" if rate < 6 else "red")
+            line = Text()
+            line.append(sparkline(swap_rate_history, w), style=color)
+            line.append(f" {rate:.1f}/min", style=color)
+            table.add_row("Swap \u2581\u2582", line)
 
         return table
 
@@ -124,10 +171,15 @@ class CircuitBreakerPanel(Static):
 class WatchdogPanel(Static):
     """Process monitor status: Ollama health and GPU responsiveness."""
 
-    def render_data(self, watchdog_data: dict[str, Any]) -> Table:
+    def render_data(
+        self,
+        watchdog_data: dict[str, Any],
+        ollama_latency_history: list[float] | None = None,
+    ) -> Table:
         table = Table(title="Watchdog", expand=True, show_edge=False, pad_edge=False)
         table.add_column("key", style="bold", width=12)
         table.add_column("value")
+        w = SPARKLINE_WIDTH
 
         if not watchdog_data:
             table.add_row(Text("(no data)", style="dim"), "")
@@ -163,6 +215,15 @@ class WatchdogPanel(Static):
         if gpu_ms is not None:
             latency_style = "green" if gpu_ms < 500 else ("yellow" if gpu_ms < 2000 else "red")
             table.add_row("GPU ms", Text(f"{gpu_ms:.0f}ms", style=latency_style))
+
+        # Ollama latency sparkline
+        if ollama_latency_history:
+            ms_val = ollama_latency_history[-1]
+            color = "green" if ms_val < 100 else ("yellow" if ms_val < 500 else "red")
+            line = Text()
+            line.append(sparkline(ollama_latency_history, w), style=color)
+            line.append(f" {ms_val:.0f}ms", style=color)
+            table.add_row("Lat \u2581\u2582", line)
 
         # Failure counts
         ollama_fails = watchdog_data.get("consecutive_ollama_failures", 0)

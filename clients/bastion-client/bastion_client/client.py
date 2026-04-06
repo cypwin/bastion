@@ -8,7 +8,7 @@ Provides typed methods for interacting with BASTION's broker API:
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 
@@ -63,8 +63,8 @@ class BastionClient:
     async def declare_intent(
         self,
         *,
-        profile: Optional[str] = None,
-        model_sequence: Optional[list[str]] = None,
+        profile: str | None = None,
+        model_sequence: list[str] | None = None,
         estimated_requests: int = 10,
         client_id: str = "bastion_client",
     ) -> IntentResponse:
@@ -87,7 +87,7 @@ class BastionClient:
         model: str,
         prompt: str,
         *,
-        tier: Optional[str] = None,
+        tier: str | None = None,
         stream: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:

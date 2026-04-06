@@ -16,9 +16,9 @@ import hashlib
 import json
 import logging
 import logging.handlers
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 # Audit event types
 EVENT_SWAP = "swap"
@@ -70,14 +70,14 @@ def hash_content(text: str) -> str:
 
 def build_audit_event(
     event_type: str,
-    data: Dict[str, Any],
+    data: dict[str, Any],
     tier: int = 2,
-    auth_token: Optional[str] = None,
-    a2a_identity: Optional[Dict[str, Any]] = None,
-    source_ip: Optional[str] = None,
-    prompt: Optional[str] = None,
-    response: Optional[str] = None,
-) -> Dict[str, Any]:
+    auth_token: str | None = None,
+    a2a_identity: dict[str, Any] | None = None,
+    source_ip: str | None = None,
+    prompt: str | None = None,
+    response: str | None = None,
+) -> dict[str, Any]:
     """Construct a tiered audit event with dual-identity tracking.
 
     Parameters
@@ -106,8 +106,8 @@ def build_audit_event(
     dict
         Fully constructed audit event ready for JSON serialization.
     """
-    entry: Dict[str, Any] = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+    entry: dict[str, Any] = {
+        "timestamp": datetime.now(UTC).isoformat(),
         "event": event_type,
         "details": dict(data),  # shallow copy to avoid mutating caller's dict
     }
@@ -144,8 +144,9 @@ class AuditLogger:
 
     Parameters
     ----------
-    log_path : str
-        Path to the audit log file (default: /tmp/bastion-audit.jsonl).
+    log_path : str, optional
+        Path to the audit log file.  Defaults to the XDG data directory
+        (see :func:`bastion.paths.audit_log_path`).
     max_bytes : int
         Maximum file size before rotation (default: 10MB).
     backup_count : int
@@ -156,11 +157,15 @@ class AuditLogger:
 
     def __init__(
         self,
-        log_path: str = "/tmp/bastion-audit.jsonl",
+        log_path: str | None = None,
         max_bytes: int = 10 * 1024 * 1024,
         backup_count: int = 5,
         tier: int = 2,
     ) -> None:
+        from bastion.paths import audit_log_path as _default_audit_path
+
+        if log_path is None:
+            log_path = _default_audit_path()
         self.logger = logging.getLogger("bastion.audit")
         self.logger.setLevel(logging.INFO)
         self.logger.propagate = False  # Don't propagate to root logger
@@ -181,7 +186,7 @@ class AuditLogger:
         handler.setFormatter(logging.Formatter("%(message)s"))  # Raw JSON only
         self.logger.addHandler(handler)
 
-    def emit(self, event: str, details: Dict[str, Any]) -> None:
+    def emit(self, event: str, details: dict[str, Any]) -> None:
         """Emit an audit event as a JSON line.
 
         Parameters
@@ -192,7 +197,7 @@ class AuditLogger:
             Event-specific data to include in the log entry.
         """
         entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "event": event,
             "details": details,
         }
@@ -201,13 +206,13 @@ class AuditLogger:
     def emit_tiered(
         self,
         event_type: str,
-        data: Dict[str, Any],
-        tier_override: Optional[int] = None,
-        auth_token: Optional[str] = None,
-        a2a_identity: Optional[Dict[str, Any]] = None,
-        source_ip: Optional[str] = None,
-        prompt: Optional[str] = None,
-        response: Optional[str] = None,
+        data: dict[str, Any],
+        tier_override: int | None = None,
+        auth_token: str | None = None,
+        a2a_identity: dict[str, Any] | None = None,
+        source_ip: str | None = None,
+        prompt: str | None = None,
+        response: str | None = None,
     ) -> None:
         """Emit a tiered audit event with dual-identity tracking.
 
@@ -252,7 +257,7 @@ _audit_logger: AuditLogger | None = None
 
 
 def init_audit_logger(
-    log_path: str = "/tmp/bastion-audit.jsonl",
+    log_path: str | None = None,
     max_bytes: int = 10 * 1024 * 1024,
     backup_count: int = 5,
     tier: int = 2,
@@ -263,8 +268,9 @@ def init_audit_logger(
 
     Parameters
     ----------
-    log_path : str
-        Path to the audit log file.
+    log_path : str, optional
+        Path to the audit log file.  Defaults to the XDG data directory
+        (see :func:`bastion.paths.audit_log_path`).
     max_bytes : int
         Maximum file size before rotation (default: 10MB).
     backup_count : int
@@ -276,7 +282,7 @@ def init_audit_logger(
     _audit_logger = AuditLogger(log_path, max_bytes, backup_count, tier=tier)
 
 
-def emit(event: str, details: Dict[str, Any]) -> None:
+def emit(event: str, details: dict[str, Any]) -> None:
     """Emit an audit event (convenience wrapper).
 
     Backward compatible -- delegates to AuditLogger.emit() which
@@ -295,13 +301,13 @@ def emit(event: str, details: Dict[str, Any]) -> None:
 
 def emit_tiered(
     event_type: str,
-    data: Dict[str, Any],
-    tier_override: Optional[int] = None,
-    auth_token: Optional[str] = None,
-    a2a_identity: Optional[Dict[str, Any]] = None,
-    source_ip: Optional[str] = None,
-    prompt: Optional[str] = None,
-    response: Optional[str] = None,
+    data: dict[str, Any],
+    tier_override: int | None = None,
+    auth_token: str | None = None,
+    a2a_identity: dict[str, Any] | None = None,
+    source_ip: str | None = None,
+    prompt: str | None = None,
+    response: str | None = None,
 ) -> None:
     """Emit a tiered audit event (convenience wrapper).
 

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import time
 from collections import deque
 from pathlib import Path
@@ -261,33 +260,10 @@ class SystemDataCollector:
 
     @staticmethod
     def query_gpu_processes() -> list[dict[str, str]]:
-        """Run nvidia-smi to get compute processes and their VRAM usage."""
-        try:
-            result = subprocess.run(
-                [
-                    "nvidia-smi",
-                    "--query-compute-apps=pid,process_name,used_memory",
-                    "--format=csv,noheader,nounits",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode != 0:
-                return []
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return []
+        """Query GPU compute processes via the configured GPU backend."""
+        from bastion.gpu import get_backend
 
-        processes: list[dict[str, str]] = []
-        for line in result.stdout.strip().splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 3:
-                processes.append({
-                    "pid": parts[0],
-                    "name": parts[1],
-                    "vram_mb": parts[2],
-                })
-        return processes
+        return get_backend().query_processes()
 
     # ------------------------------------------------------------------
     # Top processes

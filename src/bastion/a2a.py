@@ -25,11 +25,11 @@ import json
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Set
+from collections.abc import AsyncGenerator, Callable
+from datetime import UTC, datetime
+from typing import Any
 
 import httpx
-from pydantic import BaseModel, Field
 
 from bastion import audit
 from bastion.circuitbreaker import CircuitBreaker, CircuitOpenError
@@ -46,7 +46,6 @@ from bastion.models import (
     A2ATaskState,
     BrokerConfig,
     LeaseState,
-    LoadedModel,
     ModelLease,
     PriorityTier,
     QueuedRequest,
@@ -59,7 +58,7 @@ from bastion.vram import VRAMTracker
 logger = logging.getLogger(__name__)
 
 
-class _noop_async_cm:
+class _NoopAsyncCm:
     """Async context-manager wrapper that yields a pre-existing object.
 
     Used to wrap a shared ``httpx.AsyncClient`` so that it can be used in
@@ -77,20 +76,10 @@ class _noop_async_cm:
         pass  # Do NOT close the shared client
 
 
-# Try to import A2A SDK types for protocol compliance
+# Detect A2A SDK availability without importing unused names
 try:
-    from a2a.types import (
-        AgentCard as A2AAgentCard,
-        AgentCapabilities as A2AAgentCapabilities,
-        AgentSkill as A2AAgentSkill,
-        Artifact as A2AArtifact,
-        DataPart as A2ADataPart,
-        Message as A2AMessage,
-        Task as A2ATask,
-        TaskState as A2ATaskStateEnum,
-        TaskStatus as A2ATaskStatus,
-        TextPart as A2ATextPart,
-    )
+    import a2a.types  # noqa: F401
+
     A2A_SDK_AVAILABLE = True
 except ImportError:
     A2A_SDK_AVAILABLE = False
@@ -129,8 +118,8 @@ class A2AHandler:
         enqueue_fn: Callable[[QueuedRequest], asyncio.Event],
         vram_tracker: VRAMTracker,
         scheduler: Any,  # Avoid circular import
-        circuit_breaker: Optional[CircuitBreaker] = None,
-        http_client: Optional[httpx.AsyncClient] = None,
+        circuit_breaker: CircuitBreaker | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._config = config
         self._enqueue_fn = enqueue_fn
@@ -148,14 +137,14 @@ class A2AHandler:
         self._store.start_cleanup()
 
         # Active model reservations (reservation_id -> Reservation)
-        self._reservations: Dict[str, Reservation] = {}
+        self._reservations: dict[str, Reservation] = {}
 
         # Hybrid leases (lease_id -> ModelLease) — upgrade from simple reservations
-        self._leases: Dict[str, ModelLease] = {}
+        self._leases: dict[str, ModelLease] = {}
         self._fencing_counter: int = 0
 
         # Skill routing table
-        self._skill_handlers: Dict[str, Callable] = {
+        self._skill_handlers: dict[str, Callable] = {
             "infer": self._handle_infer,
             "status": self._handle_status,
             "batch_infer": self._handle_batch_infer,
@@ -163,7 +152,7 @@ class A2AHandler:
         }
 
         # GC prevention: hold strong references to fire-and-forget tasks
-        self._background_tasks: Set[asyncio.Task] = set()
+        self._background_tasks: set[asyncio.Task] = set()
 
         # Start background cleanup task for expired reservations
         self._spawn_background_task(self._cleanup_expired_reservations())
@@ -303,7 +292,7 @@ class A2AHandler:
         logger.info("A2A task created: %s (skill=%s)", task_id, skill_id)
         return self._task_to_dict(record)
 
-    async def get_task(self, task_id: str) -> Optional[dict]:
+    async def get_task(self, task_id: str) -> dict | None:
         """Return current task state, artifacts, and status.
 
         Parameters
@@ -401,14 +390,17 @@ class A2AHandler:
             # Stream updates with heartbeat and disconnect detection
             while True:
                 # Check for client disconnect
-                if request is not None and hasattr(request, 'is_disconnected'):
-                    if await request.is_disconnected():
-                        logger.debug("SSE client disconnected for task %s", task_id)
-                        break
+                if (
+                    request is not None
+                    and hasattr(request, 'is_disconnected')
+                    and await request.is_disconnected()
+                ):
+                    logger.debug("SSE client disconnected for task %s", task_id)
+                    break
 
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=15.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # Send heartbeat marker (handled by _sse_wrapper as SSE comment)
                     yield {"_heartbeat": True}
                     continue
@@ -465,7 +457,7 @@ class A2AHandler:
         self,
         handler: Callable,
         record: A2ATaskRecord,
-        trace_context: Optional[Dict[str, str]] = None,
+        trace_context: dict[str, str] | None = None,
     ) -> None:
         """Wrapper to run a skill handler and catch exceptions.
 
@@ -481,7 +473,11 @@ class A2AHandler:
             Serialized trace context from task submission (for span linking).
         """
         # Start a CONSUMER telemetry span linked to the producer
-        model = record.input_params.get("model", "") if isinstance(record.input_params, dict) else ""
+        model = (
+            record.input_params.get("model", "")
+            if isinstance(record.input_params, dict)
+            else ""
+        )
         process_span = record_task_process(
             record.task_id, record.skill_id, model, trace_context,
         )
@@ -534,7 +530,10 @@ class A2AHandler:
             )
             end_span(process_span, error=str(e))
         except Exception as e:
-            logger.exception("A2A skill handler error (task=%s, skill=%s)", record.task_id, record.skill_id)
+            logger.exception(
+                "A2A skill handler error (task=%s, skill=%s)",
+                record.task_id, record.skill_id,
+            )
             record.error = str(e)
             if self._safe_transition(record.task_id, A2ATaskState.FAILED):
                 await self._notify_subscribers(
@@ -614,7 +613,7 @@ class A2AHandler:
         queue_timeout = self._config.proxy.queue_timeout_seconds
         try:
             await asyncio.wait_for(grant_event.wait(), timeout=queue_timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             cancel_fn()  # Clean up ghost request from all tracking structures
             record.error = f"Queue timeout after {queue_timeout}s"
             if self._safe_transition(record.task_id, A2ATaskState.FAILED):
@@ -753,12 +752,11 @@ class A2AHandler:
             # Use shared client if available; otherwise create a per-request one
             use_shared = self._http_client is not None
             client_cm = (
-                _noop_async_cm(self._http_client)
+                _NoopAsyncCm(self._http_client)
                 if use_shared
                 else httpx.AsyncClient(timeout=timeout)
             )
-            async with client_cm as client:
-                async with client.stream("POST", ollama_url, json=payload) as resp:
+            async with client_cm as client, client.stream("POST", ollama_url, json=payload) as resp:
                     try:
                         resp.raise_for_status()
                     except httpx.HTTPStatusError as e:
@@ -782,7 +780,10 @@ class A2AHandler:
                             chunk = json.loads(line)
                         except json.JSONDecodeError as e:
                             # Malformed JSON, log and skip
-                            logger.warning("A2A stream: malformed JSON chunk (task=%s): %s", record.task_id, e)
+                            logger.warning(
+                                "A2A stream: malformed JSON chunk (task=%s): %s",
+                                record.task_id, e,
+                            )
                             continue
 
                         # Extract token text
@@ -811,7 +812,7 @@ class A2AHandler:
                                             "artifact_id": f"token-{token_index}",
                                             "parts": [{"kind": "text", "text": token}],
                                         },
-                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "timestamp": datetime.now(UTC).isoformat(),
                                     }
                                 },
                             )
@@ -881,7 +882,11 @@ class A2AHandler:
         try:
             # Query current state
             loaded = await self._vram.get_loaded_models() if self._vram else []
-            queue_depth = self._scheduler.queue.total_size if self._scheduler and hasattr(self._scheduler, "queue") else 0
+            queue_depth = (
+                self._scheduler.queue.total_size
+                if self._scheduler and hasattr(self._scheduler, "queue")
+                else 0
+            )
             queue_by_model = (
                 self._scheduler.queue.queue_depth_by_model()
                 if self._scheduler and hasattr(self._scheduler, "queue")
@@ -958,7 +963,10 @@ class A2AHandler:
                 return
 
             if len(prompts) > self._config.a2a.max_batch_size:
-                record.error = f"Batch size {len(prompts)} exceeds max {self._config.a2a.max_batch_size}"
+                record.error = (
+                    f"Batch size {len(prompts)} exceeds max"
+                    f" {self._config.a2a.max_batch_size}"
+                )
                 if self._safe_transition(record.task_id, A2ATaskState.FAILED):
                     await self._notify_subscribers(
                         record.task_id,
@@ -967,7 +975,7 @@ class A2AHandler:
                 return
 
             # Initialize results tracking
-            results: List[Dict[str, Any]] = []
+            results: list[dict[str, Any]] = []
             succeeded = 0
             failed = 0
 
@@ -1006,7 +1014,7 @@ class A2AHandler:
             queue_timeout = self._config.proxy.queue_timeout_seconds
             try:
                 await asyncio.wait_for(grant_event.wait(), timeout=queue_timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 cancel_fn()  # Clean up ghost request from all tracking structures
                 record.error = f"Queue timeout after {queue_timeout}s"
                 if self._safe_transition(record.task_id, A2ATaskState.FAILED):
@@ -1044,7 +1052,7 @@ class A2AHandler:
             # Use shared client if available; otherwise create per-request
             use_shared = self._http_client is not None
             client_cm = (
-                _noop_async_cm(self._http_client)
+                _NoopAsyncCm(self._http_client)
                 if use_shared
                 else httpx.AsyncClient(timeout=timeout)
             )
@@ -1273,7 +1281,10 @@ class A2AHandler:
 
             # Validate num_requests
             if num_requests <= 0 or num_requests > self._config.a2a.reservation_max_requests:
-                record.error = f"num_requests must be between 1 and {self._config.a2a.reservation_max_requests}"
+                record.error = (
+                    f"num_requests must be between 1 and"
+                    f" {self._config.a2a.reservation_max_requests}"
+                )
                 if self._safe_transition(record.task_id, A2ATaskState.FAILED):
                     await self._notify_subscribers(
                         record.task_id,
@@ -1304,8 +1315,14 @@ class A2AHandler:
                 model=model,
                 endpoint="/api/generate",
                 body=json.dumps(load_payload).encode(),
-                priority=priority if isinstance(priority, float) else self._config.priorities.interactive,
-                base_priority=priority if isinstance(priority, float) else self._config.priorities.interactive,
+                priority=(
+                    priority if isinstance(priority, float)
+                    else self._config.priorities.interactive
+                ),
+                base_priority=(
+                    priority if isinstance(priority, float)
+                    else self._config.priorities.interactive
+                ),
                 tier=PriorityTier.INTERACTIVE,
                 client_info=f"a2a:preload:{record.task_id}",
             )
@@ -1325,7 +1342,7 @@ class A2AHandler:
             queue_timeout = self._config.proxy.queue_timeout_seconds
             try:
                 await asyncio.wait_for(grant_event.wait(), timeout=queue_timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 cancel_fn()  # Clean up ghost request from all tracking structures
                 record.error = f"Queue timeout after {queue_timeout}s"
                 if self._safe_transition(record.task_id, A2ATaskState.FAILED):
@@ -1446,9 +1463,7 @@ class A2AHandler:
             if r.model == model and r.remaining_requests > 0 and now < r.expires_at:
                 return True
         # Also check hybrid leases
-        if self.has_active_lease(model):
-            return True
-        return False
+        return bool(self.has_active_lease(model))
 
     # ── Lease Management ───────────────────────────────────────────────
 
@@ -1518,7 +1533,11 @@ class A2AHandler:
         lease = self._leases[lease_id]
 
         if lease.fencing_token != fencing_token:
-            return False, f"Stale fencing token: got {fencing_token}, expected {lease.fencing_token}"
+            return (
+                False,
+                f"Stale fencing token: got {fencing_token},"
+                f" expected {lease.fencing_token}",
+            )
 
         should_release, reason = lease.should_release()
         if should_release:
@@ -1701,11 +1720,27 @@ class A2AHandler:
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "model": {"type": "string", "description": "Model name to use for inference"},
-                            "prompt": {"type": "string", "description": "Prompt text to process"},
-                            "system_prompt": {"type": "string", "description": "Optional system prompt"},
-                            "options": {"type": "object", "description": "Ollama options (temperature, etc.)"},
-                            "stream": {"type": "boolean", "description": "Enable SSE streaming", "default": False},
+                            "model": {
+                                "type": "string",
+                                "description": "Model name to use for inference",
+                            },
+                            "prompt": {
+                                "type": "string",
+                                "description": "Prompt text to process",
+                            },
+                            "system_prompt": {
+                                "type": "string",
+                                "description": "Optional system prompt",
+                            },
+                            "options": {
+                                "type": "object",
+                                "description": "Ollama options (temperature, etc.)",
+                            },
+                            "stream": {
+                                "type": "boolean",
+                                "description": "Enable SSE streaming",
+                                "default": False,
+                            },
                         },
                         "required": ["model", "prompt"],
                     },

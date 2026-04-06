@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import time
 import uuid
-from enum import Enum
-from typing import Any, Dict, List, Optional, Set
+from enum import StrEnum
+from typing import Any
 
-from pydantic import BaseModel, Field
-
+from pydantic import BaseModel, Field, computed_field
 
 # ---------------------------------------------------------------------------
 # Configuration models
@@ -39,11 +38,15 @@ class ServerConfig(BaseModel):
 
 
 class GPUConfig(BaseModel):
-    """GPU safety thresholds."""
-    total_vram_gb: float = 32.0
+    """GPU safety thresholds.
+
+    Set ``total_vram_gb`` to ``0`` (the default) to auto-detect from
+    ``nvidia-smi`` at startup.  See :func:`bastion.config.resolve_gpu_defaults`.
+    """
+    total_vram_gb: float = 0.0  # 0 = auto-detect from nvidia-smi
     headroom_gb: float = 6.0
-    max_temperature_c: int = 82
-    max_power_watts: float = 450.0
+    max_temperature_c: int = 83
+    max_power_watts: float = 300.0  # Conservative default; auto-detect overrides
     default_vram_estimate_gb: float = 10.0  # VRAM estimate for unknown models
     nvidia_smi_timeout_seconds: int = 5  # nvidia-smi subprocess timeout
 
@@ -59,10 +62,10 @@ class ProxyConfig(BaseModel):
     connect_timeout_seconds: float = 10.0  # HTTP connect timeout
     queue_timeout_seconds: float = 300.0  # Max wait in queue before 504
     max_request_body_bytes: int = 10 * 1024 * 1024  # 10 MB default
-    scheduled_endpoints: Set[str] = Field(
+    scheduled_endpoints: set[str] = Field(
         default_factory=lambda: {"/api/generate", "/api/chat", "/api/embed"}
     )
-    passthrough_endpoints: Set[str] = Field(
+    passthrough_endpoints: set[str] = Field(
         default_factory=lambda: {
             "/api/pull", "/api/show", "/api/tags", "/api/ps",
             "/api/delete", "/api/copy", "/api/create", "/api/blobs",
@@ -94,7 +97,8 @@ class SchedulerConfig(BaseModel):
     swap_rate_warn_cooldown_seconds: float = 5.0  # Cooldown at warn level
     swap_rate_critical_cooldown_seconds: float = 10.0  # Cooldown at critical level
     max_concurrent_dispatches: int = 3  # Max concurrent inferences (different models)
-    concurrent_dispatch_delay_seconds: float = 0.1  # Stagger concurrent dispatches to reduce power transients
+    # Stagger concurrent dispatches to reduce power transients
+    concurrent_dispatch_delay_seconds: float = 0.1
     queue_ttl_seconds: float = 600.0  # Max age for queued requests (10 min); swept every 60s
 
 
@@ -116,7 +120,7 @@ class AuditConfig(BaseModel):
 class AuthConfig(BaseModel):
     """Authentication configuration."""
     enabled: bool = False
-    api_keys: List[str] = Field(default_factory=list)
+    api_keys: list[str] = Field(default_factory=list)
 
 
 class RateLimitConfig(BaseModel):
@@ -145,14 +149,14 @@ class ModelInfo(BaseModel):
     """Known model metadata."""
     vram_gb: float
     default_num_ctx: int = 4096  # Default context window for this model
-    tags: List[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
     always_allowed: bool = False
 
 
 class RequestOverrides(BaseModel):
     """Safety overrides injected into ALL Ollama requests."""
     use_mmap: bool = False  # GPU crash prevention — see CRASH_ROOT_CAUSE.md
-    default_num_ctx: Optional[int] = 4096  # Global fallback context window
+    default_num_ctx: int | None = 4096  # Global fallback context window
 
 
 # ---------------------------------------------------------------------------
@@ -178,14 +182,14 @@ class TelemetryConfig(BaseModel):
 class A2AConfig(BaseModel):
     """A2A interface configuration."""
     enabled: bool = False
-    tokens: List[str] = Field(default_factory=list)
+    tokens: list[str] = Field(default_factory=list)
     reservation_max_requests: int = 100
     reservation_timeout_seconds: float = 600.0  # 10 minutes
     task_ttl_seconds: float = 3600.0  # Completed tasks kept for 1 hour
     max_batch_size: int = 50
 
 
-class A2ATaskState(str, Enum):
+class A2ATaskState(StrEnum):
     """A2A task lifecycle states."""
     SUBMITTED = "submitted"
     WORKING = "working"
@@ -200,9 +204,9 @@ class A2ATaskRecord(BaseModel):
     context_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
     state: A2ATaskState = A2ATaskState.SUBMITTED
     skill_id: str
-    input_params: Dict[str, Any] = Field(default_factory=dict)
-    output_artifacts: List[Dict[str, Any]] = Field(default_factory=list)
-    error: Optional[str] = None
+    input_params: dict[str, Any] = Field(default_factory=dict)
+    output_artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    error: str | None = None
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
 
@@ -223,8 +227,8 @@ class BrokerConfig(BaseModel):
     circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     a2a: A2AConfig = Field(default_factory=lambda: A2AConfig())
-    models: Dict[str, ModelInfo] = Field(default_factory=dict)
-    session_profiles: Dict[str, SessionProfile] = Field(default_factory=dict)
+    models: dict[str, ModelInfo] = Field(default_factory=dict)
+    session_profiles: dict[str, SessionProfile] = Field(default_factory=dict)
     request_overrides: RequestOverrides = Field(default_factory=RequestOverrides)
 
 
@@ -232,7 +236,7 @@ class BrokerConfig(BaseModel):
 # Priority tier enum
 # ---------------------------------------------------------------------------
 
-class PriorityTier(str, Enum):
+class PriorityTier(StrEnum):
     """Request priority tiers (highest to lowest)."""
     INTERACTIVE = "interactive"
     AGENT = "agent"
@@ -279,7 +283,7 @@ class LoadedModel(BaseModel):
     name: str
     size_bytes: int = 0
     vram_gb: float = 0.0
-    details: Dict[str, Any] = Field(default_factory=dict)
+    details: dict[str, Any] = Field(default_factory=dict)
 
 
 class ResidencyState(BaseModel):
@@ -288,7 +292,7 @@ class ResidencyState(BaseModel):
     Used by admin API to report multi-model residency state and by
     scheduler to make co-residency decisions.
     """
-    resident_models: List[str] = Field(
+    resident_models: list[str] = Field(
         default_factory=list,
         description="Names of all models currently loaded in VRAM"
     )
@@ -296,7 +300,7 @@ class ResidencyState(BaseModel):
         default_factory=time.time,
         description="Timestamp when residency was last queried (seconds since epoch)"
     )
-    vram_usage: Dict[str, float] = Field(
+    vram_usage: dict[str, float] = Field(
         default_factory=dict,
         description="Per-model VRAM usage in GB (model_name -> vram_gb)"
     )
@@ -312,7 +316,7 @@ class ResidencyState(BaseModel):
         return time.time() - self.last_refreshed
 
     @classmethod
-    def from_loaded_models(cls, models: List[LoadedModel]) -> "ResidencyState":
+    def from_loaded_models(cls, models: list[LoadedModel]) -> ResidencyState:
         """Create ResidencyState from a list of LoadedModel instances.
 
         Parameters
@@ -342,7 +346,7 @@ class SessionProfile(BaseModel):
     Used by client pipelines to signal upcoming model usage
     so the scheduler can pre-plan transitions.
     """
-    model_sequence: List[str] = Field(
+    model_sequence: list[str] = Field(
         description="Ordered list of models used in this pipeline"
     )
     default_priority: PriorityTier = PriorityTier.AGENT
@@ -356,11 +360,11 @@ class IntentDeclaration(BaseModel):
     planned model transitions.
     """
     intent_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
-    profile: Optional[str] = Field(
+    profile: str | None = Field(
         default=None,
         description="Name of a session profile from broker.yaml"
     )
-    model_sequence: Optional[List[str]] = Field(
+    model_sequence: list[str] | None = Field(
         default=None,
         description="Ad-hoc model sequence (used if profile is None)"
     )
@@ -379,21 +383,27 @@ class IntentResponse(BaseModel):
     """Response to a successful intent declaration."""
     intent_id: str
     resolved_priority: str
-    model_sequence: List[str]
+    model_sequence: list[str]
     estimated_requests: int
     status: str = "registered"
 
 
 class GPUStatus(BaseModel):
     """Current GPU hardware state."""
-    temperature_c: Optional[int] = None
-    vram_used_mb: Optional[int] = None
-    vram_free_mb: Optional[int] = None
-    vram_total_mb: Optional[int] = None
-    power_draw_watts: Optional[float] = None
+    temperature_c: int | None = None
+    vram_used_mb: int | None = None
+    vram_free_mb: int | None = None
+    vram_total_mb: int | None = None
+    power_draw_watts: float | None = None
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
-    def vram_utilization_pct(self) -> Optional[float]:
+    def vram_utilization_pct(self) -> float | None:
+        """VRAM utilization as a percentage (0-100).
+
+        Exposed via ``@computed_field`` so that ``model_dump()`` and JSON
+        serialization include the value automatically.
+        """
         if self.vram_used_mb and self.vram_total_mb:
             return (self.vram_used_mb / self.vram_total_mb) * 100
         return None
@@ -410,9 +420,7 @@ class GPUStatus(BaseModel):
         temp_limit = gpu_config.max_temperature_c if gpu_config else 82
         if self.temperature_c and self.temperature_c > temp_limit:
             return False
-        if self.vram_utilization_pct and self.vram_utilization_pct > 95:
-            return False
-        return True
+        return not (self.vram_utilization_pct and self.vram_utilization_pct > 95)
 
 
 class BrokerStatus(BaseModel):
@@ -420,17 +428,26 @@ class BrokerStatus(BaseModel):
     version: str = Field(default_factory=lambda: __import__("bastion").__version__)
     uptime_seconds: float = 0.0
     queue_depth: int = 0
-    queue_by_model: Dict[str, int] = Field(default_factory=dict)
-    loaded_models: List[LoadedModel] = Field(default_factory=list)
+    queue_by_model: dict[str, int] = Field(default_factory=dict)
+    loaded_models: list[LoadedModel] = Field(default_factory=list)
     gpu: GPUStatus = Field(default_factory=GPUStatus)
-    current_model: Optional[str] = None
+    current_model: str | None = None
     total_requests_served: int = 0
     total_model_swaps: int = 0
     state: str = "running"  # running, draining, stopped
-    vram_ledger: Optional[Dict[str, Any]] = Field(
+    vram_ledger: dict[str, Any] | None = Field(
         default=None,
         description="VRAM ledger status from VRAMManager (if available)",
     )
+    # --- Observability fields (Phase 1) ------------------------------------
+    total_dispatched: int = 0
+    swap_rate_level: str | None = None
+    stall_reason: str | None = None
+    stall_duration_seconds: float | None = None
+    inflight_models: dict[str, int] | None = None
+    circuit_breaker: dict | None = None
+    gpu_is_safe: bool | None = None
+    max_vram_gb: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -440,15 +457,15 @@ class BrokerStatus(BaseModel):
 class BatchInferRequest(BaseModel):
     """Parameters for the batch_infer skill."""
     model: str
-    prompts: List[str]
-    system_prompt: Optional[str] = None
-    options: Dict[str, Any] = Field(default_factory=dict)
+    prompts: list[str]
+    system_prompt: str | None = None
+    options: dict[str, Any] = Field(default_factory=dict)
     priority: PriorityTier = PriorityTier.AGENT
 
 
 class BatchInferResult(BaseModel):
     """Result of a batch_infer task."""
-    results: List[Dict[str, Any]]  # Per-prompt results (index-aligned)
+    results: list[dict[str, Any]]  # Per-prompt results (index-aligned)
     total: int
     succeeded: int
     failed: int
@@ -458,7 +475,7 @@ class ReservationRequest(BaseModel):
     """Parameters for the preload/reservation skill."""
     model: str
     num_requests: int = 10
-    timeout_seconds: Optional[float] = None  # Falls back to config default
+    timeout_seconds: float | None = None  # Falls back to config default
     priority: PriorityTier = PriorityTier.INTERACTIVE
 
 
@@ -472,7 +489,7 @@ class Reservation(BaseModel):
     expires_at: float = 0.0  # Set from config
 
 
-class LeaseState(str, Enum):
+class LeaseState(StrEnum):
     """States for a model lease."""
     ACTIVE = "active"
     EXPIRED = "expired"

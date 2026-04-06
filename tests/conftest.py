@@ -9,19 +9,17 @@ Provides:
 
 from __future__ import annotations
 
-import json
 import time
-from typing import Any, Dict, List
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import Any
+from unittest.mock import AsyncMock, patch
 
-import pytest
 import httpx
+import pytest
 
 from bastion.models import (
     BrokerConfig,
     GPUConfig,
     GPUStatus,
-    LoadedModel,
     ModelInfo,
     OllamaConfig,
     PriorityTier,
@@ -31,7 +29,6 @@ from bastion.models import (
 )
 from bastion.queue import AffinityQueue
 from bastion.vram import VRAMTracker
-
 
 # ---------------------------------------------------------------------------
 # Configuration fixtures
@@ -177,9 +174,9 @@ class MockOllamaResponses:
     """
 
     def __init__(self) -> None:
-        self.ps_response: Dict[str, Any] = {"models": []}
-        self.tags_response: Dict[str, Any] = {"models": []}
-        self.generate_response: Dict[str, Any] = {"response": "", "done": True}
+        self.ps_response: dict[str, Any] = {"models": []}
+        self.tags_response: dict[str, Any] = {"models": []}
+        self.generate_response: dict[str, Any] = {"response": "", "done": True}
 
     def make_response(self, status_code: int = 200, json_data: Any = None) -> httpx.Response:
         """Create a mock httpx.Response."""
@@ -279,8 +276,8 @@ def request_factory():
 # TaskStore fixtures (D5: shared fixtures)
 # ---------------------------------------------------------------------------
 
-from bastion.models import A2ATaskRecord, A2ATaskState
-from bastion.taskstore import TaskStore
+from bastion.models import A2ATaskRecord, A2ATaskState  # noqa: E402
+from bastion.taskstore import TaskStore  # noqa: E402
 
 
 def make_task_record(
@@ -338,7 +335,7 @@ def _isolate_telemetry():
 # VRAMManager fixture (D5)
 # ---------------------------------------------------------------------------
 
-from bastion.vram import VRAMManager
+from bastion.vram import VRAMManager  # noqa: E402
 
 
 @pytest.fixture

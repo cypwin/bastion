@@ -12,21 +12,17 @@ from __future__ import annotations
 
 import json
 import logging
-import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict
-
-import pytest
 
 from bastion.audit import (
-    AuditLogger,
-    EVENT_SWAP,
-    EVENT_VRAM_ALERT,
     EVENT_QUEUE_CHANGE,
     EVENT_REQUEST_COMPLETE,
-    init_audit_logger,
+    EVENT_SWAP,
+    EVENT_VRAM_ALERT,
+    AuditLogger,
     emit,
+    init_audit_logger,
 )
 
 
@@ -109,9 +105,9 @@ class TestAuditEventEmission:
         log_file = tmp_path / "test-audit.jsonl"
         audit = AuditLogger(log_path=str(log_file))
 
-        before = datetime.now(timezone.utc)
+        before = datetime.now(UTC)
         audit.emit("test", {})
-        after = datetime.now(timezone.utc)
+        after = datetime.now(UTC)
 
         # Read and parse
         lines = log_file.read_text().strip().split("\n")
@@ -314,7 +310,7 @@ class TestFileRotation:
             audit.emit("test", {"iteration": i, "data": "x" * 20})
 
         # Should have created backup files
-        backup1 = Path(str(log_file) + ".1")
+        Path(str(log_file) + ".1")
 
         # At least one backup should exist (exact behavior depends on logging module)
         # Just verify the main file still exists and has content

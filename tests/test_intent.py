@@ -15,19 +15,14 @@ from __future__ import annotations
 import time
 from unittest.mock import MagicMock
 
-import pytest
-
 from bastion.models import (
     BrokerConfig,
     IntentDeclaration,
     IntentResponse,
-    ModelInfo,
     PriorityTier,
-    SchedulerConfig,
     SessionProfile,
 )
 from bastion.proxy import OllamaProxy
-
 
 # ---------------------------------------------------------------------------
 # SessionProfile model tests
@@ -179,8 +174,10 @@ class TestConfigSessionProfiles:
         )
         assert "council_pipeline" in config.session_profiles
         assert "embedding_pipeline" in config.session_profiles
-        assert config.session_profiles["council_pipeline"].default_priority == PriorityTier.INTERACTIVE
-        assert config.session_profiles["embedding_pipeline"].default_priority == PriorityTier.BACKGROUND
+        council = config.session_profiles["council_pipeline"]
+        embedding = config.session_profiles["embedding_pipeline"]
+        assert council.default_priority == PriorityTier.INTERACTIVE
+        assert embedding.default_priority == PriorityTier.BACKGROUND
 
     def test_profiles_parsed_from_yaml_style_dict(self) -> None:
         """Simulate what YAML parsing produces."""
@@ -422,7 +419,7 @@ class TestIntentLifecycle:
 
     def test_lookup_returns_none_after_completion(self) -> None:
         """After completing an intent, _lookup_intent returns None."""
-        from bastion.server import _active_intents, _resolved_intents, _lookup_intent
+        from bastion.server import _active_intents, _lookup_intent, _resolved_intents
         _active_intents.clear()
         _resolved_intents.clear()
 
@@ -445,7 +442,7 @@ class TestIntentLifecycle:
 
     def test_intent_influences_subsequent_requests(self) -> None:
         """End-to-end: declared intent -> lookup -> proxy uses resolved priority."""
-        from bastion.server import _resolved_intents, _lookup_intent
+        from bastion.server import _lookup_intent, _resolved_intents
         _resolved_intents.clear()
 
         intent_id = "test-e2e-intent"
