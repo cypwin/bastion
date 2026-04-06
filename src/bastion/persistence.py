@@ -155,6 +155,9 @@ class PersistentAuditLog:
                               model=data.get("model"), client_ip=source_ip,
                               content_hash=data.get("content_hash"))
 
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
     def _schedule_insert(self, event_type: str, tier: int, payload: dict[str, Any],
                          model: str | None = None, client_ip: str | None = None,
                          content_hash: str | None = None) -> None:
@@ -186,6 +189,9 @@ class PersistentTaskStore:
     def __init__(self, inner: Any, db: DatabaseManager) -> None:
         self._inner = inner
         self._db = db
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
 
     # Delegated read methods
     def get(self, task_id: str) -> Any:
@@ -269,6 +275,9 @@ class PersistentQueue:
         self._inner = inner
         self._db = db
 
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
     # Delegated read-only properties and methods
     @property
     def total_size(self) -> int:
@@ -292,37 +301,56 @@ class PersistentQueue:
     def drain_all(self) -> list:
         return self._inner.drain_all()
 
-    # Write methods (dual-write)
-    async def enqueue(self, request: Any) -> bool:
+    # Write methods (dual-write, sync interface matching AffinityQueue)
+    def enqueue(self, request: Any) -> bool:
         result = self._inner.enqueue(request)
         if result:
-            try:
-                await self._db.conn.execute(
-                    """INSERT OR REPLACE INTO queue_entries
-                       (entry_id, model, priority, payload, enqueued_at, completed)
-                       VALUES (?, ?, ?, ?, ?, 0)""",
-                    (request.id, request.model, int(request.base_priority),
-                     json.dumps({"model": request.model, "endpoint": request.endpoint,
-                                 "body": request.body.decode("utf-8", errors="replace") if isinstance(request.body, bytes) else str(request.body),
-                                 "priority": request.priority, "base_priority": request.base_priority}),
-                     datetime.now(UTC).isoformat()),
-                )
-                await self._db.conn.commit()
-            except Exception as e:
-                logger.warning("SQLite queue persist failed for %s: %s", request.id, e)
+            self._schedule_persist(request)
         return result
 
-    async def dequeue_for_model(self, model: str) -> Any:
+    def dequeue_for_model(self, model: str) -> Any:
         request = self._inner.dequeue_for_model(model)
         if request is not None:
-            await self._mark_completed(request.id)
+            self._schedule_complete(request.id)
         return request
 
-    async def cancel(self, request_id: str) -> bool:
+    def cancel(self, request_id: str) -> bool:
         result = self._inner.cancel(request_id)
         if result:
-            await self._mark_completed(request_id)
+            self._schedule_complete(request_id)
         return result
+
+    def _schedule_persist(self, request: Any) -> None:
+        """Fire-and-forget async persist of a queue entry."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._persist_entry(request))
+
+    def _schedule_complete(self, entry_id: str) -> None:
+        """Fire-and-forget async mark-completed."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._mark_completed(entry_id))
+
+    async def _persist_entry(self, request: Any) -> None:
+        try:
+            await self._db.conn.execute(
+                """INSERT OR REPLACE INTO queue_entries
+                   (entry_id, model, priority, payload, enqueued_at, completed)
+                   VALUES (?, ?, ?, ?, ?, 0)""",
+                (request.id, request.model, int(request.base_priority),
+                 json.dumps({"model": request.model, "endpoint": request.endpoint,
+                             "body": request.body.decode("utf-8", errors="replace") if isinstance(request.body, bytes) else str(request.body),
+                             "priority": request.priority, "base_priority": request.base_priority}),
+                 datetime.now(UTC).isoformat()),
+            )
+            await self._db.conn.commit()
+        except Exception as e:
+            logger.warning("SQLite queue persist failed for %s: %s", request.id, e)
 
     async def _mark_completed(self, entry_id: str) -> None:
         try:
@@ -368,4 +396,13 @@ class PersistentQueue:
                     discarded += 1
         if recovered or discarded:
             logger.info("Queue hydration: recovered=%d, discarded=%d", recovered, discarded)
+        # Mark all pending entries as completed after hydration
+        # (recovered entries are now in-memory; stale entries should not be retried)
+        try:
+            await self._db.conn.execute(
+                "UPDATE queue_entries SET completed = 1 WHERE completed = 0"
+            )
+            await self._db.conn.commit()
+        except Exception as e:
+            logger.warning("Failed to mark hydrated queue entries: %s", e)
         return recovered, discarded
