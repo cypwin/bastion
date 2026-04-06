@@ -17,3 +17,7 @@ build/
 .mypy_cache
 .pytest_cache
 to_del_*
+CLAUDE.md
+CLAUDE.local.md
+ARCHIVE/
+.claude/

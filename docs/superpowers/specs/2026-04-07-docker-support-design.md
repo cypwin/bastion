@@ -7,9 +7,10 @@
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Base image | `python:3.12-slim` multi-stage | No CUDA needed; nvidia-smi injected by NVIDIA Container Toolkit. ~200MB vs ~2GB |
+| Base image | `python:3.12-slim` multi-stage | No CUDA needed; nvidia-smi injected by NVIDIA Container Toolkit at runtime. ~200MB vs ~2GB |
 | Ollama relationship | Separate containers + compose | BASTION image stays focused; compose gives one-command full stack |
 | GPU access | NVIDIA Container Toolkit (`--gpus all`) | Standard Docker GPU approach; no CUDA libraries bundled |
+| Default config | `broker.example.yaml` (minimal) | GPU auto-detection works in-container; users run `--detect-models` or mount their own `broker.yaml` |
 | Startup behavior | Start always, health check gates readiness | Matches bare-metal behavior; compose gets proper orchestration signals |
 | CI/ghcr.io | Deferred to Phase 4 | No CI infrastructure yet; get Docker working locally first |
 
@@ -26,7 +27,7 @@ WORKDIR /build
 COPY pyproject.toml README.md ./
 COPY src/ src/
 
-RUN pip install --no-cache-dir --prefix=/install .
+RUN pip install --no-cache-dir --prefix=/install ".[persistence]"
 ```
 
 ### Runtime stage
@@ -47,25 +48,39 @@ COPY config/broker.example.yaml /etc/bastion/broker.yaml
 USER bastion
 WORKDIR /home/bastion
 
-# Default ports
+# Default ports: 11434 (proxy), 9999 (admin two-port mode)
 EXPOSE 11434 9999
 
 # Health check: livez always works if process is up
-# readyz gates on Ollama connectivity + scheduler running
 HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:11434/broker/livez')" || exit 1
 
 ENTRYPOINT ["python", "-m", "bastion"]
+CMD ["--config", "/etc/bastion/broker.yaml"]
 ```
 
 ### Design choices
 
 - **Non-root**: Runs as `bastion` user (UID auto-assigned by useradd -r).
   Data dir `/home/bastion/.local/share/bastion/` follows XDG conventions.
+- **Persistence built-in**: The build stage installs `.[persistence]` so
+  aiosqlite is available. Persistence is enabled via env var in compose
+  (not in the default config file).
 - **No curl**: Health check uses Python's urllib to avoid installing curl in
   the slim image.
 - **Default config**: Copies `broker.example.yaml` to `/etc/bastion/broker.yaml`
-  (in the config search path). Users override via env vars or volume mount.
+  (in the config search path). Has `models: {}` and `total_vram_gb: 0`
+  (auto-detect) — works out of the box. Users override via env vars, volume
+  mount, or `docker exec bastion --detect-models`.
+- **CMD vs ENTRYPOINT**: ENTRYPOINT is `python -m bastion`; CMD provides
+  default args (`--config /etc/bastion/broker.yaml`). Users can override CMD
+  to pass different flags: `docker run bastion --port 8080`.
+- **nvidia-smi availability**: The image does NOT bundle nvidia-smi or CUDA.
+  The NVIDIA Container Toolkit injects `/usr/bin/nvidia-smi` and the NVIDIA
+  driver libraries into the container at runtime when `--gpus all` (or the
+  compose `deploy.resources.reservations.devices` stanza) is used. BASTION's
+  `health.py` already handles the `FileNotFoundError` gracefully when
+  nvidia-smi is absent.
 - **Start period**: 15s gives BASTION time to connect to Ollama and run
   migrations if persistence is enabled.
 
@@ -79,6 +94,7 @@ ENTRYPOINT ["python", "-m", "bastion"]
 services:
   ollama:
     image: ollama/ollama
+    restart: unless-stopped
     ports:
       - "11435:11434"
     volumes:
@@ -91,7 +107,7 @@ services:
               count: all
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
       interval: 10s
       timeout: 5s
       start_period: 30s
@@ -99,6 +115,7 @@ services:
 
   bastion:
     build: .
+    restart: unless-stopped
     ports:
       - "11434:11434"
     environment:
@@ -127,17 +144,23 @@ volumes:
 
 - **Ollama on host 11435**: Maps Ollama's internal 11434 to host 11435, so
   BASTION owns the standard 11434 port on the host — transparent to clients.
-- **BASTION connects to `ollama:11434`**: Uses Docker network hostname, not
-  the host port mapping.
+- **BASTION connects to `ollama:11434`**: Uses Docker network DNS hostname,
+  not the host port mapping. The env vars override the config file's
+  `127.0.0.1:11435` default — this is critical since localhost in a container
+  is the container itself, not the host.
 - **`depends_on: condition: service_healthy`**: BASTION waits for Ollama's
   health check before starting. BASTION itself starts gracefully even if
   Ollama isn't ready (existing resilience), but this avoids noisy warnings.
 - **Both containers get GPU**: BASTION needs nvidia-smi for GPU monitoring;
-  Ollama needs GPU for inference.
+  Ollama needs GPU for inference. The NVIDIA Container Toolkit handles device
+  sharing between containers.
 - **Persistence enabled by default**: In Docker, state loss on restart is
   the common case — persistence makes it durable via the `bastion_data` volume.
+  The `[persistence]` extra is already installed in the image.
 - **Volume mounts**: `ollama_data` persists models; `bastion_data` persists
   audit logs, SQLite DB, VRAM journal.
+- **Ollama healthcheck uses CMD-SHELL**: The `ollama/ollama` image includes
+  curl. Using `CMD-SHELL` with `|| exit 1` for proper exit code handling.
 
 ## 3. .dockerignore
 
@@ -161,13 +184,17 @@ build/
 .mypy_cache
 .pytest_cache
 to_del_*
+CLAUDE.md
+CLAUDE.local.md
+ARCHIVE/
+.claude/
 ```
 
 Keeps the build context small and fast. Tests and docs not needed in the image.
 
 ## 4. Configuration in Docker
 
-All configuration via environment variables (already supported):
+All configuration via environment variables (already supported in `config.py`):
 
 | Env Var | Purpose | Default in compose |
 |---------|---------|-------------------|

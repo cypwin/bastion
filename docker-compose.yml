@@ -19,6 +19,7 @@
 services:
   ollama:
     image: ollama/ollama
+    restart: unless-stopped
     ports:
       - "11435:11434"
     volumes:
@@ -39,6 +40,7 @@ services:
 
   bastion:
     build: .
+    restart: unless-stopped
     ports:
       - "11434:11434"
     environment:
