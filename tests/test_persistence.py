@@ -33,3 +33,63 @@ class TestPersistenceConfig:
 
         result = database_path()
         assert result == tmp_path / "bastion.db"
+
+
+class TestDatabaseManager:
+    @pytest.mark.asyncio
+    async def test_open_creates_schema(self):
+        from bastion.persistence import DatabaseManager
+
+        mgr = DatabaseManager(":memory:")
+        await mgr.open()
+        try:
+            async with mgr._conn.execute(
+                "SELECT version FROM schema_version ORDER BY version"
+            ) as cursor:
+                rows = await cursor.fetchall()
+            assert len(rows) == 1
+            assert rows[0][0] == 1
+
+            async with mgr._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            ) as cursor:
+                tables = [row[0] async for row in cursor]
+            assert "audit_events" in tables
+            assert "task_state" in tables
+            assert "queue_entries" in tables
+        finally:
+            await mgr.close()
+
+    @pytest.mark.asyncio
+    async def test_wal_mode_enabled(self):
+        from bastion.persistence import DatabaseManager
+
+        mgr = DatabaseManager(":memory:")
+        await mgr.open()
+        try:
+            async with mgr._conn.execute("PRAGMA journal_mode") as cursor:
+                row = await cursor.fetchone()
+            assert row is not None
+        finally:
+            await mgr.close()
+
+    @pytest.mark.asyncio
+    async def test_migrations_idempotent(self):
+        from bastion.persistence import DatabaseManager
+
+        mgr = DatabaseManager(":memory:")
+        await mgr.open()
+        await mgr._run_migrations()
+        async with mgr._conn.execute(
+            "SELECT COUNT(*) FROM schema_version"
+        ) as cursor:
+            count = (await cursor.fetchone())[0]
+        assert count == 1
+        await mgr.close()
+
+    @pytest.mark.asyncio
+    async def test_close_is_safe_when_not_opened(self):
+        from bastion.persistence import DatabaseManager
+
+        mgr = DatabaseManager(":memory:")
+        await mgr.close()  # Should not raise
