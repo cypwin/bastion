@@ -411,6 +411,39 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     )
     logger.info("Audit logging initialized: %s (tier=%d)", _resolved_audit, config.audit.tier)
 
+    # --- Optional SQLite persistence (Phase 3.2) ---
+    _db_manager = None
+    if config.persistence.enabled:
+        try:
+            from bastion.persistence import (
+                DatabaseManager,
+                PersistentAuditLog,
+                PersistentQueue,
+                PersistentTaskStore,
+            )
+        except ImportError:
+            logger.error(
+                "Persistence requires aiosqlite. "
+                "Install with: pip install bastion[persistence]"
+            )
+            raise SystemExit(1)
+
+        # Resolve database path
+        if config.persistence.database_path:
+            db_path = config.persistence.database_path
+        else:
+            from bastion.paths import database_path as _default_db_path
+            db_path = str(_default_db_path())
+
+        try:
+            _db_manager = DatabaseManager(db_path)
+            await _db_manager.open()
+            logger.info("Persistence database opened: %s", db_path)
+        except Exception as e:
+            logger.error("SQLite open failed: %s — falling back to in-memory", e)
+            _db_manager = None
+            config.persistence.enabled = False
+
     # Pre-flight: check Ollama connectivity (non-blocking, warn-only)
     try:
         async with httpx.AsyncClient(timeout=5.0) as preflight:
@@ -450,6 +483,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     _vram_manager = VRAMManager(_vram_tracker, total_vram_bytes, safety_margin_pct=10.0)
 
     _queue = AffinityQueue(config.scheduler)
+
+    # Wrap audit logger with persistence if enabled
+    if _db_manager and config.persistence.enabled and config.persistence.persist_audit:
+        if audit._audit_logger is not None:
+            audit._audit_logger = PersistentAuditLog(audit._audit_logger, _db_manager)
+            logger.info("Audit persistence enabled (dual-write JSONL+SQLite)")
+
+    # Wrap queue with persistence if enabled
+    if _db_manager and config.persistence.enabled and config.persistence.persist_queue:
+        _queue = PersistentQueue(_queue, _db_manager)
+        recovered, discarded = await _queue.hydrate(config.persistence.queue_recovery_ttl)
+        logger.info("Queue persistence enabled: recovered=%d, discarded=%d", recovered, discarded)
+
     _proxy = OllamaProxy(
         config,
         enqueue_fn=_enqueue_request,
@@ -546,6 +592,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     # Shutdown
     notify_stopping()
     logger.info("BASTION shutting down...")
+    if _db_manager:
+        await _db_manager.close()
+        logger.info("Persistence database closed")
     if _sweep_task:
         _sweep_task.cancel()
         _sweep_task = None
