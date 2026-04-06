@@ -1,0 +1,63 @@
+# BASTION + Ollama — one-command full-stack deployment
+#
+# Usage:
+#   docker compose up              # Start both services
+#   docker compose up -d           # Detached mode
+#   docker compose down            # Stop and remove containers
+#   docker compose down -v         # Also remove volumes (data loss!)
+#
+# Prerequisites:
+#   - Docker with Compose v2
+#   - NVIDIA Container Toolkit (for GPU access)
+#     Install: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+#
+# Custom config:
+#   Mount your broker.yaml to override the default:
+#     volumes:
+#       - ./my-broker.yaml:/etc/bastion/broker.yaml:ro
+
+services:
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11435:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+
+  bastion:
+    build: .
+    ports:
+      - "11434:11434"
+    environment:
+      BASTION_OLLAMA_HOST: ollama
+      BASTION_OLLAMA_PORT: "11434"
+      BASTION_PERSISTENCE_ENABLED: "true"
+    volumes:
+      - bastion_data:/home/bastion/.local/share/bastion
+    depends_on:
+      ollama:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  ollama_data:
+  bastion_data:
