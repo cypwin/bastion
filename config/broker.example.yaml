@@ -72,6 +72,20 @@ models: {}
 request_overrides:
   use_mmap: false          # Prevents GPU crashes from mmap on some hardware
 
+# ── Persistence (optional SQLite storage) ──────────────────────────
+# Requires: pip install bastion[persistence]
+# Stores audit events, task state, and optionally queue entries in SQLite
+# for recovery after restart. In-memory stores remain primary — SQLite
+# is a durable archive and recovery source.
+#
+# persistence:
+#   enabled: true
+#   # database_path: ""          # Empty = auto (~/.local/share/bastion/bastion.db)
+#   persist_audit: true          # Dual-write audit events to SQLite
+#   persist_tasks: true          # Persist A2A task state for recovery
+#   persist_queue: false         # Opt-in: persist queue entries for recovery
+#   queue_recovery_ttl: 300      # Seconds — entries older than this discarded on startup
+
 # ── Optional features (disabled by default) ─────────────────────────
 # Uncomment to enable:
 
