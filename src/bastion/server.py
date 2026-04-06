@@ -592,9 +592,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     # Shutdown
     notify_stopping()
     logger.info("BASTION shutting down...")
-    if _db_manager:
-        await _db_manager.close()
-        logger.info("Persistence database closed")
     if _sweep_task:
         _sweep_task.cancel()
         _sweep_task = None
@@ -612,6 +609,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     _inflight_models.clear()
     if _a2a_http_client:
         await _a2a_http_client.aclose()
+    if _db_manager:
+        await _db_manager.close()
+        logger.info("Persistence database closed")
     if _proxy:
         await _proxy.close()
     if _vram_tracker:

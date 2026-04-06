@@ -277,7 +277,8 @@ class TestPersistentQueue:
             inner = self._make_queue()
             pq = PersistentQueue(inner, mgr)
             req = self._make_request(req_id="r-001")
-            result = await pq.enqueue(req)
+            result = pq.enqueue(req)
+            await asyncio.sleep(0.1)
             assert result is True
             async with mgr.conn.execute("SELECT entry_id, model, completed FROM queue_entries") as cursor:
                 rows = await cursor.fetchall()
@@ -297,8 +298,10 @@ class TestPersistentQueue:
             inner = self._make_queue()
             pq = PersistentQueue(inner, mgr)
             req = self._make_request(req_id="r-002")
-            await pq.enqueue(req)
-            dequeued = await pq.dequeue_for_model("qwen3:14b")
+            pq.enqueue(req)
+            await asyncio.sleep(0.1)
+            dequeued = pq.dequeue_for_model("qwen3:14b")
+            await asyncio.sleep(0.1)
             assert dequeued is not None
             assert dequeued.id == "r-002"
             async with mgr.conn.execute(
@@ -318,8 +321,10 @@ class TestPersistentQueue:
             inner = self._make_queue()
             pq = PersistentQueue(inner, mgr)
             req = self._make_request(req_id="r-003")
-            await pq.enqueue(req)
-            result = await pq.cancel("r-003")
+            pq.enqueue(req)
+            await asyncio.sleep(0.1)
+            result = pq.cancel("r-003")
+            await asyncio.sleep(0.1)
             assert result is True
             async with mgr.conn.execute(
                 "SELECT completed FROM queue_entries WHERE entry_id = ?", ("r-003",)
