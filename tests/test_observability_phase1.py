@@ -508,14 +508,14 @@ class TestSafetyLimitsBarBudget:
 
     def test_default_budget(self) -> None:
         """Default budget is the fallback value (26.0 GB)."""
-        from bastion.dashboard import SafetyLimitsBar
+        from bastion.dashboard.statusbar import SafetyLimitsBar
 
         bar = SafetyLimitsBar()
         assert bar.vram_budget_gb == 26.0
 
     def test_update_budget_from_api(self) -> None:
         """update_budget sets the budget from the API value."""
-        from bastion.dashboard import SafetyLimitsBar
+        from bastion.dashboard.statusbar import SafetyLimitsBar
 
         bar = SafetyLimitsBar()
         bar.update_budget(24.0)
@@ -523,7 +523,7 @@ class TestSafetyLimitsBarBudget:
 
     def test_update_budget_none_keeps_default(self) -> None:
         """update_budget(None) does not change the budget (backward compat)."""
-        from bastion.dashboard import SafetyLimitsBar
+        from bastion.dashboard.statusbar import SafetyLimitsBar
 
         bar = SafetyLimitsBar()
         bar.update_budget(None)
@@ -531,7 +531,7 @@ class TestSafetyLimitsBarBudget:
 
     def test_update_budget_zero_keeps_default(self) -> None:
         """update_budget(0) does not change the budget (zero guard)."""
-        from bastion.dashboard import SafetyLimitsBar
+        from bastion.dashboard.statusbar import SafetyLimitsBar
 
         bar = SafetyLimitsBar()
         bar.update_budget(0.0)
@@ -539,7 +539,7 @@ class TestSafetyLimitsBarBudget:
 
     def test_update_budget_updates_render(self) -> None:
         """Rendered bar reflects the updated budget value."""
-        from bastion.dashboard import SafetyLimitsBar
+        from bastion.dashboard.statusbar import SafetyLimitsBar
 
         bar = SafetyLimitsBar()
         bar.update_budget(20.0)
@@ -550,7 +550,7 @@ class TestSafetyLimitsBarBudget:
 
     def test_render_with_default_budget(self) -> None:
         """Rendered bar uses default budget when no update is called."""
-        from bastion.dashboard import SafetyLimitsBar
+        from bastion.dashboard.statusbar import SafetyLimitsBar
 
         bar = SafetyLimitsBar()
         text = bar.render_data(13.0)
@@ -560,7 +560,7 @@ class TestSafetyLimitsBarBudget:
 
     def test_render_percentage_calculation(self) -> None:
         """Percentage uses the dynamic budget, not hardcoded value."""
-        from bastion.dashboard import SafetyLimitsBar
+        from bastion.dashboard.statusbar import SafetyLimitsBar
 
         bar = SafetyLimitsBar()
         bar.update_budget(10.0)
@@ -570,7 +570,7 @@ class TestSafetyLimitsBarBudget:
 
     def test_successive_budget_updates(self) -> None:
         """Multiple update_budget calls use the latest value."""
-        from bastion.dashboard import SafetyLimitsBar
+        from bastion.dashboard.statusbar import SafetyLimitsBar
 
         bar = SafetyLimitsBar()
         bar.update_budget(30.0)
@@ -584,7 +584,7 @@ class TestSafetyLimitsBarBudget:
 
     def test_negative_budget_keeps_previous(self) -> None:
         """Negative budget values are treated like zero/None."""
-        from bastion.dashboard import SafetyLimitsBar
+        from bastion.dashboard.statusbar import SafetyLimitsBar
 
         bar = SafetyLimitsBar()
         bar.update_budget(20.0)
