@@ -55,6 +55,11 @@ BASTION_PORT=11434
 STARTED_OLLAMA=""
 STARTED_BASTION=""
 
+# Helper: curl Ollama through bastion group (nftables blocks other GIDs on 11435)
+ollama_check() {
+    sg bastion -c "curl -sf http://127.0.0.1:${OLLAMA_PORT}/" >/dev/null 2>&1
+}
+
 # ---------------------------------------------------------------------------
 # 0. Ensure NVIDIA GPU device nodes exist (may be missing after reboot)
 # ---------------------------------------------------------------------------
@@ -72,7 +77,7 @@ fi
 # 1. Ensure Ollama is running on port 11435
 #    Prefer systemd-managed Ollama if available; fall back to nohup.
 # ---------------------------------------------------------------------------
-if curl -sf "http://127.0.0.1:${OLLAMA_PORT}/" >/dev/null 2>&1; then
+if ollama_check; then
     echo "[ok] Ollama already running on port ${OLLAMA_PORT}"
 elif systemctl is-active --quiet ollama 2>/dev/null; then
     # systemd service is running but not responding — might be on wrong port
@@ -80,7 +85,7 @@ elif systemctl is-active --quiet ollama 2>/dev/null; then
     echo "     Restarting with port override..."
     sudo systemctl restart ollama
     for i in $(seq 1 30); do
-        if curl -sf "http://127.0.0.1:${OLLAMA_PORT}/" >/dev/null 2>&1; then
+        if ollama_check; then
             echo "[ok] Ollama restarted via systemd on port ${OLLAMA_PORT}"
             break
         fi
@@ -91,13 +96,13 @@ elif systemctl is-enabled --quiet ollama 2>/dev/null; then
     echo "[..] Starting Ollama via systemd..."
     sudo systemctl start ollama
     for i in $(seq 1 30); do
-        if curl -sf "http://127.0.0.1:${OLLAMA_PORT}/" >/dev/null 2>&1; then
+        if ollama_check; then
             echo "[ok] Ollama started via systemd on port ${OLLAMA_PORT}"
             break
         fi
         sleep 0.5
     done
-    if ! curl -sf "http://127.0.0.1:${OLLAMA_PORT}/" >/dev/null 2>&1; then
+    if ! ollama_check; then
         echo "[!!] Ollama not responding after 15s — check: journalctl -u ollama"
     fi
 else
@@ -113,7 +118,7 @@ else
     STARTED_OLLAMA=$!
 
     for i in $(seq 1 30); do
-        if curl -sf "http://127.0.0.1:${OLLAMA_PORT}/" >/dev/null 2>&1; then
+        if ollama_check; then
             echo "[ok] Ollama started (PID ${STARTED_OLLAMA})"
             break
         fi
@@ -125,7 +130,7 @@ else
         sleep 0.5
     done
 
-    if [ -n "$STARTED_OLLAMA" ] && ! curl -sf "http://127.0.0.1:${OLLAMA_PORT}/" >/dev/null 2>&1; then
+    if [ -n "$STARTED_OLLAMA" ] && ! ollama_check; then
         echo "[!!] Ollama not responding after 15s — dashboard may show errors"
     fi
 fi
