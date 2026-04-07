@@ -3,14 +3,14 @@
 # Ensures GPU, Ollama, and BASTION are ready, then launches the TUI dashboard.
 # Cleanup: on exit, stops BASTION if we started it (Ollama keeps running).
 
-set -euo pipefail
+set -uo pipefail
 
 # Resolve project directory relative to this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Prevent duplicate launches via lock file
-LOCK_FILE="/tmp/bastion-dashboard.lock"
+LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/bastion-dashboard.lock"
 if [ -f "$LOCK_FILE" ] && kill -0 "$(cat "$LOCK_FILE" 2>/dev/null)" 2>/dev/null; then
     echo "[!!] Dashboard already running (PID $(cat "$LOCK_FILE")). Exiting."
     exit 1
