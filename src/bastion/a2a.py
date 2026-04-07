@@ -120,6 +120,7 @@ class A2AHandler:
         scheduler: Any,  # Avoid circular import
         circuit_breaker: CircuitBreaker | None = None,
         http_client: httpx.AsyncClient | None = None,
+        task_store: TaskStore | None = None,
     ) -> None:
         self._config = config
         self._enqueue_fn = enqueue_fn
@@ -128,8 +129,8 @@ class A2AHandler:
         self._circuit_breaker = circuit_breaker
         self._http_client = http_client
 
-        # Hardened in-memory task store (replaces plain dict)
-        self._store = TaskStore(
+        # Hardened task store — accepts pre-wrapped PersistentTaskStore
+        self._store = task_store or TaskStore(
             maxsize=10_000,
             task_ttl_seconds=config.a2a.task_ttl_seconds,
             completed_ttl_seconds=config.a2a.task_ttl_seconds,

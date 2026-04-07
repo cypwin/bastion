@@ -543,6 +543,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             )
             logger.info("A2A shared httpx client created (no circuit breaker)")
 
+        # Build task store, optionally wrapping with persistence
+        from bastion.taskstore import TaskStore as _TaskStore
+
+        _a2a_task_store = _TaskStore(
+            maxsize=10_000,
+            task_ttl_seconds=config.a2a.task_ttl_seconds,
+            completed_ttl_seconds=config.a2a.task_ttl_seconds,
+        )
+        if _db_manager and config.persistence.enabled and config.persistence.persist_tasks:
+            _a2a_task_store = PersistentTaskStore(_a2a_task_store, _db_manager)
+            recovered = await _a2a_task_store.hydrate()
+            logger.info("Task persistence enabled: recovered=%d active tasks", recovered)
+
         _a2a_handler = A2AHandler(
             config=config,
             enqueue_fn=_enqueue_request,
@@ -550,6 +563,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             scheduler=_scheduler,
             circuit_breaker=proxy_cb,
             http_client=_a2a_http_client,
+            task_store=_a2a_task_store,
         )
         # Wire up reservation check callback to scheduler
         _scheduler._reservation_check_fn = _a2a_handler.has_active_reservation
