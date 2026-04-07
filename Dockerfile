@@ -20,6 +20,10 @@ COPY --from=builder /install /usr/local
 # Copy default config (in config search path: /etc/bastion/broker.yaml)
 COPY config/broker.example.yaml /etc/bastion/broker.yaml
 
+# Create data directory with correct ownership (volume mount point)
+RUN mkdir -p /home/bastion/.local/share/bastion && \
+    chown -R bastion:bastion /home/bastion/.local
+
 # Switch to non-root user
 USER bastion
 WORKDIR /home/bastion
