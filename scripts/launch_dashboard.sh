@@ -38,6 +38,16 @@ LOG_DIR="${PROJECT_DIR}/logs"
 mkdir -p "$LOG_DIR"
 
 # ---------------------------------------------------------------------------
+# 0. Ensure NVIDIA GPU device nodes exist (may be missing after reboot)
+# ---------------------------------------------------------------------------
+if ! nvidia-smi >/dev/null 2>&1; then
+    echo "[..] GPU device nodes missing — running nvidia-modprobe..."
+    sudo nvidia-modprobe && sudo nvidia-modprobe -u 2>/dev/null && \
+        echo "[ok] GPU device nodes created" || \
+        echo "[!!] nvidia-modprobe failed — GPU features may not work"
+fi
+
+# ---------------------------------------------------------------------------
 # 1. Ensure Ollama is running (on port 11435 for BASTION proxy setup)
 # ---------------------------------------------------------------------------
 OLLAMA_PORT=11435
