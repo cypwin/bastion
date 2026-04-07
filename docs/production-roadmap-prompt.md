@@ -1,7 +1,7 @@
 # BASTION Production Roadmap — Master Prompt
 
 > Paste this into a new Claude Code session to continue the production roadmap.
-> Last updated: 2026-04-06 after completing Phase 1 + Phase 2.
+> Last updated: 2026-04-08 after completing Phase 1 + Phase 2 + Phase 3.1 + Phase 3.2.
 
 ---
 
@@ -43,10 +43,36 @@ BASTION (Batch Affinity Scheduler for Throttled Inference on Ollama Networks) is
 - Improved startup messages (Ollama not running, no models, nvidia-smi missing)
 - Example config ships with `models: {}` and guidance comments
 
-### Commit
+### Phase 3.1 — Docker Image ✅
+
+- `Dockerfile` — multi-stage build (python:3.12-slim), non-root `bastion` user, `.[persistence]` built-in
+- `docker-compose.yml` — BASTION + Ollama with GPU, health checks, restart policies, named volumes
+- `.dockerignore` — lean build context
+- Desktop launcher (`scripts/launch_dashboard.sh`) hardened:
+  - GPU device node creation (`nvidia-modprobe`)
+  - Systemd Ollama detection (prefers systemctl over nohup)
+  - nftables-aware health checks (`sg bastion` for port 11435 access)
+  - Lock file prevents duplicate launches
+  - Runs BASTION under `bastion` group
+- `docs/deployment.md` — comprehensive guide (desktop, systemd, Docker, troubleshooting)
+
+### Phase 3.2 — SQLite Persistence ✅
+
+- `src/bastion/persistence.py` — DatabaseManager, PersistentAuditLog, PersistentTaskStore, PersistentQueue
+- Schema migrations (versioned, WAL mode)
+- Dual-write: in-memory stays primary, SQLite is durable archive
+- PersistentTaskStore wired into A2A handler via `task_store` parameter
+- 20 passing tests (`tests/test_persistence.py`)
+- Config, env vars, paths, pyproject.toml extra all in place
+
+### Key commits (Phase 3)
 
 ```
-1c36a97 feat(v0.3.0): production readiness — Phase 1 & Phase 2
+23099bc feat(docker): add .dockerignore for lean build context
+7a6660d feat(docker): add multi-stage Dockerfile with persistence
+eaf5e4d feat(docker): add docker-compose for BASTION + Ollama stack
+c88bc55 feat(persistence): wire PersistentTaskStore into A2A handler
+3194121 docs: add comprehensive deployment guide
 ```
 
 ## Current project structure
@@ -135,25 +161,9 @@ Note: `test_dashboard.py` and `test_observability_phase1.py` have pre-existing i
 
 **Goal**: Docker-ready. Optional SQLite persistence for audit and task recovery.
 
-#### 3.1 Docker Image
-- `Dockerfile` based on `python:3.12-slim` with NVIDIA Container Toolkit support
-- `docker-compose.yml` — BASTION + Ollama side-by-side
-- `.github/workflows/docker.yml` — build and push to ghcr.io on release
-- Use `BASTION_*` env vars (already implemented) as primary config mechanism
+#### 3.1 Docker Image ✅ (completed 2026-04-07)
 
-#### 3.2 Optional SQLite Persistence
-- New `src/bastion/persistence.py` — SQLite-backed stores:
-  - `PersistentAuditLog` — writes audit events to SQLite (or dual JSONL+SQLite)
-  - `PersistentTaskStore` — persists A2A task state; recovers on restart
-  - Queue recovery: persist pending queue entries, replay on startup
-- `src/bastion/models.py` — add `PersistenceConfig`:
-  - `enabled: bool = False`
-  - `database_path: str` (default via `bastion.paths.data_dir() / "bastion.db"`)
-  - `persist_queue: bool = False`
-  - `persist_audit: bool = True`
-- `src/bastion/server.py` — wire up persistent stores in lifespan when enabled
-- `src/bastion/audit.py` — dual-write to JSONL + SQLite when persistence enabled
-- Keep in-memory as default — persistence is opt-in
+#### 3.2 Optional SQLite Persistence ✅ (completed 2026-04-07)
 
 #### 3.3 Examples Directory
 - `examples/basic-proxy/README.md` — minimal setup (5 lines to start)
@@ -168,8 +178,8 @@ Note: `test_dashboard.py` and `test_observability_phase1.py` have pre-existing i
 - Publish to PyPI as `bastion-client`
 
 #### Phase 3 Exit Criteria
-- [ ] `docker run` with `--gpus all` works
-- [ ] `persistence.enabled: true` → state survives restart
+- [x] `docker run` with `--gpus all` works
+- [x] `persistence.enabled: true` → state survives restart
 - [ ] Examples directory has 3+ working examples
 - [ ] Client library on PyPI
 
