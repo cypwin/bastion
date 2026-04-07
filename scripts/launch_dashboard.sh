@@ -137,7 +137,7 @@ if curl -sf "http://127.0.0.1:${BASTION_PORT}/broker/health" >/dev/null 2>&1; th
     echo "[ok] BASTION already running on port ${BASTION_PORT}"
 else
     echo "[..] Starting BASTION broker..."
-    PYTHONPATH=src python -m bastion --config config/broker.yaml >> "${LOG_DIR}/bastion-broker.log" 2>&1 &
+    sg bastion -c "PYTHONPATH=src python -m bastion --config config/broker.yaml >> '${LOG_DIR}/bastion-broker.log' 2>&1" &
     STARTED_BASTION=$!
 
     for i in $(seq 1 20); do
