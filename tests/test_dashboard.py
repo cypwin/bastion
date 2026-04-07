@@ -6,9 +6,7 @@ import time
 
 from rich.text import Text
 
-from bastion.dashboard import (
-    AlertPanel,
-    SafetyLimitsBar,
+from bastion.dashboard.helpers import (
     format_uptime,
     sparkline,
     state_color,
@@ -16,6 +14,8 @@ from bastion.dashboard import (
     usage_color,
     vram_bar,
 )
+from bastion.dashboard.panels_broker import AlertPanel
+from bastion.dashboard.statusbar import SafetyLimitsBar
 
 # ---------------------------------------------------------------------------
 # sparkline tests
