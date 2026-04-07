@@ -3,7 +3,8 @@
 # Ensures GPU, Ollama, and BASTION are ready, then launches the TUI dashboard.
 # Cleanup: on exit, stops BASTION if we started it (Ollama keeps running).
 
-set -uo pipefail
+# Note: no set -euo here — conda activate breaks with set -u,
+# and many commands (nvidia-smi, curl, systemctl) intentionally return non-zero.
 
 # Resolve project directory relative to this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
