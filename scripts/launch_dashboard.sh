@@ -12,12 +12,17 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Prevent duplicate launches via lock file
 LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/bastion-dashboard.lock"
-if [ -f "$LOCK_FILE" ] && kill -0 "$(cat "$LOCK_FILE" 2>/dev/null)" 2>/dev/null; then
-    echo "[!!] Dashboard already running (PID $(cat "$LOCK_FILE")). Exiting."
-    exit 1
+if [ -f "$LOCK_FILE" ]; then
+    OLD_PID="$(cat "$LOCK_FILE" 2>/dev/null)"
+    # Check if process is alive AND is actually a bastion dashboard
+    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null && \
+       grep -q "bastion" "/proc/$OLD_PID/cmdline" 2>/dev/null; then
+        echo "[!!] Dashboard already running (PID $OLD_PID). Exiting."
+        exit 1
+    fi
+    rm -f "$LOCK_FILE"
 fi
 echo $$ > "$LOCK_FILE"
-trap 'rm -f "$LOCK_FILE"' EXIT
 
 cd "$PROJECT_DIR" || exit 1
 
