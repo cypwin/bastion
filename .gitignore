@@ -22,6 +22,7 @@ pytest-of-*/
 # Claude Code / MCP
 .claude/
 .mcp.json
+.worktrees/
 
 # Project-specific ignores
 CLAUDE.md
