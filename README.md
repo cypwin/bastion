@@ -191,6 +191,9 @@ curl http://localhost:11434/broker/status
 ollama run llama3.1:8b "Hello, world!"
 ```
 
+For production deployment (systemd, Docker, desktop launcher), see the
+**[Deployment Guide](docs/deployment.md)**.
+
 ## Configuration
 
 Copy the example configuration and adjust for your hardware:
