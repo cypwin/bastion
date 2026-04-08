@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bastion-client"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python client library for BASTION GPU/LLM broker"
 readme = "README.md"
 license = "MIT"
