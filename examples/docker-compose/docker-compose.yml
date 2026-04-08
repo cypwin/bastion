@@ -1,0 +1,57 @@
+# BASTION + Ollama — minimal Docker Compose quickstart
+#
+# Usage:
+#   docker compose up -d        # Start both services
+#   docker compose logs -f      # Watch logs
+#   docker compose down         # Stop and remove containers
+#
+# Prerequisites:
+#   - Docker with Compose v2
+#   - NVIDIA Container Toolkit
+#     https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+
+services:
+  ollama:
+    image: ollama/ollama
+    restart: unless-stopped
+    # Ollama listens on its default port (11434) inside the container.
+    # BASTION connects to it via the Docker network — no host port needed.
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+
+  bastion:
+    image: ghcr.io/cyprian/bastion:latest
+    # Or build from source:
+    # build: ../../
+    restart: unless-stopped
+    ports:
+      - "11434:11434"        # Expose BASTION on the standard Ollama port
+    environment:
+      BASTION_OLLAMA_HOST: ollama
+      BASTION_OLLAMA_PORT: "11434"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  ollama_data:
