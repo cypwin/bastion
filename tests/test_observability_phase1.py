@@ -504,90 +504,85 @@ class TestBrokerStatusObservabilityFields:
 
 
 class TestSafetyLimitsBarBudget:
-    """Verify SafetyLimitsBar reads VRAM budget from API response."""
+    """Verify SafetyLimitsBar threshold management via update_limits()."""
 
     def test_default_budget(self) -> None:
-        """Default budget is the fallback value (26.0 GB)."""
+        """Default VRAM limit is the fallback value (26.0 GB)."""
         from bastion.dashboard.statusbar import SafetyLimitsBar
 
         bar = SafetyLimitsBar()
-        assert bar.vram_budget_gb == 26.0
+        assert bar._max_vram_gb == 26.0
 
-    def test_update_budget_from_api(self) -> None:
-        """update_budget sets the budget from the API value."""
+    def test_update_limits_from_api(self) -> None:
+        """update_limits sets the VRAM limit from the API value."""
         from bastion.dashboard.statusbar import SafetyLimitsBar
 
         bar = SafetyLimitsBar()
-        bar.update_budget(24.0)
-        assert bar.vram_budget_gb == 24.0
+        bar.update_limits(24.0, None)
+        assert bar._max_vram_gb == 24.0
 
-    def test_update_budget_none_keeps_default(self) -> None:
-        """update_budget(None) does not change the budget (backward compat)."""
+    def test_update_limits_none_keeps_default(self) -> None:
+        """update_limits(None, None) does not change limits."""
         from bastion.dashboard.statusbar import SafetyLimitsBar
 
         bar = SafetyLimitsBar()
-        bar.update_budget(None)
-        assert bar.vram_budget_gb == 26.0
+        bar.update_limits(None, None)
+        assert bar._max_vram_gb == 26.0
 
-    def test_update_budget_zero_keeps_default(self) -> None:
-        """update_budget(0) does not change the budget (zero guard)."""
+    def test_update_limits_zero_keeps_default(self) -> None:
+        """update_limits(0, 0) does not change limits (zero guard)."""
         from bastion.dashboard.statusbar import SafetyLimitsBar
 
         bar = SafetyLimitsBar()
-        bar.update_budget(0.0)
-        assert bar.vram_budget_gb == 26.0
+        bar.update_limits(0.0, 0)
+        assert bar._max_vram_gb == 26.0
 
-    def test_update_budget_updates_render(self) -> None:
-        """Rendered bar reflects the updated budget value."""
+    def test_update_limits_updates_render(self) -> None:
+        """Rendered bar reflects the updated VRAM limit value."""
         from bastion.dashboard.statusbar import SafetyLimitsBar
 
         bar = SafetyLimitsBar()
-        bar.update_budget(20.0)
-        text = bar.render_data(10.0)
-        # Bar should show "10.0/20.0 GB" (not "10.0/26.0 GB")
-        assert "20.0" in text.plain
-        assert "10.0" in text.plain
+        bar.update_limits(20.0, None)
+        text = bar.render()
+        assert "20.0GB" in text.plain
 
     def test_render_with_default_budget(self) -> None:
-        """Rendered bar uses default budget when no update is called."""
+        """Rendered bar uses default limit when no update is called."""
         from bastion.dashboard.statusbar import SafetyLimitsBar
 
         bar = SafetyLimitsBar()
-        text = bar.render_data(13.0)
-        # Should show "13.0/26.0 GB"
-        assert "26.0" in text.plain
-        assert "13.0" in text.plain
+        text = bar.render()
+        assert "26.0GB" in text.plain
 
-    def test_render_percentage_calculation(self) -> None:
-        """Percentage uses the dynamic budget, not hardcoded value."""
+    def test_render_shows_temp_threshold(self) -> None:
+        """Rendered bar includes temperature threshold."""
         from bastion.dashboard.statusbar import SafetyLimitsBar
 
         bar = SafetyLimitsBar()
-        bar.update_budget(10.0)
-        # 10/10 = 100%, should use "red bold" color
-        text = bar.render_data(10.0)
-        assert "10.0/10.0 GB" in text.plain
+        bar.update_limits(None, 80)
+        text = bar.render()
+        assert "80\u00b0C" in text.plain
 
-    def test_successive_budget_updates(self) -> None:
-        """Multiple update_budget calls use the latest value."""
+    def test_successive_limit_updates(self) -> None:
+        """Multiple update_limits calls use the latest value."""
         from bastion.dashboard.statusbar import SafetyLimitsBar
 
         bar = SafetyLimitsBar()
-        bar.update_budget(30.0)
-        assert bar.vram_budget_gb == 30.0
+        bar.update_limits(30.0, None)
+        assert bar._max_vram_gb == 30.0
 
-        bar.update_budget(16.0)
-        assert bar.vram_budget_gb == 16.0
+        bar.update_limits(16.0, None)
+        assert bar._max_vram_gb == 16.0
 
-        text = bar.render_data(8.0)
-        assert "16.0" in text.plain
+        text = bar.render()
+        assert "16.0GB" in text.plain
 
     def test_negative_budget_keeps_previous(self) -> None:
-        """Negative budget values are treated like zero/None."""
+        """Negative VRAM values are treated like zero/None."""
         from bastion.dashboard.statusbar import SafetyLimitsBar
 
         bar = SafetyLimitsBar()
-        bar.update_budget(20.0)
-        bar.update_budget(-5.0)
-        # Negative is <= 0, so budget should stay at 20.0
-        assert bar.vram_budget_gb == 20.0
+        bar.update_limits(20.0, None)
+        bar.update_limits(-5.0, None)
+        # Negative is <= 0, so limit should stay at 20.0
+        assert bar._max_vram_gb == 20.0
