@@ -149,6 +149,11 @@ class BastionClient:
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Submit an inference request with automatic priority injection."""
+        if stream:
+            raise ValueError(
+                "Streaming not supported by BastionClient. "
+                "Use stream=False or the raw httpx client."
+            )
         resolved_tier = self._resolve_tier(tier) if tier else self.default_tier
         headers = {"X-Broker-Priority": resolved_tier}
 
@@ -186,6 +191,11 @@ class BastionClient:
         Returns:
             Parsed JSON response from Ollama.
         """
+        if stream:
+            raise ValueError(
+                "Streaming not supported by BastionClient. "
+                "Use stream=False or the raw httpx client."
+            )
         resolved_tier = self._resolve_tier(tier) if tier else self.default_tier
         headers = {"X-Broker-Priority": resolved_tier}
 
@@ -292,6 +302,7 @@ class SyncBastionClient:
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
         self._thread.start()
+        self._closed = False
         self._async_client = BastionClient(
             base_url=base_url,
             default_tier=default_tier,
@@ -370,6 +381,9 @@ class SyncBastionClient:
 
     def close(self) -> None:
         """Close the underlying async client and shut down the event loop."""
+        if self._closed:
+            return
+        self._closed = True
         self._run(self._async_client.close())
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=5.0)
