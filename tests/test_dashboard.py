@@ -218,36 +218,38 @@ def test_alert_panel_render_alerts() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_safety_bar_low_usage() -> None:
-    """SafetyLimitsBar.render_data(5.0) is in the green zone (< 50%)."""
-    bar = SafetyLimitsBar.__new__(SafetyLimitsBar)
-    result = bar.render_data(5.0)
+def test_safety_bar_default_thresholds() -> None:
+    """SafetyLimitsBar defaults to 26.0 GB VRAM and 82°C temp."""
+    bar = SafetyLimitsBar()
+    assert bar._max_vram_gb == 26.0
+    assert bar._max_temp_c == 82
+
+
+def test_safety_bar_render_returns_text() -> None:
+    """SafetyLimitsBar.render() returns a Text object with threshold info."""
+    bar = SafetyLimitsBar()
+    result = bar.render()
     assert isinstance(result, Text)
-    # 5.0/26.0 = ~19.2%, should be green
-    assert "5.0/26.0 GB" in result.plain
+    assert "26.0GB" in result.plain
+    assert "82\u00b0C" in result.plain
 
 
-def test_safety_bar_medium_usage() -> None:
-    """SafetyLimitsBar.render_data(15.0) is in the yellow zone (50-74%)."""
-    bar = SafetyLimitsBar.__new__(SafetyLimitsBar)
-    result = bar.render_data(15.0)
-    assert isinstance(result, Text)
-    # 15.0/26.0 = ~57.7%, should be yellow
-    assert "15.0/26.0 GB" in result.plain
+def test_safety_bar_custom_thresholds() -> None:
+    """SafetyLimitsBar accepts custom VRAM and temp thresholds."""
+    bar = SafetyLimitsBar(max_vram_gb=20.0, max_temp_c=75)
+    result = bar.render()
+    assert "20.0GB" in result.plain
+    assert "75\u00b0C" in result.plain
 
 
-def test_safety_bar_high_usage() -> None:
-    """SafetyLimitsBar.render_data(24.0) is in the red zone (>= 90%)."""
-    bar = SafetyLimitsBar.__new__(SafetyLimitsBar)
-    result = bar.render_data(24.0)
-    assert isinstance(result, Text)
-    # 24.0/26.0 = ~92.3%, should be red bold
-    assert "24.0/26.0 GB" in result.plain
-
-
-def test_safety_bar_budget() -> None:
-    """SafetyLimitsBar.VRAM_BUDGET_GB is 26.0."""
-    assert SafetyLimitsBar.VRAM_BUDGET_GB == 26.0
+def test_safety_bar_update_limits() -> None:
+    """update_limits() changes the displayed thresholds."""
+    bar = SafetyLimitsBar()
+    bar.update_limits(max_vram_gb=24.0, max_temp_c=80)
+    assert bar._max_vram_gb == 24.0
+    assert bar._max_temp_c == 80
+    result = bar.render()
+    assert "24.0GB" in result.plain
 
 
 # ---------------------------------------------------------------------------
