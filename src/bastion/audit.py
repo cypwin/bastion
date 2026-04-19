@@ -25,6 +25,7 @@ EVENT_SWAP = "swap"
 EVENT_VRAM_ALERT = "vram_alert"
 EVENT_QUEUE_CHANGE = "queue_change"
 EVENT_REQUEST_COMPLETE = "request_complete"
+EVENT_THRASHING = "thrashing"
 
 
 # ---------------------------------------------------------------------------
