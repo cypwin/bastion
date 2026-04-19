@@ -49,6 +49,7 @@ from bastion.proxy import OllamaProxy
 from bastion.queue import AffinityQueue
 from bastion.ratelimit import RateLimitMiddleware
 from bastion.scheduler import Scheduler
+from bastion.thrashing import ThrashingDetector
 from bastion.vram import VRAMManager, VRAMTracker
 from bastion.watchdog import (
     ProcessMonitor,
@@ -72,6 +73,7 @@ _config: BrokerConfig | None = None
 _process_monitor: ProcessMonitor | None = None
 _sweep_task: asyncio.Task | None = None
 _start_time: float = 0.0
+_thrashing_detector: ThrashingDetector | None = None
 
 # Maps request ID -> asyncio.Event that the scheduler sets when the request
 # is granted (model loaded, ready to forward to Ollama).
@@ -496,11 +498,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         recovered, discarded = await _queue.hydrate(config.persistence.queue_recovery_ttl)
         logger.info("Queue persistence enabled: recovered=%d, discarded=%d", recovered, discarded)
 
+    # Initialize thrashing detector (M58)
+    global _thrashing_detector
+    _thrashing_detector = ThrashingDetector(config.thrashing_detection)
+
     _proxy = OllamaProxy(
         config,
         enqueue_fn=_enqueue_request,
         record_fn=record_recent_request,
         intent_lookup_fn=_lookup_intent,
+        thrashing_detector=_thrashing_detector,
     )
 
     # Create scheduler (reservation callback set later if A2A enabled)
@@ -725,6 +732,11 @@ def create_app(config: BrokerConfig) -> FastAPI:
 
         # T1-06: gpu_is_safe computed from GPUStatus.is_safe(config.gpu)
         result["gpu_is_safe"] = gpu.is_safe(config.gpu)
+
+        # M58: thrashing detection stats
+        if _thrashing_detector:
+            result["thrashing_warnings"] = _thrashing_detector.total_warnings
+            result["thrashing_halts"] = _thrashing_detector.total_halts
 
         return result
 
@@ -1396,6 +1408,11 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
 
         # T1-06: gpu_is_safe computed from GPUStatus.is_safe(config.gpu)
         result["gpu_is_safe"] = gpu.is_safe(config.gpu)
+
+        # M58: thrashing detection stats
+        if _thrashing_detector:
+            result["thrashing_warnings"] = _thrashing_detector.total_warnings
+            result["thrashing_halts"] = _thrashing_detector.total_halts
 
         return result
 
