@@ -592,5 +592,25 @@ class OllamaProxy:
             and k.lower() not in ("host", "content-length")
         }
 
+    @staticmethod
+    def _extract_streaming_tokens(chunk: bytes) -> dict[str, int] | None:
+        """Extract token counts from a streaming NDJSON final chunk.
+
+        Ollama includes prompt_eval_count and eval_count in the last chunk
+        where done=true. Returns None for non-final chunks.
+        """
+        try:
+            data = json.loads(chunk)
+            if data.get("done"):
+                result: dict[str, int] = {}
+                if "prompt_eval_count" in data:
+                    result["prompt_tokens"] = data["prompt_eval_count"]
+                if "eval_count" in data:
+                    result["completion_tokens"] = data["eval_count"]
+                return result if result else None
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+        return None
+
     async def close(self) -> None:
         await self._http.aclose()

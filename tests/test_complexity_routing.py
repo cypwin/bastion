@@ -232,3 +232,25 @@ class TestComplexityRouting:
         )
         await proxy._handle_scheduled(req, "/api/generate", await req.body())
         assert captured["model"] == "qwen3:14b"
+
+
+class TestStreamingTokenCapture:
+    @pytest.mark.asyncio
+    async def test_final_chunk_tokens_captured(self):
+        """The streaming generator should parse the final done=true chunk for token counts."""
+        config = BrokerConfig()
+        proxy = OllamaProxy(config)
+
+        # Verify the _extract_streaming_tokens helper works
+        final_chunk = b'{"model":"qwen3:14b","done":true,"prompt_eval_count":100,"eval_count":50}\n'
+        tokens = proxy._extract_streaming_tokens(final_chunk)
+        assert tokens == {"prompt_tokens": 100, "completion_tokens": 50}
+
+    @pytest.mark.asyncio
+    async def test_non_final_chunk_returns_none(self):
+        config = BrokerConfig()
+        proxy = OllamaProxy(config)
+
+        chunk = b'{"model":"qwen3:14b","done":false,"response":"hello"}\n'
+        tokens = proxy._extract_streaming_tokens(chunk)
+        assert tokens is None
