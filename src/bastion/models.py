@@ -169,6 +169,32 @@ class RequestOverrides(BaseModel):
     default_num_ctx: int | None = 4096  # Global fallback context window
 
 
+class ComplexityRoutingConfig(BaseModel):
+    """Complexity-based model routing configuration (M58).
+
+    When enabled, reads X-Task-Complexity header and overrides the
+    client-requested model with the configured route model.
+    """
+    enabled: bool = True
+    routes: dict[str, str] = Field(default_factory=dict)  # "simple" -> model name
+    complex_action: str = "reject"  # always "reject" -> HTTP 422
+
+
+class ThrashingDetectionConfig(BaseModel):
+    """Per-agent swap thrashing detection (M58).
+
+    Tracks swap patterns per agent and warns or halts when swap ratio
+    exceeds thresholds. Thresholds derived from RTX 5090 crash data.
+    """
+    enabled: bool = True
+    mode: str = "warn"  # "warn" or "strict"
+    window_size: int = 12
+    warn_swap_ratio: float = 0.5  # ~4 swaps/min equivalent
+    halt_swap_ratio: float = 0.75  # ~6 swaps/min (matches global critical)
+    cooloff_seconds: int = 30
+    min_requests_before_eval: int = 6
+
+
 # ---------------------------------------------------------------------------
 # S7: A2A models
 # ---------------------------------------------------------------------------
@@ -241,6 +267,8 @@ class BrokerConfig(BaseModel):
     models: dict[str, ModelInfo] = Field(default_factory=dict)
     session_profiles: dict[str, SessionProfile] = Field(default_factory=dict)
     request_overrides: RequestOverrides = Field(default_factory=RequestOverrides)
+    complexity_routing: ComplexityRoutingConfig = Field(default_factory=ComplexityRoutingConfig)
+    thrashing_detection: ThrashingDetectionConfig = Field(default_factory=ThrashingDetectionConfig)
 
 
 # ---------------------------------------------------------------------------
