@@ -254,3 +254,83 @@ class TestStreamingTokenCapture:
         chunk = b'{"model":"qwen3:14b","done":false,"response":"hello"}\n'
         tokens = proxy._extract_streaming_tokens(chunk)
         assert tokens is None
+
+
+class TestResponseHeaders:
+    @pytest.mark.asyncio
+    async def test_non_streaming_token_headers(self):
+        """Non-streaming responses should include X-Prompt-Tokens and X-Completion-Tokens."""
+        config = BrokerConfig(
+            complexity_routing=ComplexityRoutingConfig(
+                enabled=True,
+                routes={"simple": "qwen3.5:9b"},
+            ),
+            models={"qwen3.5:9b": ModelInfo(vram_gb=8.1)},
+        )
+        proxy = OllamaProxy(config)
+
+        # Mock the HTTP client response with token counts
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "model": "qwen3.5:9b",
+            "response": "classified",
+            "done": True,
+            "prompt_eval_count": 150,
+            "eval_count": 25,
+        }
+        mock_response.status_code = 200
+        proxy._http = MagicMock()
+        proxy._http.post = AsyncMock(return_value=mock_response)
+
+        req = _make_request(
+            body={"model": "qwen3:14b", "prompt": "classify", "stream": False},
+            headers={"user-agent": "test", "x-task-complexity": "simple"},
+        )
+        result = await proxy._forward_response(
+            req, "http://localhost:11435/api/generate",
+            json.dumps({"model": "qwen3.5:9b", "prompt": "classify"}).encode(),
+            model="qwen3.5:9b", path="/api/generate", tier=PriorityTier.AGENT,
+            routing_meta={
+                "requested": "qwen3:14b",
+                "routed": "qwen3.5:9b",
+                "reason": "complexity-simple",
+            },
+        )
+        assert result.headers.get("X-Model-Requested") == "qwen3:14b"
+        assert result.headers.get("X-Model-Routed") == "qwen3.5:9b"
+        assert result.headers.get("X-Routing-Reason") == "complexity-simple"
+        assert result.headers.get("X-Prompt-Tokens") == "150"
+        assert result.headers.get("X-Completion-Tokens") == "25"
+
+
+class TestThrashingIntegration:
+    @pytest.mark.asyncio
+    async def test_halt_returns_429(self):
+        """In strict mode, thrashing agent gets 429."""
+        from bastion.thrashing import ThrashingDetector
+
+        config = BrokerConfig(
+            thrashing_detection=ThrashingDetectionConfig(
+                enabled=True, mode="strict",
+                window_size=6, min_requests_before_eval=3,
+                warn_swap_ratio=0.3, halt_swap_ratio=0.5,
+            ),
+        )
+        detector = ThrashingDetector(config.thrashing_detection)
+        proxy = OllamaProxy(config, thrashing_detector=detector)
+
+        # Pre-fill detector with thrashing pattern
+        for i in range(6):
+            detector.record_request("thrash_agent", "modelA" if i % 2 == 0 else "modelB")
+
+        req = _make_request(
+            body={"model": "modelA", "prompt": "test"},
+            headers={
+                "user-agent": "test",
+                "x-agent-id": "thrash_agent",
+            },
+        )
+        result = await proxy._handle_scheduled(req, "/api/generate", await req.body())
+        assert result.status_code == 429
+        body = json.loads(result.body)
+        assert "thrashing" in body["error"].lower()
