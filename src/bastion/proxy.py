@@ -24,6 +24,7 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 import httpx
 from fastapi import Request
@@ -70,12 +71,14 @@ class OllamaProxy:
         ) = None,
         record_fn: Callable[..., None] | None = None,
         intent_lookup_fn: Callable[[str], tuple[PriorityTier, list] | None] | None = None,
+        thrashing_detector: Any | None = None,
     ) -> None:
         self.config = config
         self._backend_url = config.ollama.base_url
         self._enqueue_fn = enqueue_fn
         self._record_fn = record_fn
         self._intent_lookup_fn = intent_lookup_fn
+        self._thrashing_detector = thrashing_detector
         # Use configured timeouts
         proxy_cfg = config.proxy
         self._http = httpx.AsyncClient(
@@ -145,6 +148,68 @@ class OllamaProxy:
 
         model = payload.get("model", "")
         is_streaming = payload.get("stream", True)  # Ollama defaults to stream=true
+
+        # --- M58: Complexity-based model routing ---
+        routing_meta: dict[str, str] | None = None
+        task_complexity = request.headers.get("x-task-complexity", "").lower().strip()
+
+        if task_complexity and self.config.complexity_routing.enabled:
+            if task_complexity == "complex":
+                return JSONResponse(
+                    {
+                        "error": "Task complexity 'complex' requires Claude, not local model. Route to API.",
+                        "complexity": "complex",
+                    },
+                    status_code=422,
+                )
+
+            route_model = self.config.complexity_routing.routes.get(task_complexity)
+            if route_model:
+                original_model = model
+                model = route_model
+                payload["model"] = model
+                routing_meta = {
+                    "requested": original_model,
+                    "routed": model,
+                    "reason": f"complexity-{task_complexity}",
+                }
+                logger.info(
+                    "M58 routing: %s -> %s (complexity=%s, agent=%s)",
+                    original_model, model, task_complexity,
+                    request.headers.get("x-agent-id", "unknown"),
+                )
+
+        # M58: record request for per-agent thrashing detection
+        agent_id = request.headers.get("x-agent-id", "")
+        if self._thrashing_detector and agent_id:
+            self._thrashing_detector.record_request(agent_id, model)
+            verdict = self._thrashing_detector.check(agent_id)
+            if verdict.level == "halt":
+                return JSONResponse(
+                    {
+                        "error": "Pipeline suspended — swap thrashing detected",
+                        "swap_ratio": round(verdict.swap_ratio, 2),
+                        "window_size": verdict.window_size,
+                        "estimated_overhead_seconds": round(verdict.estimated_penalty_seconds, 1),
+                        "cooloff_seconds": self.config.thrashing_detection.cooloff_seconds,
+                        "suggestion": "Reorganize calls to batch by model. Current pattern causes ~14s GPU penalty per swap.",
+                    },
+                    status_code=429,
+                )
+            if verdict.level == "warn":
+                routing_meta = routing_meta or {}
+                routing_meta["_thrashing_warn"] = (
+                    f"swap_ratio={verdict.swap_ratio:.2f}; "
+                    f"estimated_overhead_seconds={verdict.estimated_penalty_seconds:.0f}; "
+                    'suggestion="batch requests by model to reduce swap penalties"'
+                )
+                audit.emit(audit.EVENT_THRASHING, {
+                    "agent_id": agent_id,
+                    "verdict": "warn",
+                    "swap_ratio": round(verdict.swap_ratio, 2),
+                    "window_size": verdict.window_size,
+                    "estimated_penalty_seconds": round(verdict.estimated_penalty_seconds, 1),
+                })
 
         # Inject safety overrides
         options = payload.get("options", {})
@@ -245,12 +310,14 @@ class OllamaProxy:
             if is_streaming:
                 # Pass done_fn into generator so it signals completion after last byte
                 result = await self._stream_response(
-                    request, target_url, modified_body, model, path, tier, done_fn=done_fn
+                    request, target_url, modified_body, model, path, tier,
+                    done_fn=done_fn, routing_meta=routing_meta,
                 )
                 done_fn = None  # Generator owns done_fn now; prevent double-call in finally
             else:
                 result = await self._forward_response(
                     request, target_url, modified_body, model, path, tier,
+                    routing_meta=routing_meta,
                 )
         finally:
             # Non-streaming: call done_fn here (after _forward_response returns).
@@ -261,14 +328,25 @@ class OllamaProxy:
 
         # Audit: request complete event (for scheduled endpoints)
         dispatch_duration = time.time() - dispatch_start
-        audit.emit(audit.EVENT_REQUEST_COMPLETE, {
+        audit_details: dict[str, Any] = {
             "model": model,
             "endpoint": path,
             "tier": tier.value,
             "queue_wait_seconds": round(queue_wait_seconds, 3),
             "dispatch_duration_seconds": round(dispatch_duration, 3),
             "streaming": is_streaming,
-        })
+        }
+        if agent_id:
+            audit_details["agent_id"] = agent_id
+        if task_complexity:
+            audit_details["task_complexity"] = task_complexity
+        if routing_meta:
+            audit_details["model_requested"] = routing_meta["requested"]
+            audit_details["model_routed"] = routing_meta["routed"]
+            audit_details["routing_applied"] = True
+        else:
+            audit_details["routing_applied"] = False
+        audit.emit(audit.EVENT_REQUEST_COMPLETE, audit_details)
 
         # Record for /broker/recent (S5: Dashboard Evolution)
         if self._record_fn is not None:
@@ -376,6 +454,7 @@ class OllamaProxy:
         self, request: Request, url: str, body: bytes,
         model: str = "", path: str = "", tier: PriorityTier = PriorityTier.AGENT,
         done_fn: Callable[[], None] | None = None,
+        routing_meta: dict[str, str] | None = None,
     ) -> StreamingResponse:
         """Stream Ollama's NDJSON response back to the client.
 
@@ -410,14 +489,24 @@ class OllamaProxy:
                 if done_fn:
                     done_fn()  # Unblock scheduler — this request is done
 
+        response_headers: dict[str, str] = {}
+        if routing_meta:
+            response_headers["X-Model-Requested"] = routing_meta["requested"]
+            response_headers["X-Model-Routed"] = routing_meta["routed"]
+            response_headers["X-Routing-Reason"] = routing_meta["reason"]
+            if "_thrashing_warn" in routing_meta:
+                response_headers["X-Swap-Penalty-Warning"] = routing_meta["_thrashing_warn"]
+
         return StreamingResponse(
             generate(),
             media_type="application/x-ndjson",
+            headers=response_headers,
         )
 
     async def _forward_response(
         self, request: Request, url: str, body: bytes,
         model: str = "", path: str = "", tier: PriorityTier = PriorityTier.AGENT,
+        routing_meta: dict[str, str] | None = None,
     ) -> JSONResponse:
         """Forward a non-streaming request and return the full response."""
         headers = self._forward_headers(request)
@@ -427,7 +516,30 @@ class OllamaProxy:
             self._requests_served += 1
             if self.circuit_breaker:
                 await self.circuit_breaker.record_success()
-            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+
+            resp_json = resp.json()
+            response_headers: dict[str, str] = {}
+
+            if routing_meta:
+                response_headers["X-Model-Requested"] = routing_meta["requested"]
+                response_headers["X-Model-Routed"] = routing_meta["routed"]
+                response_headers["X-Routing-Reason"] = routing_meta["reason"]
+                if "_thrashing_warn" in routing_meta:
+                    response_headers["X-Swap-Penalty-Warning"] = routing_meta["_thrashing_warn"]
+
+            # Token count headers from Ollama response
+            prompt_tokens = resp_json.get("prompt_eval_count")
+            completion_tokens = resp_json.get("eval_count")
+            if prompt_tokens is not None:
+                response_headers["X-Prompt-Tokens"] = str(prompt_tokens)
+            if completion_tokens is not None:
+                response_headers["X-Completion-Tokens"] = str(completion_tokens)
+
+            return JSONResponse(
+                content=resp_json,
+                status_code=resp.status_code,
+                headers=response_headers,
+            )
         except Exception as e:
             logger.error("Forward proxy error to %s: %s", url, e)
             if self.circuit_breaker:
