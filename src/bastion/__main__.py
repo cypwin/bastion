@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import logging
 import signal
+import sys
 from pathlib import Path
 
 import uvicorn
@@ -122,6 +123,19 @@ def main() -> None:
         help="Discover installed Ollama models and print a YAML models "
              "section to paste into broker.yaml, then exit.",
     )
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Run pre-flight checks to verify your system is ready for BASTION, "
+             "then exit.",
+    )
+    parser.add_argument(
+        "--stress-test",
+        action="store_true",
+        help="Run GPU stress calibrator to discover safe operating limits. "
+             "Requires BASTION to be running. Writes results to "
+             "~/.config/bastion/gpu-profile.yaml.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -140,6 +154,58 @@ def main() -> None:
         ollama_port = args.ollama_port or 11435
         detect_models(ollama_port=ollama_port)
         return
+
+    if args.validate:
+        from bastion.validate import (
+            compute_exit_code,
+            format_results,
+            run_all_checks,
+        )
+
+        ollama_port = args.ollama_port or 11435
+        bastion_port = args.port or 11434
+        results = asyncio.run(run_all_checks(
+            ollama_port=ollama_port,
+            bastion_port=bastion_port,
+        ))
+        print(format_results(results))
+        sys.exit(compute_exit_code(results))
+
+    if args.stress_test:
+        from bastion.stress import (
+            SAFETY_BANNER,
+            StressConfig,
+            recovery_phase,
+        )
+
+        stress_config = StressConfig(
+            bastion_url=f"http://127.0.0.1:{args.port or 11434}",
+        )
+
+        # Safety ceremony
+        print(SAFETY_BANNER)
+        try:
+            response = input().strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nAborted.")
+            sys.exit(0)
+
+        if response.lower() != "i understand":
+            print("Aborted -- you must type 'I understand' to continue.")
+            sys.exit(0)
+
+        try:
+            asyncio.run(_run_stress_test(stress_config))
+        except KeyboardInterrupt:
+            print("\n\nCtrl+C -- running recovery phase...")
+            asyncio.run(
+                recovery_phase(
+                    stress_config.bastion_url,
+                    baseline_temp=40,  # conservative fallback
+                )
+            )
+            print("Recovery complete. Exiting.")
+        sys.exit(0)
 
     # Lazy import to allow config override before app creation
     from bastion.config import load_config
@@ -241,6 +307,144 @@ async def _run_two_port(
         proxy_server.serve(),
         admin_server.serve(),
     )
+
+
+async def _run_stress_test(config: StressConfig) -> None:  # noqa: F821
+    """Run the full stress test sequence with phase-by-phase confirmation."""
+    from bastion.stress import (
+        CalibrationResult,
+        baseline_phase,
+        check_prerequisites,
+        concurrent_load_phase,
+        recovery_phase,
+        single_load_phase,
+        swap_ramp_phase,
+        write_profile,
+    )
+    from bastion.gpu_profiles import lookup_profile
+    from bastion.validate import _query_driver_version, _query_gpu_name
+
+    # Prerequisites
+    print("\nChecking prerequisites...")
+    ok, msg = await check_prerequisites(config)
+    if not ok:
+        print(f"\n  FAILED: {msg}")
+        return
+    print(f"  {msg}")
+
+    # Get GPU info
+    gpu_name = _query_gpu_name() or "Unknown GPU"
+    driver = _query_driver_version() or "unknown"
+    profile = lookup_profile(gpu_name)
+
+    from bastion.health import query_gpu_status
+    status = await query_gpu_status()
+    vram_total = status.vram_total_mb or profile.vram_total_mb
+
+    result = CalibrationResult(
+        gpu_name=gpu_name,
+        vram_total_mb=vram_total,
+        driver=driver,
+    )
+
+    # Get small models for testing
+    import httpx
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(f"{config.bastion_url}/api/tags", timeout=5.0)
+    models_data = resp.json().get("models", [])
+    small_models = sorted(
+        [m["name"] for m in models_data if m.get("size", 0) < 5 * 1024**3],
+        key=lambda n: next((m["size"] for m in models_data if m["name"] == n), 0),
+    )[:2]
+
+    # Phase 1: Baseline
+    print(f"\n--- Phase 1: Baseline ({config.baseline_duration_s:.0f}s) ---")
+    phase1 = await baseline_phase(config.baseline_duration_s, config.sample_interval_s)
+    result.phases.append(phase1)
+
+    if not phase1.success:
+        print(f"  FAILED: {phase1.error}")
+        await recovery_phase(config.bastion_url, 40)
+        return
+
+    print(f"  Idle temp: {phase1.data['idle_temp_c']}C")
+    print(f"  Idle power: {phase1.data['idle_power_w']}W")
+    print(f"  VRAM in use: {phase1.data['vram_in_use_mb']} MB")
+    if not _confirm_continue():
+        await recovery_phase(config.bastion_url, phase1.data["idle_temp_c"])
+        return
+
+    baseline_temp = phase1.data["idle_temp_c"]
+
+    # Phase 2: Single load
+    print(f"\n--- Phase 2: Single Load ({small_models[0]}) ---")
+    phase2 = await single_load_phase(config.bastion_url, small_models[0], baseline_temp)
+    result.phases.append(phase2)
+
+    if not phase2.success:
+        print(f"  FAILED: {phase2.error}")
+        await recovery_phase(config.bastion_url, baseline_temp)
+        return
+
+    print(f"  Inference latency: {phase2.data['inference_latency_s']}s")
+    print(f"  Thermal delta: +{phase2.data['thermal_delta_c']}C")
+    print(f"  Peak VRAM: {phase2.data['peak_vram_mb']} MB")
+    if not _confirm_continue():
+        await recovery_phase(config.bastion_url, baseline_temp)
+        return
+
+    # Phase 3: Swap ramp
+    print("\n--- Phase 3: Swap Ramp ---")
+    phase3 = await swap_ramp_phase(
+        config.bastion_url, small_models, profile.thermal_ceiling_c,
+    )
+    result.phases.append(phase3)
+    print(f"  Safe swap rate: {phase3.data['safe_swap_rate_per_min']}/min")
+    print(f"  Stop reason: {phase3.data['stop_reason']}")
+    print(f"  Avg swap duration: {phase3.data['swap_duration_avg_s']}s")
+    if not _confirm_continue():
+        await recovery_phase(config.bastion_url, baseline_temp)
+        return
+
+    # Phase 4: Concurrent load
+    print(f"\n--- Phase 4: Concurrent Load ({small_models[0]}) ---")
+    phase4 = await concurrent_load_phase(config.bastion_url, small_models[0])
+    result.phases.append(phase4)
+    print(f"  Max concurrent: {phase4.data['max_concurrent_requests']}")
+    print(f"  Stop reason: {phase4.data['stop_reason']}")
+
+    # Phase 5: Recovery
+    print("\n--- Phase 5: Recovery ---")
+    phase5 = await recovery_phase(config.bastion_url, baseline_temp)
+    result.phases.append(phase5)
+    print(f"  Cooldown: {phase5.data['cooldown_duration_s']}s")
+    print(f"  Final temp: {phase5.data.get('final_temp_c', '?')}C")
+
+    # Aggregate calibrated values
+    result.calibrated = {
+        "safe_swap_rate_per_min": phase3.data.get("safe_swap_rate_per_min", 3),
+        "max_concurrent_requests": phase4.data.get("max_concurrent_requests", 2),
+        "vram_headroom_mb": profile.vram_headroom_mb,
+        "thermal_ceiling_c": profile.thermal_ceiling_c,
+        "cooldown_seconds": max(2, int(phase5.data.get("cooldown_duration_s", 3) / 2)),
+        "swap_duration_avg_s": phase3.data.get("swap_duration_avg_s", 0),
+        "models_used": small_models,
+    }
+
+    # Write profile
+    dest = write_profile(result)
+    print(f"\n  Profile written to {dest}")
+    print("  BASTION will use these calibrated values on next startup.")
+
+
+def _confirm_continue() -> bool:
+    """Ask user to continue to next phase. Returns False on abort."""
+    try:
+        response = input("\n  Continue to next phase? [Y/n] ").strip().lower()
+        return response in ("", "y", "yes")
+    except (KeyboardInterrupt, EOFError):
+        print("\n  Aborting -- running recovery...")
+        return False
 
 
 if __name__ == "__main__":
