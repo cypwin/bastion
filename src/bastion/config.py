@@ -17,6 +17,9 @@ import yaml
 
 from bastion.models import BrokerConfig, ModelInfo
 
+# Avoid circular import — BrokerConfig fields used by _apply_gpu_profile
+# are accessed via attribute, not import.
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,6 +85,11 @@ def load_config(path: Path | None = None) -> BrokerConfig:
     config = BrokerConfig(**raw)
     resolve_gpu_defaults(config, explicit_fields=set(user_gpu.keys()))
     _apply_env_overrides(config)
+
+    # Apply calibrated GPU profile if available
+    gpu_profile = _load_gpu_profile()
+    if gpu_profile:
+        _apply_gpu_profile(config, gpu_profile)
 
     if not config.models:
         logger.info(
@@ -260,6 +268,65 @@ def _apply_env_overrides(config: BrokerConfig) -> None:
 
     if overrides_applied:
         logger.info("Config overrides from environment: %s", ", ".join(overrides_applied))
+
+
+def _load_gpu_profile(path: Path | None = None) -> dict | None:
+    """Load calibrated GPU profile if it exists.
+
+    Parameters
+    ----------
+    path : Path, optional
+        Explicit path. If None, checks ~/.config/bastion/gpu-profile.yaml.
+
+    Returns
+    -------
+    dict or None
+        Parsed profile data, or None if no profile exists.
+    """
+    if path is None:
+        from bastion.paths import config_dir
+        path = config_dir() / "gpu-profile.yaml"
+
+    if not path.exists():
+        return None
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        if isinstance(data, dict) and "calibrated" in data:
+            logger.info(
+                "Using calibrated GPU profile from %s (tested %s on %s)",
+                path,
+                data.get("tested", {}).get("date", "unknown"),
+                data.get("gpu", {}).get("name", "unknown"),
+            )
+            return data
+    except Exception as e:
+        logger.warning("Failed to load GPU profile from %s: %s", path, e)
+
+    return None
+
+
+def _apply_gpu_profile(config: BrokerConfig, profile: dict) -> None:
+    """Apply calibrated GPU profile values to config.
+
+    Calibrated values override defaults but NOT explicit user config.
+    """
+    cal = profile.get("calibrated", {})
+
+    if "cooldown_seconds" in cal:
+        config.scheduler.cooldown_seconds = float(cal["cooldown_seconds"])
+    if "safe_swap_rate_per_min" in cal:
+        config.scheduler.swap_rate_warn_threshold = max(1, cal["safe_swap_rate_per_min"] - 1)
+        config.scheduler.swap_rate_critical_threshold = cal["safe_swap_rate_per_min"]
+    if "max_concurrent_requests" in cal:
+        config.scheduler.max_concurrent_dispatches = cal["max_concurrent_requests"]
+    if "thermal_ceiling_c" in cal:
+        config.gpu.max_temperature_c = cal["thermal_ceiling_c"]
+    if "vram_headroom_mb" in cal:
+        config.gpu.headroom_gb = cal["vram_headroom_mb"] / 1024.0
+
+    logger.info("Applied calibrated GPU profile overrides")
 
 
 def _find_config(explicit_path: Path | None) -> Path | None:
