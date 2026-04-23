@@ -36,7 +36,7 @@ import pytest
 BASTION_URL: str = "http://127.0.0.1:11434"
 STRESS_LOG_PATH: str = "/tmp/bastion-stress-test.jsonl"
 REQUEST_TIMEOUT: float = 120.0
-VRAM_BUDGET_GB: float = 26.0
+VRAM_BUDGET_GB: float = 28.0
 
 # Known model VRAM sizes (from config/broker.yaml)
 KNOWN_VRAM: dict[str, float] = {
