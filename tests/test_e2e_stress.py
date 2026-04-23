@@ -551,6 +551,32 @@ def _pick_swap_models(
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+async def _unload_all_models(bastion_url: str) -> list[str]:
+    """Unload every model currently loaded in Ollama via the broker.
+
+    Returns the list of models that were unloaded.  Used to ensure VRAM
+    is clean before tests that need to preload specific model sets.
+    """
+    unloaded: list[str] = []
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        ps = await client.get(f"{bastion_url}/api/ps", timeout=10.0)
+        for model in ps.json().get("models", []):
+            name = model.get("name", "")
+            if name:
+                await client.post(
+                    f"{bastion_url}/broker/unload",
+                    json={"model": name},
+                    timeout=30.0,
+                )
+                unloaded.append(name)
+    return unloaded
+
+
+# ---------------------------------------------------------------------------
 # Pytest fixtures (session-scoped)
 # ---------------------------------------------------------------------------
 
@@ -1627,6 +1653,11 @@ class TestConfirmedUnload:
             if len(council) < 2:
                 pytest.skip(f"Need at least 2 council models, have {len(council)}")
 
+            # Clean VRAM: unload leftover models from previous tests
+            evicted = await _unload_all_models(bastion_url)
+            if evicted:
+                stress_log.log("cleanup", {"unloaded": evicted})
+
             async with httpx.AsyncClient() as client:
                 # Phase 1: Preload council models
                 for model in council:
@@ -1711,6 +1742,11 @@ class TestCouncilConcurrentDispatch:
             council = [m for m in self._COUNCIL_MODELS if m in available_models]
             if len(council) < 3:
                 pytest.skip(f"Need 3 council models, have {len(council)}: {council}")
+
+            # Clean VRAM: unload leftover models from previous tests
+            evicted = await _unload_all_models(bastion_url)
+            if evicted:
+                stress_log.log("cleanup", {"unloaded": evicted})
 
             async with httpx.AsyncClient(timeout=30.0) as admin:
                 # Phase 1: Preload all council models
@@ -1828,6 +1864,11 @@ class TestCouncilConcurrentDispatch:
             council = [m for m in self._COUNCIL_MODELS if m in available_models]
             if len(council) < 3:
                 pytest.skip(f"Need 3 council models, have {len(council)}")
+
+            # Clean VRAM: unload leftover models from previous tests
+            evicted = await _unload_all_models(bastion_url)
+            if evicted:
+                stress_log.log("cleanup", {"unloaded": evicted})
 
             # Find a model that's NOT in the council for the "secondary" role
             embedding = {"nomic-embed-text"}
