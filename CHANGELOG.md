@@ -5,6 +5,25 @@ All notable changes to BASTION are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-04-23
+
+### Added
+- `--validate` CLI flag for pre-flight system checks (Python, GPU, Ollama, config, permissions)
+- `--stress-test` CLI flag for GPU stress calibration with 5-phase ramp-up
+- GPU profile table (`gpu_profiles.py`) with known-safe defaults for 13 NVIDIA GPUs
+- Calibrated GPU profile loading at startup (`gpu-profile.yaml`)
+- Documentation suite: getting-started, hardware guide, configuration reference, troubleshooting, operations, security
+
+### Changed
+- README rewritten for public release (prerequisites, quickstart, documentation table)
+- CHANGELOG cleaned of internal session tags
+- Crash prevention guide rewritten as technical reference (removed investigation narrative)
+- Internal development artifacts archived to `_archive/`
+- VRAM budget in e2e stress tests raised from 26 GB to 28 GB (4 GB headroom on 32 GB GPU)
+
+### Fixed
+- E2e stress tests failing due to VRAM state leaking between tests (added cleanup)
+
 ## [0.3.0] - 2026-04-06
 
 ### Added
