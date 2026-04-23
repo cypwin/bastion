@@ -51,7 +51,7 @@ standard Ollama port so every client benefits with zero configuration changes.
 ### 1. Install
 
 ```bash
-git clone https://github.com/cyprian-sw/bastion.git
+git clone https://github.com/cyprian-w/bastion.git
 cd bastion
 pip install -e ".[dev]"
 ```
