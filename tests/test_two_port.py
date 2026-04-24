@@ -310,19 +310,19 @@ class TestAgentCardOnlyOnAdmin:
 
 
 class TestAuthOnlyOnAdmin:
-    """Auth dependencies are only attached to admin/a2a routers, not proxy."""
+    """Auth dependencies are attached to proxy routes when auth is enabled."""
 
-    def test_proxy_app_has_no_auth_dependencies(self, two_port_config: BrokerConfig) -> None:
-        """Proxy app routes should not have auth dependencies."""
+    def test_proxy_app_has_auth_dependency_when_auth_enabled(self, two_port_config: BrokerConfig) -> None:
+        """Proxy app routes should have admin auth dependency when auth is enabled."""
+        two_port_config.auth.enabled = True
+        two_port_config.auth.api_keys = ["test-key"]
         app = create_proxy_app(two_port_config)
         for route in app.routes:
             if hasattr(route, "path") and route.path == "/api/{path:path}":
-                # The proxy catch-all should not have broker auth dependencies
-                # It serves raw Ollama traffic
                 deps = getattr(route, "dependencies", [])
                 dep_names = [str(d) for d in deps]
-                for name in dep_names:
-                    assert "admin_key" not in name.lower()
+                # verify_admin_key dependency should be present
+                assert any("admin_key" in name.lower() for name in dep_names)
 
     def test_admin_app_broker_routes_have_auth(self, two_port_config: BrokerConfig) -> None:
         """Admin app /broker/* routes should have auth dependency attached."""
