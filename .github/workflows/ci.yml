@@ -27,5 +27,13 @@ jobs:
       - name: Lint
         run: ruff check src/ tests/
 
+      - name: Type check
+        # TODO: fix existing type errors then remove `|| true`
+        run: mypy src/bastion --ignore-missing-imports --no-strict-optional || true
+
       - name: Test
         run: pytest tests/ -v --ignore=tests/test_e2e_stress.py
+
+      - name: Test bastion-client package
+        working-directory: clients/bastion-client
+        run: pip install -e . && pytest tests/ -v
