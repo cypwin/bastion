@@ -412,6 +412,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         tier=config.audit.tier,
     )
     logger.info("Audit logging initialized: %s (tier=%d)", _resolved_audit, config.audit.tier)
+    from bastion.paths import harden_audit_log
+    harden_audit_log()
 
     # --- Optional SQLite persistence (Phase 3.2) ---
     _db_manager = None

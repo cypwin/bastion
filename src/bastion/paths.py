@@ -63,3 +63,19 @@ def vram_journal_path() -> Path:
 def database_path() -> Path:
     """Return the default path to the SQLite persistence database."""
     return data_dir() / "bastion.db"
+
+
+def harden_audit_log() -> None:
+    """Set audit log file mode to 0o600 if it exists.
+
+    Protects hashed tokens and tier-2 prompt hashes from other local users.
+    Idempotent; no-op when the file does not yet exist.
+    """
+    path = Path(audit_log_path())
+    if not path.exists():
+        return
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        # Best-effort; failure to chmod should not crash the service.
+        pass
