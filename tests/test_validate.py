@@ -121,3 +121,47 @@ class TestRunAllChecks:
         exit_code = 1 if has_fail else 0
         # Just verify the logic, actual result depends on environment
         assert exit_code in (0, 1)
+
+
+class TestCheckOllamaProxyFallback:
+    """Tests validator fallback behavior."""
+
+    @pytest.mark.asyncio
+    async def test_ollama_direct_succeeds(self) -> None:
+        mock_resp = AsyncMock(status_code=200)
+        with patch("httpx.AsyncClient.get", return_value=mock_resp):
+            result = await check_ollama(port=11435, host="127.0.0.1")
+        assert result.status == CheckStatus.PASS
+        assert "11435" in result.message
+
+    @pytest.mark.asyncio
+    async def test_ollama_direct_fails_but_proxy_ok_is_warn_not_fail(self) -> None:
+        calls: list[str] = []
+
+        async def fake_get(self: object, url: str, timeout: float = 5.0) -> AsyncMock:
+            calls.append(url)
+            if "11435" in url:
+                raise Exception("RST (nftables)")
+            # The BASTION proxy on 11434 answers /api/tags
+            mock = AsyncMock()
+            mock.status_code = 200
+            return mock
+
+        with patch("httpx.AsyncClient.get", fake_get):
+            result = await check_ollama(
+                port=11435, host="127.0.0.1", proxy_port=11434
+            )
+        assert result.status == CheckStatus.WARN, result.message
+        assert "via BASTION proxy" in result.message
+        assert any("11434" in c for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_ollama_both_direct_and_proxy_fail_is_fail(self) -> None:
+        async def fake_get(self: object, url: str, timeout: float = 5.0) -> None:
+            raise Exception("unreachable")
+
+        with patch("httpx.AsyncClient.get", fake_get):
+            result = await check_ollama(
+                port=11435, host="127.0.0.1", proxy_port=11434
+            )
+        assert result.status == CheckStatus.FAIL

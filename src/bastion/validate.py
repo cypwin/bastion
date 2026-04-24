@@ -121,8 +121,18 @@ def check_gpu_profile(gpu_name: str | None) -> CheckResult:
     )
 
 
-async def check_ollama(port: int = 11435, host: str = "127.0.0.1") -> CheckResult:
-    """Check if Ollama is reachable on the backend port."""
+async def check_ollama(
+    port: int = 11435,
+    host: str = "127.0.0.1",
+    proxy_port: int | None = None,
+) -> CheckResult:
+    """Check if Ollama is reachable on the backend port.
+
+    When ``proxy_port`` is provided and the direct probe to ``port`` fails,
+    retry via the BASTION proxy on ``proxy_port``. A successful proxy
+    probe yields WARN (not FAIL) so users with locked-down direct access
+    (e.g. nftables GID restriction) don't see a misleading failure.
+    """
     url = f"http://{host}:{port}"
     try:
         async with httpx.AsyncClient() as client:
@@ -133,46 +143,73 @@ async def check_ollama(port: int = 11435, host: str = "127.0.0.1") -> CheckResul
                 CheckStatus.PASS,
                 f"reachable on {host}:{port}",
             )
-        return CheckResult(
-            "Ollama",
-            CheckStatus.FAIL,
-            f"responded with HTTP {resp.status_code} on {host}:{port}",
-        )
-    except Exception:
+        direct_err = f"HTTP {resp.status_code}"
+    except Exception as e:  # noqa: BLE001
+        direct_err = str(e) or "unreachable"
+
+    if proxy_port is None:
         return CheckResult(
             "Ollama",
             CheckStatus.FAIL,
             f"unreachable on {host}:{port} -- is Ollama running on that port?",
         )
 
-
-async def check_models(port: int = 11435, host: str = "127.0.0.1") -> CheckResult:
-    """Check installed Ollama models and VRAM compatibility."""
-    url = f"http://{host}:{port}/api/tags"
+    # Fallback via BASTION proxy
+    proxy_url = f"http://{host}:{proxy_port}/api/tags"
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(url, timeout=5.0)
-        if resp.status_code != 200:
-            return CheckResult("Installed models", CheckStatus.WARN, "could not query Ollama models")
+            resp = await client.get(proxy_url, timeout=5.0)
+        if resp.status_code == 200:
+            return CheckResult(
+                "Ollama",
+                CheckStatus.WARN,
+                f"direct probe {host}:{port} failed ({direct_err}); "
+                f"reachable via BASTION proxy on :{proxy_port} — "
+                "likely nftables lockdown (normal)",
+            )
+    except Exception:  # noqa: BLE001
+        pass
+    return CheckResult(
+        "Ollama",
+        CheckStatus.FAIL,
+        f"unreachable on {host}:{port} ({direct_err}) and not reachable via "
+        f"BASTION proxy on :{proxy_port} -- is Ollama running?",
+    )
 
-        data = resp.json()
-        models = data.get("models", [])
-        if not models:
+
+async def check_models(
+    port: int = 11435,
+    host: str = "127.0.0.1",
+    proxy_port: int | None = None,
+) -> CheckResult:
+    """Check installed Ollama models and VRAM compatibility."""
+    urls = [f"http://{host}:{port}/api/tags"]
+    if proxy_port is not None:
+        urls.append(f"http://{host}:{proxy_port}/api/tags")
+    for url in urls:
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, timeout=5.0)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            models = data.get("models", [])
+            if not models:
+                return CheckResult(
+                    "Installed models",
+                    CheckStatus.WARN,
+                    "no models installed -- run: ollama pull llama3.1:8b",
+                )
+            model_names = [m.get("name", "?") for m in models]
             return CheckResult(
                 "Installed models",
-                CheckStatus.WARN,
-                "no models installed -- run: ollama pull llama3.1:8b",
+                CheckStatus.PASS,
+                f"{len(models)} model(s): {', '.join(model_names[:5])}"
+                + (f" (+{len(models) - 5} more)" if len(models) > 5 else ""),
             )
-
-        model_names = [m.get("name", "?") for m in models]
-        return CheckResult(
-            "Installed models",
-            CheckStatus.PASS,
-            f"{len(models)} model(s): {', '.join(model_names[:5])}"
-            + (f" (+{len(models) - 5} more)" if len(models) > 5 else ""),
-        )
-    except Exception:
-        return CheckResult("Installed models", CheckStatus.WARN, "could not query Ollama models")
+        except Exception:  # noqa: BLE001
+            continue
+    return CheckResult("Installed models", CheckStatus.WARN, "could not query Ollama models")
 
 
 async def check_port(port: int = 11434) -> CheckResult:
@@ -302,11 +339,15 @@ async def run_all_checks(
     gpu_name = _query_gpu_name()
     results.append(check_gpu_profile(gpu_name))
 
-    # 4. Ollama reachable (async)
-    results.append(await check_ollama(port=ollama_port, host=ollama_host))
+    # 4. Ollama reachable (async) — with proxy fallback
+    results.append(
+        await check_ollama(port=ollama_port, host=ollama_host, proxy_port=bastion_port)
+    )
 
-    # 5. Installed models (async)
-    results.append(await check_models(port=ollama_port, host=ollama_host))
+    # 5. Installed models (async) — with proxy fallback
+    results.append(
+        await check_models(port=ollama_port, host=ollama_host, proxy_port=bastion_port)
+    )
 
     # 6. Port availability (async -- may do HTTP check)
     results.append(await check_port(port=bastion_port))
