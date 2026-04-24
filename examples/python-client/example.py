@@ -1,36 +1,38 @@
-"""BASTION Python client — basic usage example.
+"""Minimal BASTION client example using httpx.
 
-Prerequisites:
-    pip install bastion-client
-
-Make sure BASTION is running on localhost:11434 and a model is available
-(e.g., ollama pull llama3.1:8b).
+Shows how to call BASTION's Ollama-compatible /api/chat endpoint
+without installing any BASTION-specific client package.
 """
 from __future__ import annotations
 
-import asyncio
+import os
 
-from bastion_client import BastionClient
+import httpx
+
+BASTION_URL = os.environ.get("BASTION_URL", "http://127.0.0.1:11434")
+# If auth is enabled, set BASTION_API_KEY in the environment or edit here.
+API_KEY: str | None = os.environ.get("BASTION_API_KEY")
 
 
-async def main() -> None:
-    async with BastionClient() as client:
-        # Check GPU/VRAM status
-        vram = await client.check_vram()
-        print(f"VRAM: {vram.used_vram_gb:.1f}/{vram.total_vram_gb:.1f} GB")
-        print(f"Utilization: {vram.utilization_pct:.0f}%")
-        print(f"Loaded models: {vram.loaded_models}")
-        print()
-
-        # Run inference with interactive priority
-        print("Sending inference request...")
-        result = await client.infer(
-            "llama3.1:8b",
-            "Explain what a GPU broker does in one sentence.",
-            tier="interactive",
+def chat(model: str, prompt: str) -> str:
+    headers: dict[str, str] = {}
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
+    with httpx.Client(timeout=120.0) as client:
+        resp = client.post(
+            f"{BASTION_URL}/api/chat",
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+            },
+            headers=headers,
         )
-        print(f"Response: {result['response']}")
+        resp.raise_for_status()
+        data = resp.json()
+        return data["message"]["content"]
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    out = chat("llama3.1:8b", "Say hi in one sentence.")
+    print(out)
