@@ -1184,6 +1184,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
     @app.api_route(
         "/api/{path:path}",
         methods=["GET", "POST", "PUT", "DELETE", "HEAD"],
+        dependencies=[Depends(verify_admin)],
     )
     async def proxy_ollama(request: Request, path: str):
         """Proxy all /api/* requests to Ollama backend."""
@@ -1196,6 +1197,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
     @app.api_route(
         "/v1/{path:path}",
         methods=["GET", "POST", "PUT", "DELETE", "HEAD"],
+        dependencies=[Depends(verify_admin)],
     )
     async def proxy_ollama_v1(request: Request, path: str):
         """Proxy all /v1/* requests to Ollama backend (OpenAI-compatible API)."""
@@ -1263,11 +1265,15 @@ def create_proxy_app(config: BrokerConfig) -> FastAPI:
     app.add_middleware(RateLimitMiddleware, config=config.rate_limit)
     app.add_middleware(MetricsMiddleware)
 
+    # ── Auth dependency ─────────────────────────────────────────────
+    verify_admin = make_admin_key_dependency(config.auth)
+
     # ── Ollama proxy routes ─────────────────────────────────────────
 
     @app.api_route(
         "/api/{path:path}",
         methods=["GET", "POST", "PUT", "DELETE", "HEAD"],
+        dependencies=[Depends(verify_admin)],
     )
     async def proxy_ollama(request: Request, path: str) -> Response:
         """Proxy all /api/* requests to Ollama backend."""
@@ -1278,6 +1284,7 @@ def create_proxy_app(config: BrokerConfig) -> FastAPI:
     @app.api_route(
         "/v1/{path:path}",
         methods=["GET", "POST", "PUT", "DELETE", "HEAD"],
+        dependencies=[Depends(verify_admin)],
     )
     async def proxy_ollama_v1(request: Request, path: str) -> Response:
         """Proxy all /v1/* requests to Ollama backend (OpenAI-compatible API)."""
