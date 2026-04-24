@@ -1,9 +1,12 @@
 """Priority tiers demo — shows BASTION scheduling order.
 
-Launches three concurrent requests at different priority tiers using
-httpx directly (no bastion-client package required). Interactive
-requests are served before pipeline and background, even when
-submitted at the same time.
+Launches three concurrent clients at different priority tiers.
+Interactive requests are served before pipeline and background,
+even when submitted at the same time.
+
+Prerequisites:
+    # Until bastion-client is published to PyPI, install from source:
+    pip install ./clients/bastion-client/
 
 Make sure BASTION is running on localhost:11434 and a model is available
 (e.g., ollama pull llama3.1:8b).
@@ -11,37 +14,21 @@ Make sure BASTION is running on localhost:11434 and a model is available
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 
-import httpx
+from bastion_client import BastionClient
 
-BASTION_URL = os.environ.get("BASTION_URL", "http://127.0.0.1:11434")
-API_KEY: str | None = os.environ.get("BASTION_API_KEY")
 MODEL = "llama3.1:8b"
 PROMPT = "Reply with exactly one word: hello."
 
 
 async def send_request(name: str, tier: str, start_time: float) -> None:
-    """Send a single inference request at the given priority tier."""
-    headers = {"X-Broker-Priority": tier}
-    if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    """Send a single inference request and report timing."""
+    async with BastionClient() as client:
         print(f"[{name}] Submitting request (tier={tier})...")
-        resp = await client.post(
-            f"{BASTION_URL}/api/chat",
-            json={
-                "model": MODEL,
-                "messages": [{"role": "user", "content": PROMPT}],
-                "stream": False,
-            },
-            headers=headers,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        result = await client.infer(MODEL, PROMPT, tier=tier)
         elapsed = time.monotonic() - start_time
-        response = data["message"]["content"].strip()[:80]
+        response = result["response"].strip()[:80]
         print(f"[{name}] Completed in {elapsed:.1f}s (tier={tier}): {response}")
 
 

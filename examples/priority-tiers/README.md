@@ -22,9 +22,13 @@ gain priority over time (aging rate: +2 points/second) to prevent starvation.
 
 ## Install
 
+`bastion-client` is not yet published to PyPI. Install from source:
+
 ```bash
-pip install bastion-client
+pip install ../../clients/bastion-client/
 ```
+
+(Once published, this becomes `pip install bastion-client`.)
 
 ## Run
 
