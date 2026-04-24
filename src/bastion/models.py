@@ -144,6 +144,7 @@ class RateLimitConfig(BaseModel):
     enabled: bool = False
     requests_per_minute: int = 60
     burst: int = 10
+    trusted_proxies: list[str] = Field(default_factory=list)
 
 
 class CircuitBreakerConfig(BaseModel):
