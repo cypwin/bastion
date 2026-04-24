@@ -1,6 +1,14 @@
 # BASTION — Batch Affinity Scheduler for Throttled Inference on Ollama Networks
-# Install: sudo cp bastion.service.example /etc/systemd/system/bastion.service
-#          sudo systemctl daemon-reload && sudo systemctl enable --now bastion
+#
+# SETUP (required before `systemctl daemon-reload`):
+#   1. Copy this file to /etc/systemd/system/bastion.service
+#   2. Substitute the four placeholders below:
+#        <RUN_USER>    — the user that will run bastion (e.g. your login user)
+#        <BASTION_DIR> — absolute path to the BASTION project directory
+#        <PYTHON_PATH> — absolute path to the python binary with bastion installed
+#   3. Ensure <RUN_USER> is a member of the `bastion` group: `sudo usermod -aG bastion <RUN_USER>`
+#      (the nftables GID 983 lockdown on port 11435 depends on this)
+#   4. `sudo systemctl daemon-reload && sudo systemctl enable --now bastion`
 
 [Unit]
 Description=BASTION GPU/LLM Broker (Ollama proxy on :11434)
@@ -13,7 +21,7 @@ Requires=ollama.service
 Type=notify
 NotifyAccess=main
 WatchdogSec=30
-User=<USER>
+User=<RUN_USER>
 Group=bastion
 WorkingDirectory=<BASTION_DIR>
 ExecStart=<PYTHON_PATH> -m bastion --config config/broker.yaml
@@ -21,10 +29,11 @@ Restart=always
 RestartSec=3
 StartLimitBurst=5
 StartLimitIntervalSec=60
-SupplementaryGroups=<USER>
+# Supplementary groups for GPU device node access (render, video)
+SupplementaryGroups=video render
 TimeoutStopSec=15
 
-# Environment
+# Environment — only needed for editable installs; remove for `pip install` setups
 Environment="PYTHONPATH=<BASTION_DIR>/src"
 
 # Logging — journal captures stdout/stderr
@@ -38,6 +47,13 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=<BASTION_DIR>
 PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

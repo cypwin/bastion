@@ -160,22 +160,29 @@ The example service file includes security directives:
 
 ```ini
 [Service]
-# Run as dedicated user
-User=bastion
+# Run as your user (not a dedicated bastion user)
+User=<RUN_USER>
 Group=bastion
 
 # Filesystem protection
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/bastion/.local/share/bastion
-ReadWritePaths=/home/bastion/.config/bastion
+ReadWritePaths=<BASTION_DIR>
 
 # Privilege escalation prevention
-NoNewPrivileges=yes
-PrivateTmp=yes
+NoNewPrivileges=true
+PrivateTmp=true
 
 # Network restrictions
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+# Capability restrictions
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
 ```
 
 ### 6. Audit Log Security
