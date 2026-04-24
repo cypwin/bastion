@@ -504,7 +504,7 @@ class BastionDashboard(App):
         lease_panel.update(lease_panel.render_data(data))
 
         audit_panel = self.query_one("#audit-stream", AuditStreamPanel)
-        audit_events = data.get("audit_events", [])
+        audit_events = data.get("recent_audit_events", [])
         audit_panel.update(audit_panel.render_data(audit_events))
 
     # ------------------------------------------------------------------

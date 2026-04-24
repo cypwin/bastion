@@ -102,7 +102,7 @@ class LeasePanel(Static):
         table.add_column("key", style="bold", width=12)
         table.add_column("value")
 
-        leases = status_data.get("leases", [])
+        leases = status_data.get("active_leases", [])
 
         if not leases:
             table.add_row(Text("(none)", style="dim"), "")

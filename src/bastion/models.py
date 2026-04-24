@@ -487,6 +487,11 @@ class BrokerStatus(BaseModel):
     circuit_breaker: dict | None = None
     gpu_is_safe: bool | None = None
     max_vram_gb: float | None = None
+    # --- Dashboard observability fields (Phase 2) ------------------
+    a2a_summary: dict[str, int] | None = None
+    a2a_tasks: list[dict] = Field(default_factory=list)
+    active_leases: list[dict] = Field(default_factory=list)
+    recent_audit_events: list[dict] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

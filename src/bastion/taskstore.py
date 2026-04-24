@@ -299,6 +299,10 @@ class TaskStore:
             if record.state.value == state
         )
 
+    def list_active(self) -> list[A2ATaskRecord]:
+        """Return all currently active (non-terminal, non-compacted) task records."""
+        return list(self._active.values())
+
     def stats(self) -> dict:
         """Return store statistics for monitoring."""
         return {
