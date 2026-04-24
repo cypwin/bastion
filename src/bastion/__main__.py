@@ -20,6 +20,55 @@ from pathlib import Path
 import uvicorn
 
 
+logger = logging.getLogger(__name__)
+
+
+def _security_banner_lines(config: "BrokerConfig") -> list[str]:
+    """Return warning lines for insecure server configuration.
+
+    Returns an empty list when bind is localhost-only or when auth is
+    properly configured. Otherwise returns a SECURITY WARNING banner.
+
+    Designed for extension: callers may append additional warnings to the
+    returned list before printing (Task 11 will extend this for A2A tokens
+    and rate limiting).
+    """
+    warnings: list[str] = []
+    host = config.server.host
+    auth_on = config.auth.enabled
+    keys_configured = bool(config.auth.api_keys)
+
+    public_bind = host in ("0.0.0.0", "::") or (
+        host
+        and not host.startswith("127.")
+        and host != "localhost"
+    )
+
+    if public_bind and (not auth_on or not keys_configured):
+        warnings.append("=" * 72)
+        warnings.append("*** SECURITY WARNING ***")
+        if not auth_on:
+            warnings.append(
+                f"  Listening on {host}:{config.server.port} with auth is disabled."
+            )
+        else:
+            warnings.append(
+                f"  Listening on {host}:{config.server.port} with auth.enabled=true "
+                "but no api_keys configured — proxy is OPEN."
+            )
+        warnings.append(
+            "  Anyone who can reach this port can run inference against your GPU."
+        )
+        warnings.append(
+            "  To secure: set auth.enabled: true + auth.api_keys: [\"<key>\"] in broker.yaml,"
+        )
+        warnings.append(
+            "  OR restrict server.host to 127.0.0.1 for localhost-only."
+        )
+        warnings.append("=" * 72)
+    return warnings
+
+
 def _generate_config() -> None:
     """Generate a starter config with auto-detected GPU values."""
     import shutil
@@ -222,6 +271,9 @@ def main() -> None:
         config.ollama.port = args.ollama_port
 
     bastion_logger = logging.getLogger("bastion")
+
+    for line in _security_banner_lines(config):
+        logger.warning(line)
 
     if config.server.two_port_mode:
         # Two-port mode: proxy on port, admin on admin_port
