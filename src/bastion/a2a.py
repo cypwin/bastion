@@ -1695,8 +1695,10 @@ class A2AHandler:
                 "pushNotifications": False,
             },
             "skills": [
-                "text-generation",
-                "embeddings",
+                {"id": "infer", "name": "Single Prompt Inference"},
+                {"id": "batch_infer", "name": "Batch Inference"},
+                {"id": "preload", "name": "Preload Model"},
+                {"id": "status", "name": "Broker Status"},
             ],
         }
 
