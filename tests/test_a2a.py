@@ -708,11 +708,15 @@ class TestAgentCard:
         card_str = json.dumps(card)
         assert "queue_depth" not in card_str
 
-    def test_public_card_has_broad_skill_categories(self, a2a_handler):
-        """Public card lists broad skill categories only."""
+    def test_public_card_has_real_skill_ids(self, a2a_handler):
+        """Public card lists real skill IDs that match the routing table."""
         card = a2a_handler.build_public_card()
-        assert "text-generation" in card["skills"]
-        assert "embeddings" in card["skills"]
+        skill_ids = {
+            s["id"] if isinstance(s, dict) else s
+            for s in card["skills"]
+        }
+        assert "infer" in skill_ids
+        assert "batch_infer" in skill_ids
 
     def test_public_card_has_streaming_capability(self, a2a_handler):
         """Public card advertises streaming capability."""
@@ -1151,3 +1155,24 @@ class TestReservations:
         a2a_handler._reservations[reservation.reservation_id] = reservation
 
         assert a2a_handler.has_active_reservation("qwen3:14b") is False
+
+
+# ---------------------------------------------------------------------------
+# Public Agent Card Skill IDs
+# ---------------------------------------------------------------------------
+
+def test_public_agent_card_skill_ids_match_routing(a2a_handler):
+    """Public card must advertise real skill IDs accepted by the routing table."""
+    card = a2a_handler.build_public_card()
+    # Skills in the public card must be real skill IDs the handler accepts
+    real_ids = {"infer", "status", "batch_infer", "preload"}
+    advertised = set()
+    for skill in card["skills"]:
+        # Support both string-form (legacy) and structured-form entries
+        if isinstance(skill, str):
+            advertised.add(skill)
+        else:
+            advertised.add(skill["id"])
+    assert advertised.issubset(real_ids), f"unexpected skills: {advertised - real_ids}"
+    # At least the core two must be advertised
+    assert "infer" in advertised
