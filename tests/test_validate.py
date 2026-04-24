@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -13,9 +11,7 @@ from bastion.validate import (
     CheckStatus,
     check_config,
     check_gpu,
-    check_models,
     check_ollama,
-    check_permissions,
     check_port,
     check_python_version,
     run_all_checks,

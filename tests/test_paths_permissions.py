@@ -1,7 +1,6 @@
 """Tests that data files get 0o600 mode."""
 from __future__ import annotations
 
-import os
 import stat
 from pathlib import Path
 

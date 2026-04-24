@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
 from bastion.models import ThrashingDetectionConfig
 from bastion.thrashing import ThrashingDetector, ThrashingVerdict
 

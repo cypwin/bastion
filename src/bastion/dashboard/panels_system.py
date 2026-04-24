@@ -9,7 +9,6 @@ from bastion.dashboard.helpers import (
     core_char,
     get_rate,
     sparkline,
-    temp_color,
     usage_color,
 )
 

@@ -365,6 +365,7 @@ class TestPersistentQueue:
 class TestConfigIntegration:
     def test_persistence_config_from_yaml(self, tmp_path):
         import yaml
+
         from bastion.config import load_config
 
         config_file = tmp_path / "broker.yaml"

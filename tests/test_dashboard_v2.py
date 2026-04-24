@@ -9,7 +9,6 @@ from bastion.dashboard.helpers import (
     state_color,
     temp_color,
     usage_color,
-    vram_bar,
 )
 
 

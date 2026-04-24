@@ -16,14 +16,17 @@ import logging
 import signal
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import uvicorn
 
+if TYPE_CHECKING:
+    from bastion.models import BrokerConfig
 
 logger = logging.getLogger(__name__)
 
 
-def _security_banner_lines(config: "BrokerConfig") -> list[str]:
+def _security_banner_lines(config: BrokerConfig) -> list[str]:
     """Return warning lines for insecure server configuration.
 
     Returns an empty list when bind is localhost-only or when auth is
@@ -391,6 +394,7 @@ async def _run_two_port(
 
 async def _run_stress_test(config: StressConfig) -> None:  # noqa: F821
     """Run the full stress test sequence with phase-by-phase confirmation."""
+    from bastion.gpu_profiles import lookup_profile
     from bastion.stress import (
         CalibrationResult,
         baseline_phase,
@@ -401,7 +405,6 @@ async def _run_stress_test(config: StressConfig) -> None:  # noqa: F821
         swap_ramp_phase,
         write_profile,
     )
-    from bastion.gpu_profiles import lookup_profile
     from bastion.validate import _query_driver_version, _query_gpu_name
 
     # Prerequisites

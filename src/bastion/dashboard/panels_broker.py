@@ -14,7 +14,6 @@ from bastion.dashboard.helpers import (
     format_uptime,
     sparkline,
     state_color,
-    usage_color,
 )
 
 

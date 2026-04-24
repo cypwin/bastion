@@ -312,7 +312,9 @@ class TestAgentCardOnlyOnAdmin:
 class TestAuthOnlyOnAdmin:
     """Auth dependencies are attached to proxy routes when auth is enabled."""
 
-    def test_proxy_app_has_auth_dependency_when_auth_enabled(self, two_port_config: BrokerConfig) -> None:
+    def test_proxy_app_has_auth_dependency_when_auth_enabled(
+        self, two_port_config: BrokerConfig
+    ) -> None:
         """Proxy app routes should have admin auth dependency when auth is enabled."""
         two_port_config.auth.enabled = True
         two_port_config.auth.api_keys = ["test-key"]

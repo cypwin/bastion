@@ -66,7 +66,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from bastion.models import BrokerConfig, ComplexityRoutingConfig, ModelInfo, PriorityTier
+from bastion.models import ModelInfo, PriorityTier
 from bastion.proxy import OllamaProxy
 
 

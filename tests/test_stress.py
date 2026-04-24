@@ -7,8 +7,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from bastion.stress import (
-    CalibrationResult,
-    PhaseResult,
     StressConfig,
     baseline_phase,
     check_prerequisites,
