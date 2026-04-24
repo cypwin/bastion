@@ -50,6 +50,7 @@ dev = [
 
 [project.scripts]
 bastion = "bastion.__main__:main"
+bastion-dashboard = "bastion.dashboard:main"
 
 [project.urls]
 Homepage = "https://github.com/cyprian-w/bastion"
