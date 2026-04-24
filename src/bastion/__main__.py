@@ -29,21 +29,24 @@ def _security_banner_lines(config: "BrokerConfig") -> list[str]:
     Returns an empty list when bind is localhost-only or when auth is
     properly configured. Otherwise returns a SECURITY WARNING banner.
 
-    Designed for extension: callers may append additional warnings to the
-    returned list before printing (Task 11 will extend this for A2A tokens
-    and rate limiting).
+    Checks performed (all gated on public bind):
+    1. Auth disabled or no API keys configured.
+    2. A2A enabled with no tokens — task endpoints are open.
+    3. Rate limiting disabled — GPU saturation risk (applies to all proxy traffic).
     """
     warnings: list[str] = []
     host = config.server.host
     auth_on = config.auth.enabled
     keys_configured = bool(config.auth.api_keys)
 
+    # Compute once; reused by all three checks below.
     public_bind = host in ("0.0.0.0", "::") or (
         host
         and not host.startswith("127.")
         and host != "localhost"
     )
 
+    # Check 1: auth disabled or no API keys on public bind.
     if public_bind and (not auth_on or not keys_configured):
         warnings.append("=" * 72)
         warnings.append("*** SECURITY WARNING ***")
@@ -66,6 +69,27 @@ def _security_banner_lines(config: "BrokerConfig") -> list[str]:
             "  OR restrict server.host to 127.0.0.1 for localhost-only."
         )
         warnings.append("=" * 72)
+
+    # Check 2: A2A enabled but no tokens configured — task endpoints are open.
+    if public_bind and config.a2a.enabled and not config.a2a.tokens:
+        warnings.append("-" * 72)
+        warnings.append("A2A endpoints (/a2a/*) are OPEN — no a2a.tokens configured.")
+        warnings.append(
+            "  Any caller can create, cancel, and stream A2A tasks. "
+            "Set a2a.tokens in broker.yaml to restrict."
+        )
+        warnings.append("-" * 72)
+
+    # Check 3: Rate limiting disabled on a public bind — GPU saturation risk.
+    if public_bind and not config.rate_limit.enabled:
+        warnings.append("-" * 72)
+        warnings.append("Rate limiting is DISABLED on a public bind.")
+        warnings.append(
+            "  A single client can saturate your GPU. "
+            "Set rate_limit.enabled: true in broker.yaml to throttle per-IP."
+        )
+        warnings.append("-" * 72)
+
     return warnings
 
 
