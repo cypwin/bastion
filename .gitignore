@@ -16,8 +16,8 @@ build/
 pytest-of-*/
 
 # IDE
-.idea/
-.vscode/
+.idea
+.vscode
 
 # Claude Code / MCP
 .claude/

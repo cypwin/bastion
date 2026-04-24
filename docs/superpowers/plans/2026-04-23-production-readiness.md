@@ -68,20 +68,20 @@ Stream 1 is fully independent — no code changes, only documentation. Can be do
 - Move: `docs/production-roadmap-prompt.md` → `_archive/docs/production-roadmap-prompt.md`
 - Move: `SECURITY.md` → `_archive/SECURITY.md`
 
-- [ ] **Step 1: Create archive directory structure**
+- [x] **Step 1: Create archive directory structure**
 
 ```bash
 mkdir -p _archive/docs/audit
 mkdir -p _archive/reference
 ```
 
-- [ ] **Step 2: Move internal analyst reports**
+- [x] **Step 2: Move internal analyst reports**
 
 ```bash
 mv docs/audit/* _archive/docs/audit/
 ```
 
-- [ ] **Step 3: Move session handoffs and internal docs**
+- [x] **Step 3: Move session handoffs and internal docs**
 
 ```bash
 mv M58_BASTION_HANDOFF.md _archive/
@@ -89,19 +89,19 @@ mv ROADMAP.md _archive/
 mv docs/production-roadmap-prompt.md _archive/docs/
 ```
 
-- [ ] **Step 4: Move crash investigation raw data**
+- [x] **Step 4: Move crash investigation raw data**
 
 ```bash
 mv reference/* _archive/reference/
 ```
 
-- [ ] **Step 5: Move SECURITY.md (will be rewritten as docs/security.md)**
+- [x] **Step 5: Move SECURITY.md (will be rewritten as docs/security.md)**
 
 ```bash
 mv SECURITY.md _archive/
 ```
 
-- [ ] **Step 6: Create archive README explaining what's here**
+- [x] **Step 6: Create archive README explaining what's here**
 
 Create `_archive/README.md`:
 
@@ -127,7 +127,7 @@ and investigation notes that are valuable for maintainers but not relevant
 to end users of the public release.
 ```
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add _archive/ docs/audit/ reference/ ROADMAP.md M58_BASTION_HANDOFF.md SECURITY.md docs/production-roadmap-prompt.md
@@ -144,11 +144,11 @@ git commit -m "chore: archive internal development artifacts for public release 
 
 The current README is 85% there but has some gaps: no prerequisites checklist, no `--init-config`/`--detect-models` mention in quickstart, no "where to go next", and the "Technical Deep Dive" section is too long for a landing page.
 
-- [ ] **Step 1: Read current README.md for structure**
+- [x] **Step 1: Read current README.md for structure**
 
 Read `README.md` and note: what to keep, what to trim, what to add.
 
-- [ ] **Step 2: Rewrite README.md**
+- [x] **Step 2: Rewrite README.md**
 
 The new README should follow this structure (write the complete file):
 
@@ -255,11 +255,11 @@ Key changes from current README:
 - Remove "Project Structure" section (developer-facing, lives in CONTRIBUTING.md)
 - Remove session-specific content (S7, M58 references)
 
-- [ ] **Step 3: Verify no internal references remain**
+- [x] **Step 3: Verify no internal references remain**
 
 Search the rewritten README for: `S1`, `S2`, `S3`, `S4`, `S5`, `S6`, `S7`, `M58`, `RTX 5090`, `crash 7`, `crash 8`, `crash 9`, session numbers, or any personal system details.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add README.md
@@ -274,7 +274,7 @@ git commit -m "docs: rewrite README for public release"
 - Create: `docs/getting-started.md`
 - Reference: `docs/deployment.md` (for Ollama setup patterns), `src/bastion/__main__.py` (for CLI flags)
 
-- [ ] **Step 1: Write docs/getting-started.md**
+- [x] **Step 1: Write docs/getting-started.md**
 
 Complete guide from zero to running. Structure:
 
@@ -339,7 +339,7 @@ Content principles:
 - No assumptions about the user's experience level
 - No internal references
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add docs/getting-started.md
@@ -354,7 +354,7 @@ git commit -m "docs: add getting started guide"
 - Create: `docs/hardware-guide.md`
 - Reference: `src/bastion/models.py:40-57` (GPUConfig defaults), `docs/crash-prevention.md` (swap rate thresholds)
 
-- [ ] **Step 1: Write docs/hardware-guide.md**
+- [x] **Step 1: Write docs/hardware-guide.md**
 
 ```markdown
 # Hardware Guide
@@ -454,7 +454,7 @@ Recommendation: stick to one 7B model. Multi-model workflows will queue heavily.
 [Explain max_temperature_c, what happens when exceeded, how to monitor]
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add docs/hardware-guide.md
@@ -469,7 +469,7 @@ git commit -m "docs: add hardware guide with GPU compatibility and VRAM tables"
 - Create: `docs/configuration.md`
 - Reference: `src/bastion/models.py` (all config models), `config/broker.example.yaml`, `src/bastion/config.py` (env overrides)
 
-- [ ] **Step 1: Write docs/configuration.md**
+- [x] **Step 1: Write docs/configuration.md**
 
 Structure:
 
@@ -548,7 +548,7 @@ Environment variables override config file values. Useful for Docker/systemd.
 
 Write every field from the Pydantic models. Cross-reference `src/bastion/models.py` for field names, types, and defaults. Document each field individually — no "see models.py" references.
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add docs/configuration.md
@@ -562,7 +562,7 @@ git commit -m "docs: add complete configuration reference"
 **Files:**
 - Create: `docs/troubleshooting.md`
 
-- [ ] **Step 1: Write docs/troubleshooting.md**
+- [x] **Step 1: Write docs/troubleshooting.md**
 
 Structure: each issue as a section with **Symptom**, **Cause**, **Fix**.
 
@@ -618,7 +618,7 @@ Structure: each issue as a section with **Symptom**, **Cause**, **Fix**.
 ]
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add docs/troubleshooting.md
@@ -633,7 +633,7 @@ git commit -m "docs: add troubleshooting guide with 15+ common issues"
 - Create: `docs/operations.md`
 - Reference: `src/bastion/metrics.py` (metric names), `src/bastion/server.py` (admin endpoints)
 
-- [ ] **Step 1: Write docs/operations.md**
+- [x] **Step 1: Write docs/operations.md**
 
 ```markdown
 # Operations Guide
@@ -713,7 +713,7 @@ git commit -m "docs: add troubleshooting guide with 15+ common issues"
 [Explain gpu-profile.yaml: what it is, where it lives, how it's used, when to re-run]
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add docs/operations.md
@@ -728,7 +728,7 @@ git commit -m "docs: add operations guide for day-2 management"
 - Create: `docs/security.md`
 - Reference: `_archive/SECURITY.md` (original), `src/bastion/auth.py`, `src/bastion/ratelimit.py`
 
-- [ ] **Step 1: Write docs/security.md**
+- [x] **Step 1: Write docs/security.md**
 
 Rewrite from policy document to practical howto:
 
@@ -788,7 +788,7 @@ to only the bastion group. Step-by-step including group creation.]
 [File permissions for audit logs, rotation settings]
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add docs/security.md
@@ -803,7 +803,7 @@ git commit -m "docs: add practical security guide with hardening steps"
 - Modify: `CHANGELOG.md`
 - Modify: `docs/crash-prevention.md`
 
-- [ ] **Step 1: Rewrite CHANGELOG.md**
+- [x] **Step 1: Rewrite CHANGELOG.md**
 
 Remove session tags (S1-S14), internal references, and development-specific language. Keep version history clean:
 
@@ -861,7 +861,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Systemd service files and watchdog integration
 ```
 
-- [ ] **Step 2: Rewrite docs/crash-prevention.md**
+- [x] **Step 2: Rewrite docs/crash-prevention.md**
 
 Keep the excellent technical content but remove:
 - "Investigation Methodology" section (internal forensics)
@@ -876,7 +876,7 @@ Keep and clean:
 - "BASTION's Prevention Mechanisms" → keep all four mechanisms
 - "Monitoring: What to Watch" → keep as-is
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add CHANGELOG.md docs/crash-prevention.md
@@ -893,7 +893,7 @@ git commit -m "docs: clean changelog and crash prevention for public release"
 - Create: `src/bastion/gpu_profiles.py`
 - Create: `tests/test_gpu_profiles.py`
 
-- [ ] **Step 1: Write failing test for profile lookup**
+- [x] **Step 1: Write failing test for profile lookup**
 
 Create `tests/test_gpu_profiles.py`:
 
@@ -971,13 +971,13 @@ class TestGPUProfile:
         assert profile.notes is None
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_gpu_profiles.py -v`
 
 Expected: `ModuleNotFoundError: No module named 'bastion.gpu_profiles'`
 
-- [ ] **Step 3: Write GPU profile module**
+- [x] **Step 3: Write GPU profile module**
 
 Create `src/bastion/gpu_profiles.py`:
 
@@ -1154,13 +1154,13 @@ def lookup_profile(gpu_name: str) -> GPUProfile:
     return _DEFAULT_PROFILE
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_gpu_profiles.py -v`
 
 Expected: All tests PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bastion/gpu_profiles.py tests/test_gpu_profiles.py
@@ -1175,7 +1175,7 @@ git commit -m "feat: add GPU profile table with known-safe defaults for common N
 - Create: `src/bastion/validate.py`
 - Create: `tests/test_validate.py`
 
-- [ ] **Step 1: Write failing tests for individual checks**
+- [x] **Step 1: Write failing tests for individual checks**
 
 Create `tests/test_validate.py`:
 
@@ -1308,13 +1308,13 @@ class TestRunAllChecks:
         assert exit_code in (0, 1)
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_validate.py -v`
 
 Expected: `ModuleNotFoundError: No module named 'bastion.validate'`
 
-- [ ] **Step 3: Write validate.py**
+- [x] **Step 3: Write validate.py**
 
 Create `src/bastion/validate.py`:
 
@@ -1669,13 +1669,13 @@ def compute_exit_code(results: list[CheckResult]) -> int:
     return 0
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_validate.py -v`
 
 Expected: All tests PASS (some may skip in environments without GPU/Ollama)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bastion/validate.py tests/test_validate.py
@@ -1689,7 +1689,7 @@ git commit -m "feat: add pre-flight validator with 8-point system check"
 **Files:**
 - Modify: `src/bastion/__main__.py`
 
-- [ ] **Step 1: Add --validate flag to argparse**
+- [x] **Step 1: Add --validate flag to argparse**
 
 In `src/bastion/__main__.py`, add the argument after `--detect-models`:
 
@@ -1702,7 +1702,7 @@ In `src/bastion/__main__.py`, add the argument after `--detect-models`:
     )
 ```
 
-- [ ] **Step 2: Add handler before config loading**
+- [x] **Step 2: Add handler before config loading**
 
 After the `if args.detect_models:` block and before the `# Lazy import` comment, add:
 
@@ -1724,7 +1724,7 @@ After the `if args.detect_models:` block and before the `# Lazy import` comment,
         sys.exit(compute_exit_code(results))
 ```
 
-- [ ] **Step 3: Add `sys` import if not present**
+- [x] **Step 3: Add `sys` import if not present**
 
 The `sys` import is not currently in `__main__.py`. Add it to the imports at the top:
 
@@ -1734,13 +1734,13 @@ import sys
 
 (Note: `asyncio` is already imported.)
 
-- [ ] **Step 4: Test manually**
+- [x] **Step 4: Test manually**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m bastion --validate`
 
 Expected: Output showing PASS/WARN/FAIL for each check.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bastion/__main__.py
@@ -1757,7 +1757,7 @@ git commit -m "feat: wire bastion validate into CLI as --validate flag"
 - Create: `src/bastion/stress.py`
 - Create: `tests/test_stress.py`
 
-- [ ] **Step 1: Write failing tests for safety protocol and Phase 1/2**
+- [x] **Step 1: Write failing tests for safety protocol and Phase 1/2**
 
 Create `tests/test_stress.py`:
 
@@ -1889,13 +1889,13 @@ class TestSingleLoadPhase:
         assert "thermal_delta_c" in result.data
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_stress.py -v`
 
 Expected: `ModuleNotFoundError: No module named 'bastion.stress'`
 
-- [ ] **Step 3: Write stress.py with Phases 1 & 2**
+- [x] **Step 3: Write stress.py with Phases 1 & 2**
 
 Create `src/bastion/stress.py`:
 
@@ -2387,13 +2387,13 @@ def write_profile(result: CalibrationResult) -> Path:
     return dest
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_stress.py -v`
 
 Expected: All tests PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bastion/stress.py tests/test_stress.py
@@ -2407,7 +2407,7 @@ git commit -m "feat: add stress calibrator with 5-phase GPU testing and profile 
 **Files:**
 - Modify: `src/bastion/__main__.py`
 
-- [ ] **Step 1: Add --stress-test flag to argparse**
+- [x] **Step 1: Add --stress-test flag to argparse**
 
 In `src/bastion/__main__.py`, add after `--validate`:
 
@@ -2421,7 +2421,7 @@ In `src/bastion/__main__.py`, add after `--validate`:
     )
 ```
 
-- [ ] **Step 2: Add handler**
+- [x] **Step 2: Add handler**
 
 After the `if args.validate:` block, add:
 
@@ -2462,7 +2462,7 @@ After the `if args.validate:` block, add:
         sys.exit(0)
 ```
 
-- [ ] **Step 3: Add the async runner function**
+- [x] **Step 3: Add the async runner function**
 
 Add this function before `if __name__ == "__main__":`:
 
@@ -2605,13 +2605,13 @@ def _confirm_continue() -> bool:
         return False
 ```
 
-- [ ] **Step 4: Test that --stress-test flag is recognized**
+- [x] **Step 4: Test that --stress-test flag is recognized**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m bastion --help`
 
 Expected: `--stress-test` appears in the help output.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bastion/__main__.py
@@ -2625,7 +2625,7 @@ git commit -m "feat: wire stress-test into CLI with safety ceremony and phase co
 **Files:**
 - Modify: `src/bastion/config.py`
 
-- [ ] **Step 1: Write failing test for profile loading**
+- [x] **Step 1: Write failing test for profile loading**
 
 Add to `tests/test_validate.py` (or a new section in an existing config test file):
 
@@ -2654,11 +2654,11 @@ class TestGPUProfileLoading:
         assert profile is None
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run the test — expected: `ImportError` for `_load_gpu_profile`
 
-- [ ] **Step 3: Add profile loading to config.py**
+- [x] **Step 3: Add profile loading to config.py**
 
 In `src/bastion/config.py`, add after the imports:
 
@@ -2734,13 +2734,13 @@ def _apply_gpu_profile(config: BrokerConfig, profile: dict) -> None:
     logger.info("Applied calibrated GPU profile overrides")
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_validate.py::TestGPUProfileLoading -v`
 
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bastion/config.py tests/test_validate.py
@@ -2755,7 +2755,7 @@ git commit -m "feat: load calibrated GPU profile at startup to override defaults
 - Modify: `src/bastion/stress.py`
 - Modify: `src/bastion/__main__.py`
 
-- [ ] **Step 1: Add signal handling to _run_stress_test**
+- [x] **Step 1: Add signal handling to _run_stress_test**
 
 In `src/bastion/__main__.py`, wrap the `_run_stress_test` call with Ctrl+C handling:
 
@@ -2780,13 +2780,13 @@ This needs the import at the top of the handler:
         from bastion.stress import recovery_phase
 ```
 
-- [ ] **Step 2: Verify KeyboardInterrupt triggers recovery**
+- [x] **Step 2: Verify KeyboardInterrupt triggers recovery**
 
 This is inherently interactive — document for manual testing:
 
 Run `bastion --stress-test`, type 'I understand', wait for Phase 1 to start, then press Ctrl+C. Expected: "running recovery phase..." message, models unloaded, clean exit.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/bastion/__main__.py
@@ -2799,7 +2799,7 @@ git commit -m "feat: add Ctrl+C recovery handler to stress test"
 
 **Files:** None (verification only)
 
-- [ ] **Step 1: Run full test suite**
+- [x] **Step 1: Run full test suite**
 
 Print command for user:
 ```
@@ -2808,25 +2808,25 @@ Print command for user:
 
 Expected: All tests pass, including new tests in `test_gpu_profiles.py`, `test_validate.py`, and `test_stress.py`.
 
-- [ ] **Step 2: Verify CLI flags work**
+- [x] **Step 2: Verify CLI flags work**
 
 ```bash
 /home/cyprian/miniforge3/envs/phenotype/bin/python -m bastion --help
 /home/cyprian/miniforge3/envs/phenotype/bin/python -m bastion --validate
 ```
 
-- [ ] **Step 3: Verify documentation links**
+- [x] **Step 3: Verify documentation links**
 
 Check that all cross-references between docs resolve:
 - README links to all docs/*.md files
 - getting-started.md links to troubleshooting.md, configuration.md, hardware-guide.md
 - Each doc links back to README or related guides
 
-- [ ] **Step 4: Verify no internal references in public docs**
+- [x] **Step 4: Verify no internal references in public docs**
 
 Search all docs/ and README.md for: S1-S14, M58, RTX 5090, crash 7-9, session, forensic, investigation, cyprian (the user's name), SWARM_BRAIN, or any system-specific paths.
 
-- [ ] **Step 5: Final commit**
+- [x] **Step 5: Final commit**
 
 If any fixes were needed, commit them:
 ```bash

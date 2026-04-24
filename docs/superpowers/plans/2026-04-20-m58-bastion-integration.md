@@ -35,7 +35,7 @@
 - Modify: `config/broker.yaml` (add new sections)
 - Test: `tests/test_complexity_routing.py`
 
-- [ ] **Step 1: Write failing tests for config models**
+- [x] **Step 1: Write failing tests for config models**
 
 Create `tests/test_complexity_routing.py`:
 
@@ -98,12 +98,12 @@ class TestBrokerConfigWithComplexity:
         assert isinstance(c.thrashing_detection, ThrashingDetectionConfig)
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_complexity_routing.py -v`
 Expected: FAIL — `ImportError: cannot import name 'ComplexityRoutingConfig'`
 
-- [ ] **Step 3: Implement config models**
+- [x] **Step 3: Implement config models**
 
 In `src/bastion/models.py`, add after line 170 (after `RequestOverrides`):
 
@@ -141,12 +141,12 @@ In the `BrokerConfig` class (line 226), add two new fields after `request_overri
     thrashing_detection: ThrashingDetectionConfig = Field(default_factory=ThrashingDetectionConfig)
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_complexity_routing.py -v`
 Expected: 6 passed
 
-- [ ] **Step 5: Update broker.yaml with new config sections**
+- [x] **Step 5: Update broker.yaml with new config sections**
 
 Add to `config/broker.yaml` after the `request_overrides` section (after line 293):
 
@@ -175,12 +175,12 @@ thrashing_detection:
   min_requests_before_eval: 6       # don't judge until 6 requests seen
 ```
 
-- [ ] **Step 6: Run full test suite to check for regressions**
+- [x] **Step 6: Run full test suite to check for regressions**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_models.py tests/test_config.py tests/test_complexity_routing.py -v`
 Expected: all pass
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/bastion/models.py config/broker.yaml tests/test_complexity_routing.py
@@ -195,7 +195,7 @@ git commit -m "feat(m58): add ComplexityRoutingConfig and ThrashingDetectionConf
 - Create: `src/bastion/thrashing.py`
 - Test: `tests/test_thrashing.py`
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Create `tests/test_thrashing.py`:
 
@@ -377,12 +377,12 @@ class TestThrashingDetectorStats:
         assert det.total_halts >= 1
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_thrashing.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'bastion.thrashing'`
 
-- [ ] **Step 3: Implement ThrashingDetector**
+- [x] **Step 3: Implement ThrashingDetector**
 
 Create `src/bastion/thrashing.py`:
 
@@ -548,12 +548,12 @@ class ThrashingDetector:
         return swaps / (len(models) - 1)
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_thrashing.py -v`
 Expected: all pass
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bastion/thrashing.py tests/test_thrashing.py
@@ -567,7 +567,7 @@ git commit -m "feat(m58): add ThrashingDetector with per-agent sliding window"
 **Files:**
 - Modify: `src/bastion/audit.py` (line 27, add constant)
 
-- [ ] **Step 1: Add EVENT_THRASHING constant**
+- [x] **Step 1: Add EVENT_THRASHING constant**
 
 In `src/bastion/audit.py`, add after line 27 (`EVENT_REQUEST_COMPLETE`):
 
@@ -575,12 +575,12 @@ In `src/bastion/audit.py`, add after line 27 (`EVENT_REQUEST_COMPLETE`):
 EVENT_THRASHING = "thrashing"
 ```
 
-- [ ] **Step 2: Run existing audit tests**
+- [x] **Step 2: Run existing audit tests**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_audit.py tests/test_audit_tiered.py -v`
 Expected: all pass (no functional change)
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/bastion/audit.py
@@ -595,7 +595,7 @@ git commit -m "feat(m58): add EVENT_THRASHING audit constant"
 - Modify: `src/bastion/proxy.py` (lines 42-74 `__init__`, 131-284 `_handle_scheduled`, 375-416 `_stream_response`, 418-435 `_forward_response`)
 - Test: `tests/test_complexity_routing.py` (extend)
 
-- [ ] **Step 1: Write failing tests for proxy routing**
+- [x] **Step 1: Write failing tests for proxy routing**
 
 Append to `tests/test_complexity_routing.py`:
 
@@ -772,12 +772,12 @@ class TestComplexityRouting:
         assert captured["model"] == "qwen3:14b"
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_complexity_routing.py::TestComplexityRouting -v`
 Expected: FAIL — routing logic not implemented yet
 
-- [ ] **Step 3: Implement complexity routing in proxy.py**
+- [x] **Step 3: Implement complexity routing in proxy.py**
 
 In `src/bastion/proxy.py`:
 
@@ -923,17 +923,17 @@ After receiving the response:
         audit.emit(audit.EVENT_REQUEST_COMPLETE, audit_details)
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_complexity_routing.py -v`
 Expected: all pass
 
-- [ ] **Step 5: Run existing proxy tests for regressions**
+- [x] **Step 5: Run existing proxy tests for regressions**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_proxy.py -v`
 Expected: all pass
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/bastion/proxy.py tests/test_complexity_routing.py
@@ -948,7 +948,7 @@ git commit -m "feat(m58): add complexity routing, response headers, and audit en
 - Modify: `src/bastion/server.py` (lifespan ~line 499, `/broker/status` ~line 668)
 - Modify: `src/bastion/scheduler.py` (swap event recording ~line 534)
 
-- [ ] **Step 1: Wire detector in server.py lifespan**
+- [x] **Step 1: Wire detector in server.py lifespan**
 
 In `src/bastion/server.py`:
 
@@ -1001,7 +1001,7 @@ Note: the detector must be created before the proxy. Move the `_thrashing_detect
             result["thrashing_halts"] = _thrashing_detector.total_halts
 ```
 
-- [ ] **Step 2: Feed swap events from scheduler**
+- [x] **Step 2: Feed swap events from scheduler**
 
 In `src/bastion/scheduler.py`:
 
@@ -1027,7 +1027,7 @@ Actually, re-reading the spec more carefully: the thrashing detector's `record_r
 
 So this step simplifies to: **no scheduler changes needed**. The detector works purely from the request stream in the proxy.
 
-- [ ] **Step 3: Add record_request call in proxy**
+- [x] **Step 3: Add record_request call in proxy**
 
 In `src/bastion/proxy.py`, in `_handle_scheduled`, after the routing logic and before enqueueing (~before the `if self._enqueue_fn is not None:` block):
 
@@ -1073,12 +1073,12 @@ And in `_stream_response` and `_forward_response`, inject the warning header if 
             response_headers["X-Swap-Penalty-Warning"] = routing_meta["_thrashing_warn"]
 ```
 
-- [ ] **Step 4: Run all tests**
+- [x] **Step 4: Run all tests**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_complexity_routing.py tests/test_thrashing.py tests/test_proxy.py -v`
 Expected: all pass
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bastion/server.py src/bastion/scheduler.py src/bastion/proxy.py
@@ -1092,7 +1092,7 @@ git commit -m "feat(m58): wire ThrashingDetector into server lifespan and proxy 
 **Files:**
 - Modify: `src/bastion/proxy.py` (`_stream_response` generator)
 
-- [ ] **Step 1: Write failing test for streaming token capture**
+- [x] **Step 1: Write failing test for streaming token capture**
 
 Append to `tests/test_complexity_routing.py`:
 
@@ -1123,12 +1123,12 @@ class TestStreamingTokenCapture:
         assert tokens is None
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_complexity_routing.py::TestStreamingTokenCapture -v`
 Expected: FAIL — `_extract_streaming_tokens` not defined
 
-- [ ] **Step 3: Implement streaming token extraction**
+- [x] **Step 3: Implement streaming token extraction**
 
 In `src/bastion/proxy.py`, add a helper method to `OllamaProxy`:
 
@@ -1191,12 +1191,12 @@ Actually, a simpler approach: let the audit in `_handle_scheduled` fire without 
 
 For now, the `_extract_streaming_tokens` helper exists and works — it can be wired into audit in a future iteration.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_complexity_routing.py::TestStreamingTokenCapture -v`
 Expected: pass
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bastion/proxy.py tests/test_complexity_routing.py
@@ -1210,7 +1210,7 @@ git commit -m "feat(m58): add streaming token extraction helper for audit captur
 **Files:**
 - Test: `tests/test_complexity_routing.py` (extend with integration scenarios)
 
-- [ ] **Step 1: Add integration-style tests**
+- [x] **Step 1: Add integration-style tests**
 
 Append to `tests/test_complexity_routing.py`:
 
@@ -1297,17 +1297,17 @@ class TestThrashingIntegration:
         assert "thrashing" in body["error"].lower()
 ```
 
-- [ ] **Step 2: Run full test suite**
+- [x] **Step 2: Run full test suite**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_complexity_routing.py tests/test_thrashing.py -v`
 Expected: all pass
 
-- [ ] **Step 3: Run broader regression check**
+- [x] **Step 3: Run broader regression check**
 
 Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/ -v --timeout=30`
 Expected: all pass (or at least no new failures)
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tests/test_complexity_routing.py
@@ -1320,19 +1320,19 @@ git commit -m "test(m58): add integration tests for response headers and thrashi
 
 After all tasks are complete, verify against the spec:
 
-- [ ] `X-Task-Complexity: simple` routes to configured fast model
-- [ ] `X-Task-Complexity: moderate` routes to configured quality model
-- [ ] `X-Task-Complexity: complex` rejected with HTTP 422
-- [ ] Absent header = backward-compatible (client model used)
-- [ ] Invalid header value = ignored (client model used)
-- [ ] Routing disabled in config = no override
-- [ ] Response headers: `X-Model-Requested`, `X-Model-Routed`, `X-Routing-Reason`
-- [ ] Token count headers on non-streaming responses
-- [ ] Audit log captures `agent_id`, `task_complexity`, routing fields
-- [ ] `ThrashingDetector` warns at configured swap ratio
-- [ ] `ThrashingDetector` halts in strict mode at configured ratio
-- [ ] Cooloff timer works (reject during cooloff, accept after)
-- [ ] Multiple agents tracked independently
-- [ ] `/broker/status` includes `thrashing_warnings` and `thrashing_halts`
-- [ ] Config loads from `broker.yaml` with new sections
-- [ ] No regressions in existing test suite
+- [x] `X-Task-Complexity: simple` routes to configured fast model
+- [x] `X-Task-Complexity: moderate` routes to configured quality model
+- [x] `X-Task-Complexity: complex` rejected with HTTP 422
+- [x] Absent header = backward-compatible (client model used)
+- [x] Invalid header value = ignored (client model used)
+- [x] Routing disabled in config = no override
+- [x] Response headers: `X-Model-Requested`, `X-Model-Routed`, `X-Routing-Reason`
+- [x] Token count headers on non-streaming responses
+- [x] Audit log captures `agent_id`, `task_complexity`, routing fields
+- [x] `ThrashingDetector` warns at configured swap ratio
+- [x] `ThrashingDetector` halts in strict mode at configured ratio
+- [x] Cooloff timer works (reject during cooloff, accept after)
+- [x] Multiple agents tracked independently
+- [x] `/broker/status` includes `thrashing_warnings` and `thrashing_halts`
+- [x] Config loads from `broker.yaml` with new sections
+- [x] No regressions in existing test suite
