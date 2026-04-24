@@ -172,6 +172,7 @@ Per-IP rate limiting.
 | `enabled` | bool | `false` | Enable rate limiting |
 | `requests_per_minute` | int | `60` | Sustained request rate per IP |
 | `burst` | int | `10` | Burst allowance above sustained rate |
+| `trusted_proxies` | list[str] | `[]` | Reverse-proxy IPs from which `X-Forwarded-For` is honored. If empty, the socket peer address is used regardless of the header — preventing rate-limit bypass via header spoofing. Example: `["10.0.0.1"]`. |
 
 ### circuit_breaker
 

@@ -77,7 +77,15 @@ class TestRateLimitEnabled:
         assert retry_after >= 1
 
     def test_different_ips_get_separate_buckets(self) -> None:
-        config = RateLimitConfig(enabled=True, requests_per_minute=60, burst=2)
+        # TestClient's socket peer is "testclient" — add it to trusted_proxies
+        # so that X-Forwarded-For is honored and each distinct XFF IP gets
+        # its own bucket.
+        config = RateLimitConfig(
+            enabled=True,
+            requests_per_minute=60,
+            burst=2,
+            trusted_proxies=["testclient"],
+        )
         client = _make_app(config)
 
         # Exhaust bucket for IP "10.0.0.1"
@@ -101,3 +109,34 @@ class TestRateLimitEnabled:
             headers={"X-Forwarded-For": "10.0.0.2"},
         )
         assert resp.status_code == 200
+
+
+def test_xff_ignored_when_no_trusted_proxies() -> None:
+    from bastion.ratelimit import RateLimitConfig, RateLimitMiddleware
+    from starlette.requests import Request
+
+    config = RateLimitConfig(enabled=True, trusted_proxies=[])
+    mw = RateLimitMiddleware(app=None, config=config)
+
+    scope = {
+        "type": "http",
+        "headers": [(b"x-forwarded-for", b"10.0.0.99")],
+        "client": ("192.168.1.50", 1234),
+    }
+    ip = mw._get_client_ip(Request(scope))
+    assert ip == "192.168.1.50"  # socket peer, not XFF
+
+
+def test_xff_used_when_peer_is_trusted_proxy() -> None:
+    from bastion.ratelimit import RateLimitConfig, RateLimitMiddleware
+    from starlette.requests import Request
+
+    config = RateLimitConfig(enabled=True, trusted_proxies=["192.168.1.50"])
+    mw = RateLimitMiddleware(app=None, config=config)
+    scope = {
+        "type": "http",
+        "headers": [(b"x-forwarded-for", b"10.0.0.99")],
+        "client": ("192.168.1.50", 1234),
+    }
+    ip = mw._get_client_ip(Request(scope))
+    assert ip == "10.0.0.99"  # XFF accepted because peer is trusted

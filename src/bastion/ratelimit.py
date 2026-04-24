@@ -21,7 +21,7 @@ from collections.abc import Callable
 
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
 logger = logging.getLogger(__name__)
@@ -33,6 +33,7 @@ class RateLimitConfig(BaseModel):
     enabled: bool = False
     requests_per_minute: int = 60
     burst: int = 10
+    trusted_proxies: list[str] = Field(default_factory=list)
 
 
 class _TokenBucket:
@@ -102,23 +103,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     def _get_client_ip(self, request: Request) -> str:
         """Extract client IP from the request.
 
-        Parameters
-        ----------
-        request : Request
-            Incoming request.
-
-        Returns
-        -------
-        str
-            Client IP address (falls back to "unknown" if unavailable).
+        When the request's socket peer is listed in ``trusted_proxies``, use
+        the first entry of the ``X-Forwarded-For`` header. Otherwise, use
+        the socket peer directly — ignoring any ``X-Forwarded-For`` header
+        sent by untrusted clients.
         """
-        # Prefer X-Forwarded-For for reverse-proxy setups
-        forwarded = request.headers.get("X-Forwarded-For")
-        if forwarded:
-            return forwarded.split(",")[0].strip()
-        if request.client:
-            return request.client.host
-        return "unknown"
+        peer_ip = request.client.host if request.client else "unknown"
+        trusted = frozenset(self._config.trusted_proxies)
+        if peer_ip in trusted:
+            forwarded = request.headers.get("X-Forwarded-For")
+            if forwarded:
+                return forwarded.split(",")[0].strip()
+        return peer_ip
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         """Apply rate limiting per client IP.
