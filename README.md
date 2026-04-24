@@ -205,6 +205,7 @@ mode, `r` manual refresh, `h` help overlay, `q` quit.
 | [Crash Prevention](docs/crash-prevention.md) | How BASTION prevents GPU crashes |
 | [API Reference](docs/api.md) | All endpoints with examples |
 | [Deployment](docs/deployment.md) | Systemd, Docker, desktop launcher |
+| [Releasing](docs/releasing.md) | One-time PyPI/OIDC setup and release cut procedure |
 
 ## Optional Extras
 
