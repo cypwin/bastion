@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `--validate` CLI flag for pre-flight system checks (Python, GPU, Ollama, config, permissions)
 - `--stress-test` CLI flag for GPU stress calibration with 5-phase ramp-up
-- GPU profile table (`gpu_profiles.py`) with known-safe defaults for 13 NVIDIA GPUs
+- GPU profile table (`gpu_profiles.py`) with known-safe defaults for 13 named NVIDIA GPUs + a conservative fallback
 - Calibrated GPU profile loading at startup (`gpu-profile.yaml`)
 - Documentation suite: getting-started, hardware guide, configuration reference, troubleshooting, operations, security
 

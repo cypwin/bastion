@@ -117,12 +117,17 @@ ollama run llama3.1:8b "Hello, world!"    # Transparent proxy
   with `nvidia-smi` data. Enforces a configurable budget and blocks model
   loads that would exceed it.
 
-- **Crash prevention** -- injects `use_mmap: false` into every Ollama API
-  request, enforces cooldown periods between model transitions, and rate-limits
-  model swap frequency.
+- **Crash prevention** -- BASTION injects `use_mmap: false` into scheduled
+  inference requests (`/api/generate`, `/api/chat`, `/api/embed`) when the
+  client hasn't specified `use_mmap` explicitly. This mitigates PCIe power
+  transients that crashed RTX 5090 during mmap-backed model cycling.
+  Passthrough endpoints (`/api/pull`, `/api/show`, `/api/tags`, etc.) forward
+  unchanged. Cooldown periods between model transitions and swap-rate limiting
+  provide additional protection.
 
-- **14-panel TUI dashboard** -- real-time Textual dashboard showing GPU
-  thermals, VRAM usage, queue depth, scheduler state, and more.
+- **17-panel TUI dashboard** -- real-time Textual dashboard showing GPU
+  thermals, VRAM usage, queue depth, scheduler state, A2A tasks, leases, audit
+  events, and more.
 
 - **A2A protocol support** -- Agent-to-Agent protocol with agent card
   discovery, task lifecycle, batch inference, and model reservation leases.

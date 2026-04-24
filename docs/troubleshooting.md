@@ -191,22 +191,21 @@ Valid tiers: `interactive` (100), `agent` (50), `pipeline` (25), `background` (1
 
 ## Authentication and Rate Limiting
 
-### Auth failures (401/403)
+### Auth failures (401 Unauthorized)
 
-**Symptom:** Requests return `401 Unauthorized` or `403 Forbidden`.
+**Symptom:** Requests return `401 Unauthorized`.
 
 **Cause:** Authentication is enabled but the request lacks a valid API key.
 
-**Fix:**
+**Fix:** Set the `Authorization: Bearer <your-api-key>` header on every
+request. BASTION does not support query-parameter authentication.
 
-1. Include the API key in requests:
-   ```bash
-   curl http://localhost:11434/broker/status \
-     -H "Authorization: Bearer your-api-key"
-   ```
-2. Or via query parameter: `?api_key=your-api-key`
-3. Check `auth.api_keys` in your `broker.yaml` matches the key you are using
-4. To disable auth: set `auth.enabled: false` in config
+```bash
+curl -H "Authorization: Bearer your-api-key" http://localhost:11434/broker/status
+```
+
+1. Check `auth.api_keys` in your `broker.yaml` matches the key you are using
+2. To disable auth: set `auth.enabled: false` in config
 
 ### Rate limited (429 responses)
 

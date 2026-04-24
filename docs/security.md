@@ -70,11 +70,7 @@ server:
   host: "127.0.0.1"    # only accessible from this machine
 ```
 
-Or via environment variable:
-
-```bash
-BASTION_HOST=127.0.0.1 bastion
-```
+Or pass `--host 127.0.0.1` on the command line.
 
 #### nftables port lockdown
 
@@ -209,7 +205,8 @@ audit:
 
 ## Supported Versions
 
-| Version | Supported |
-|---------|-----------|
-| 0.3.x   | Yes       |
-| < 0.3   | No        |
+| Version | Supported          |
+| ------- | ------------------ |
+| 0.4.x   | :white_check_mark: |
+| 0.3.x   | :white_check_mark: |
+| < 0.3   | :x:                |

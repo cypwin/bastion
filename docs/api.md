@@ -79,6 +79,20 @@ Returns `"Ollama is running"` -- mimics Ollama's root response for client compat
 
 ---
 
+## OpenAI-compatible passthrough — `/v1/*`
+
+All `/v1/*` paths are proxied to Ollama's OpenAI-compatibility layer.
+Subject to the same auth and rate-limit behavior as `/api/*`. Examples:
+- `GET /v1/models` — list models
+- `POST /v1/chat/completions` — chat completion
+- `POST /v1/completions` — text completion
+- `POST /v1/embeddings` — embedding generation
+
+See the [Ollama OpenAI compatibility docs](https://github.com/ollama/ollama/blob/main/docs/openai.md)
+for request/response shapes.
+
+---
+
 ## Admin Routes (`/broker/*`)
 
 Broker management and monitoring. Protected by API key auth when `auth.enabled: true` in config.
@@ -602,6 +616,21 @@ curl -X DELETE http://localhost:11434/a2a/tasks/a1b2c3d4e5f6
 **Response:**
 ```json
 {"status": "canceled", "task_id": "a1b2c3d4e5f6"}
+```
+
+### Task Store Statistics
+
+#### `GET /a2a/stats`
+
+Returns task-store statistics:
+
+```json
+{
+  "active": 3,
+  "compacted": 12,
+  "total_created": 150,
+  "backpressure": "normal"
+}
 ```
 
 ### Lease Management
