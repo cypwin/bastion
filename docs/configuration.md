@@ -230,6 +230,23 @@ A2A (Agent-to-Agent) interface.
 | `task_ttl_seconds` | float | `3600.0` | Completed task retention (1 hour) |
 | `max_batch_size` | int | `50` | Max prompts per batch_infer |
 
+### session_profiles
+
+Declare recurring workload patterns that BASTION can pre-reserve VRAM
+and queue slots for. Referenced by `/broker/intent` to declare a
+session up front:
+
+```yaml
+session_profiles:
+  council_run:
+    models: ["llama3.1:8b", "qwen2.5:7b", "gemma2:9b"]
+    total_requests: 30
+    peak_concurrency: 3
+    duration_seconds: 600
+```
+
+See `docs/api.md` (`POST /broker/intent`) for runtime usage.
+
 ### complexity_routing
 
 Complexity-based model routing.
