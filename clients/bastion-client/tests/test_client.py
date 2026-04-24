@@ -111,11 +111,12 @@ class TestPriorityHeaderInjection:
             "done": True,
         }
 
-        client._client.post = AsyncMock(return_value=mock_response)
+        # infer() calls _request_with_retry which uses _client.request(method, url, ...)
+        client._client.request = AsyncMock(return_value=mock_response)
 
         result = await client.infer("test-model", "hello")
 
-        call_kwargs = client._client.post.call_args
+        call_kwargs = client._client.request.call_args
         headers = call_kwargs.kwargs.get("headers", {})
         assert headers["X-Broker-Priority"] == "pipeline"
         assert result["response"] == "hello"
@@ -134,11 +135,11 @@ class TestPriorityHeaderInjection:
             "done": True,
         }
 
-        client._client.post = AsyncMock(return_value=mock_response)
+        client._client.request = AsyncMock(return_value=mock_response)
 
         await client.infer("test-model", "test", tier="interactive")
 
-        call_kwargs = client._client.post.call_args
+        call_kwargs = client._client.request.call_args
         headers = call_kwargs.kwargs.get("headers", {})
         assert headers["X-Broker-Priority"] == "interactive"
 
@@ -152,11 +153,11 @@ class TestPriorityHeaderInjection:
         mock_response.raise_for_status = MagicMock()
         mock_response.json.return_value = {"model": "m", "response": "", "done": True}
 
-        client._client.post = AsyncMock(return_value=mock_response)
+        client._client.request = AsyncMock(return_value=mock_response)
 
         await client.infer("m", "test", tier="council")
 
-        call_kwargs = client._client.post.call_args
+        call_kwargs = client._client.request.call_args
         headers = call_kwargs.kwargs.get("headers", {})
         assert headers["X-Broker-Priority"] == "interactive"
 
@@ -174,11 +175,11 @@ class TestPriorityHeaderInjection:
             "done": True,
         }
 
-        client._client.post = AsyncMock(return_value=mock_response)
+        client._client.request = AsyncMock(return_value=mock_response)
 
         await client.infer("qwen3:14b", "What is 2+2?")
 
-        call_kwargs = client._client.post.call_args
+        call_kwargs = client._client.request.call_args
         body = call_kwargs.kwargs.get("json", {})
         assert body["model"] == "qwen3:14b"
         assert body["prompt"] == "What is 2+2?"
