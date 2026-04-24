@@ -30,11 +30,27 @@ class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 11434  # Standard Ollama port — clients connect here
     admin_port: int = 0  # Separate admin+A2A port (0 = disabled, same port as proxy)
+    public_url: str | None = None  # Full external URL for A2A agent card advertisement
 
     @property
     def two_port_mode(self) -> bool:
         """True when admin traffic should be on a separate port."""
         return self.admin_port > 0 and self.admin_port != self.port
+
+    @property
+    def external_url(self) -> str:
+        """Return the URL to advertise in agent cards.
+
+        If ``public_url`` is set (e.g. when running behind a reverse proxy),
+        it is used verbatim (trailing slash stripped).  Otherwise falls back to
+        ``http://localhost:<port>`` — using ``localhost`` even when the bind
+        address is ``0.0.0.0`` or ``::`` since the actual listener address is
+        not known at config time.
+        """
+        if self.public_url:
+            return self.public_url.rstrip("/")
+        host = "localhost" if self.host in ("0.0.0.0", "::") else self.host
+        return f"http://{host}:{self.port}"
 
 
 class GPUConfig(BaseModel):
