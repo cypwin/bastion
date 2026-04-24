@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 from bastion.config import load_config
@@ -32,11 +33,11 @@ class TestLoadConfig:
         assert config.ollama.port == 9999
         assert config.server.port == 8888
 
-    def test_missing_explicit_path_falls_back(self, tmp_path, monkeypatch):
-        """If explicit path doesn't exist, fall back to defaults."""
+    def test_missing_explicit_path_raises(self, tmp_path, monkeypatch):
+        """If an explicit path is given but doesn't exist, raise FileNotFoundError."""
         monkeypatch.chdir(tmp_path)
-        config = load_config(tmp_path / "nonexistent.yaml")
-        assert isinstance(config, BrokerConfig)
+        with pytest.raises(FileNotFoundError, match="nonexistent.yaml"):
+            load_config(tmp_path / "nonexistent.yaml")
 
     def test_models_section_parsed(self, tmp_path):
         """Models section converts dicts to ModelInfo objects."""

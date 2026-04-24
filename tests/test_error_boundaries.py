@@ -78,11 +78,11 @@ class TestInvalidConfig:
         config = load_config(path)
         assert config.server.port == 8080
 
-    def test_missing_config_file_returns_defaults(self, tmp_path: Path, monkeypatch) -> None:
-        """When config file doesn't exist, returns defaults."""
+    def test_missing_config_file_raises(self, tmp_path: Path, monkeypatch) -> None:
+        """When an explicit config path doesn't exist, raise FileNotFoundError."""
         monkeypatch.chdir(tmp_path)
-        config = load_config(tmp_path / "nonexistent.yaml")
-        assert isinstance(config, BrokerConfig)
+        with pytest.raises(FileNotFoundError, match="nonexistent.yaml"):
+            load_config(tmp_path / "nonexistent.yaml")
 
 
 # ---------------------------------------------------------------------------
