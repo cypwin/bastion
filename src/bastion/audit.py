@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import logging.handlers
+from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -140,6 +141,15 @@ def build_audit_event(
     return entry
 
 
+# Ring buffer of recent audit events (newest last, capped at 50)
+_recent_events: deque = deque(maxlen=50)
+
+
+def recent_events(limit: int = 10) -> list[dict]:
+    """Return the most recent audit events, newest last."""
+    return list(_recent_events)[-limit:]
+
+
 class AuditLogger:
     """Structured JSON-lines audit logger with rotation.
 
@@ -202,6 +212,7 @@ class AuditLogger:
             "event": event,
             "details": details,
         }
+        _recent_events.append(entry)
         self.logger.info(json.dumps(entry))
 
     def emit_tiered(
@@ -250,6 +261,7 @@ class AuditLogger:
             prompt=prompt,
             response=response,
         )
+        _recent_events.append(entry)
         self.logger.info(json.dumps(entry))
 
 

@@ -740,6 +740,15 @@ def create_app(config: BrokerConfig) -> FastAPI:
             result["thrashing_warnings"] = _thrashing_detector.total_warnings
             result["thrashing_halts"] = _thrashing_detector.total_halts
 
+        # A2A + lease snapshot (dashboard panels)
+        if _a2a_handler:
+            snap = _a2a_handler.get_snapshot()
+            result["a2a_summary"] = snap["summary"]
+            result["a2a_tasks"] = snap["tasks"]
+            result["active_leases"] = snap["leases"]
+        # Recent audit events for AuditStreamPanel
+        result["recent_audit_events"] = audit.recent_events(10)
+
         return result
 
     @broker_router.get("/queue")
@@ -1422,6 +1431,15 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
         if _thrashing_detector:
             result["thrashing_warnings"] = _thrashing_detector.total_warnings
             result["thrashing_halts"] = _thrashing_detector.total_halts
+
+        # A2A + lease snapshot (dashboard panels)
+        if _a2a_handler:
+            snap = _a2a_handler.get_snapshot()
+            result["a2a_summary"] = snap["summary"]
+            result["a2a_tasks"] = snap["tasks"]
+            result["active_leases"] = snap["leases"]
+        # Recent audit events for AuditStreamPanel
+        result["recent_audit_events"] = audit.recent_events(10)
 
         return result
 

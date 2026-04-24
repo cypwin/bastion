@@ -1587,6 +1587,54 @@ class A2AHandler:
                 return True
         return False
 
+    def get_snapshot(self, max_tasks: int = 5, max_leases: int = 5) -> dict:
+        """Return a compact snapshot of current A2A state for dashboards.
+
+        Returns
+        -------
+        dict
+            {
+              "summary": {"total": int, "submitted": int, "working": int,
+                          "completed": int, "failed": int, "canceled": int},
+              "tasks": [{"task_id": str, "state": str, "skill_id": str,
+                         "model": str}, ...],  # most recent first, up to max_tasks
+              "leases": [{"lease_id": str, "model": str, "state": str,
+                          "remaining_requests": int,
+                          "ttl_remaining": float}, ...]  # up to max_leases
+            }
+        """
+        states = ["submitted", "working", "completed", "failed", "canceled"]
+        summary: dict[str, int] = {s: self._store.count_by_state(s) for s in states}
+        summary["total"] = sum(summary.values())
+
+        # Most-recent active tasks
+        active = self._store.list_active()[:max_tasks]
+        tasks = [
+            {
+                "task_id": r.task_id,
+                "state": r.state.value,
+                "skill_id": r.skill_id,
+                "model": (r.input_params or {}).get("model", ""),
+            }
+            for r in active
+        ]
+
+        leases_snapshot: list[dict] = []
+        now = time.monotonic()
+        for lease in list(self._leases.values())[:max_leases]:
+            state_val = lease.state.value if hasattr(lease.state, "value") else str(lease.state)
+            leases_snapshot.append(
+                {
+                    "lease_id": lease.lease_id,
+                    "model": lease.model,
+                    "state": state_val,
+                    "remaining_requests": lease.remaining_requests,
+                    "ttl_remaining": max(0.0, lease.expiry - now),
+                }
+            )
+
+        return {"summary": summary, "tasks": tasks, "leases": leases_snapshot}
+
     async def _cleanup_expired_reservations(self) -> None:
         """Periodically clean up expired reservations and leases.
 
