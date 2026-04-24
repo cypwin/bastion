@@ -183,9 +183,11 @@ ollama run llama3.1:8b "Hello, world!"    # Transparent proxy
 ## Dashboard
 
 ```bash
-python -m bastion.dashboard
-python -m bastion.dashboard --url http://localhost:11434 --interval 2.0
+bastion-dashboard
+bastion-dashboard --url http://localhost:11434 --interval 2.0
 ```
+
+(Or: `python -m bastion.dashboard` / `python -m bastion.dashboard --url http://localhost:11434 --interval 2.0`)
 
 **Keyboard shortcuts:** `p` preload model, `u` unload model, `d` toggle drain
 mode, `r` manual refresh, `h` help overlay, `q` quit.
