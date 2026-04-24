@@ -53,6 +53,7 @@ BASTION server settings.
 | `host` | string | `"0.0.0.0"` | Bind address |
 | `port` | int | `11434` | Listen port (standard Ollama port) |
 | `admin_port` | int | `0` | Admin+A2A port. `0` = disabled (single-port mode). Set to a different port to enable two-port mode. |
+| `public_url` | string | `null` | Full external URL for A2A agent card advertisement. Use when BASTION runs behind a reverse proxy or on a specific IP and you want third-party agents to discover the correct endpoint. Defaults to `http://localhost:<port>` when unset. |
 
 ### gpu
 

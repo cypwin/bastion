@@ -1686,9 +1686,9 @@ class A2AHandler:
         card: dict[str, Any] = {
             "name": "BASTION GPU Inference Broker",
             "description": "GPU inference broker with scheduling, batching, and model management",
-            "url": f"http://localhost:{self._config.server.port}",
+            "url": self._config.server.external_url,
             "version": __import__("bastion").__version__,
-            "serviceEndpoint": f"http://localhost:{self._config.server.port}/a2a",
+            "serviceEndpoint": f"{self._config.server.external_url}/a2a",
             "protocolVersion": "0.1",
             "capabilities": {
                 "streaming": True,
@@ -1751,9 +1751,9 @@ class A2AHandler:
         card: dict[str, Any] = {
             "name": "BASTION GPU Inference Broker",
             "description": "GPU inference broker with scheduling, batching, and model management",
-            "url": f"http://localhost:{self._config.server.port}",
+            "url": self._config.server.external_url,
             "version": __import__("bastion").__version__,
-            "serviceEndpoint": f"http://localhost:{self._config.server.port}/a2a",
+            "serviceEndpoint": f"{self._config.server.external_url}/a2a",
             "protocolVersion": "0.1",
             "capabilities": {
                 "streaming": True,

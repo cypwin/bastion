@@ -1176,3 +1176,42 @@ def test_public_agent_card_skill_ids_match_routing(a2a_handler):
     assert advertised.issubset(real_ids), f"unexpected skills: {advertised - real_ids}"
     # At least the core two must be advertised
     assert "infer" in advertised
+
+
+# ---------------------------------------------------------------------------
+# Agent Card URL / public_url Tests
+# ---------------------------------------------------------------------------
+
+def test_agent_card_uses_public_url_when_set(a2a_handler):
+    """Public card uses public_url when configured (proxy/external-IP scenario)."""
+    a2a_handler._config.server.public_url = "https://api.example.com"
+    card = a2a_handler.build_public_card()
+    assert card["url"] == "https://api.example.com"
+    assert card["serviceEndpoint"] == "https://api.example.com/a2a"
+
+
+def test_agent_card_strips_trailing_slash_from_public_url(a2a_handler):
+    """public_url trailing slash is stripped so serviceEndpoint path is not doubled."""
+    a2a_handler._config.server.public_url = "https://api.example.com/"
+    card = a2a_handler.build_public_card()
+    assert card["url"] == "https://api.example.com"
+    assert card["serviceEndpoint"] == "https://api.example.com/a2a"
+
+
+def test_agent_card_falls_back_to_host_port_when_no_public_url(a2a_handler):
+    """Without public_url, card URL uses localhost fallback (0.0.0.0 → localhost)."""
+    a2a_handler._config.server.public_url = None
+    a2a_handler._config.server.host = "0.0.0.0"
+    a2a_handler._config.server.port = 11434
+    card = a2a_handler.build_public_card()
+    assert card["url"].endswith("11434")
+    assert "localhost" in card["url"]
+
+
+@pytest.mark.asyncio
+async def test_extended_agent_card_uses_public_url(a2a_handler):
+    """Extended card also uses public_url when configured."""
+    a2a_handler._config.server.public_url = "https://api.example.com"
+    ext = await a2a_handler.build_extended_card()
+    assert ext["url"] == "https://api.example.com"
+    assert ext["serviceEndpoint"] == "https://api.example.com/a2a"
