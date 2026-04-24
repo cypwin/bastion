@@ -1,38 +1,40 @@
-"""Minimal BASTION client example using httpx.
+"""BASTION Python client — basic usage example.
 
-Shows how to call BASTION's Ollama-compatible /api/chat endpoint
-without installing any BASTION-specific client package.
+Prerequisites:
+    # Until bastion-client is published to PyPI, install from source:
+    pip install ./clients/bastion-client/
+
+    Then run from anywhere (BASTION_URL env var optional, defaults to
+    http://127.0.0.1:11434).
+
+Make sure BASTION is running and a model is available
+(e.g., ollama pull llama3.1:8b).
 """
 from __future__ import annotations
 
-import os
+import asyncio
 
-import httpx
-
-BASTION_URL = os.environ.get("BASTION_URL", "http://127.0.0.1:11434")
-# If auth is enabled, set BASTION_API_KEY in the environment or edit here.
-API_KEY: str | None = os.environ.get("BASTION_API_KEY")
+from bastion_client import BastionClient
 
 
-def chat(model: str, prompt: str) -> str:
-    headers: dict[str, str] = {}
-    if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
-    with httpx.Client(timeout=120.0) as client:
-        resp = client.post(
-            f"{BASTION_URL}/api/chat",
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-            },
-            headers=headers,
+async def main() -> None:
+    async with BastionClient() as client:
+        # Check GPU/VRAM status
+        vram = await client.check_vram()
+        print(f"VRAM: {vram.used_vram_gb:.1f}/{vram.total_vram_gb:.1f} GB")
+        print(f"Utilization: {vram.utilization_pct:.0f}%")
+        print(f"Loaded models: {vram.loaded_models}")
+        print()
+
+        # Run inference with interactive priority
+        print("Sending inference request...")
+        result = await client.infer(
+            "llama3.1:8b",
+            "Explain what a GPU broker does in one sentence.",
+            tier="interactive",
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["message"]["content"]
+        print(f"Response: {result['response']}")
 
 
 if __name__ == "__main__":
-    out = chat("llama3.1:8b", "Say hi in one sentence.")
-    print(out)
+    asyncio.run(main())
