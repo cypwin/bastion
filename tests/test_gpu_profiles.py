@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from bastion.gpu_profiles import GPUProfile, lookup_profile
 
 

@@ -1,7 +1,7 @@
 """Trace, A2A task, lease, and audit stream panels."""
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 from rich.table import Table

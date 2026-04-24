@@ -39,7 +39,7 @@ def test_banner_warns_when_auth_enabled_but_no_keys():
     cfg.server = ServerConfig(host="0.0.0.0")
     cfg.auth = AuthConfig(enabled=True, api_keys=[])
     lines = _security_banner_lines(cfg)
-    assert any("no api_keys configured" in l.lower() for l in lines)
+    assert any("no api_keys configured" in line.lower() for line in lines)
 
 
 def test_banner_warns_on_empty_a2a_tokens():

@@ -112,8 +112,9 @@ class TestRateLimitEnabled:
 
 
 def test_xff_ignored_when_no_trusted_proxies() -> None:
-    from bastion.ratelimit import RateLimitConfig, RateLimitMiddleware
     from starlette.requests import Request
+
+    from bastion.ratelimit import RateLimitConfig, RateLimitMiddleware
 
     config = RateLimitConfig(enabled=True, trusted_proxies=[])
     mw = RateLimitMiddleware(app=None, config=config)
@@ -128,8 +129,9 @@ def test_xff_ignored_when_no_trusted_proxies() -> None:
 
 
 def test_xff_used_when_peer_is_trusted_proxy() -> None:
-    from bastion.ratelimit import RateLimitConfig, RateLimitMiddleware
     from starlette.requests import Request
+
+    from bastion.ratelimit import RateLimitConfig, RateLimitMiddleware
 
     config = RateLimitConfig(enabled=True, trusted_proxies=["192.168.1.50"])
     mw = RateLimitMiddleware(app=None, config=config)

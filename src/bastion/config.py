@@ -336,7 +336,8 @@ def _find_config(explicit_path: Path | None) -> Path | None:
             return explicit_path
         raise FileNotFoundError(
             f"Config file not found: {explicit_path}. "
-            "Mount your broker.yaml at /etc/bastion/broker.yaml or pass --config /path/to/broker.yaml. "
+            "Mount your broker.yaml at /etc/bastion/broker.yaml "
+            "or pass --config /path/to/broker.yaml. "
             "Template: https://github.com/cyprian-w/bastion/blob/main/config/broker.example.yaml"
         )
 

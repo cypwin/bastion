@@ -13,6 +13,7 @@ Default locations (Linux):
 
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 
@@ -74,8 +75,6 @@ def harden_audit_log() -> None:
     path = Path(audit_log_path())
     if not path.exists():
         return
-    try:
+    # Best-effort; failure to chmod should not crash the service.
+    with contextlib.suppress(OSError):
         os.chmod(path, 0o600)
-    except OSError:
-        # Best-effort; failure to chmod should not crash the service.
-        pass
