@@ -284,7 +284,11 @@ def main() -> None:
     from bastion.config import load_config
     from bastion.server import create_app
 
-    config = load_config(args.config)
+    try:
+        config = load_config(args.config)
+    except FileNotFoundError as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
 
     # CLI overrides take precedence over config file
     host = args.host or config.server.host
