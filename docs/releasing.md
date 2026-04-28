@@ -74,22 +74,23 @@ No PyPI account, no trusted-publishing setup, no network upload needed.
 
 ```bash
 cd clients/bastion-client
+VER=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
 python -m build
 ```
 
 ### Expected outputs
 
-`dist/` will contain two artifacts:
+`dist/` will contain two artifacts (with `$VER` substituted from `pyproject.toml`):
 
-- `bastion_client-0.2.0-py3-none-any.whl` — the wheel
-- `bastion_client-0.2.0.tar.gz` — the sdist
+- `bastion_client-${VER}-py3-none-any.whl` — the wheel
+- `bastion_client-${VER}.tar.gz` — the sdist
 
 ### Sanity checks
 
 Confirm the wheel contains the expected modules:
 
 ```bash
-python -m zipfile -l dist/bastion_client-0.2.0-py3-none-any.whl
+python -m zipfile -l dist/bastion_client-${VER}-py3-none-any.whl
 ```
 
 Expected: entries for `bastion_client/__init__.py`, `bastion_client/client.py`,
@@ -98,13 +99,16 @@ Expected: entries for `bastion_client/__init__.py`, `bastion_client/client.py`,
 Install the wheel into a clean virtualenv and import it:
 
 ```bash
-python -m venv /tmp/bc-test && source /tmp/bc-test/bin/activate
-pip install dist/bastion_client-0.2.0-py3-none-any.whl
+python -m venv /tmp/bc-test
+source /tmp/bc-test/bin/activate
+pip install dist/bastion_client-${VER}-py3-none-any.whl
 python -c "from bastion_client import BastionClient; print(BastionClient)"
-deactivate && rm -rf /tmp/bc-test
+deactivate
+rm -rf /tmp/bc-test
 ```
 
-Expected: install succeeds, the `print` shows the class object.
+Expected: install succeeds, the `print` shows the class object. Cleanup runs
+unconditionally, so a stale venv won't be left behind if `deactivate` fails.
 
 ### Cleanup
 
