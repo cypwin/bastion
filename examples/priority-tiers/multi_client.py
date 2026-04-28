@@ -5,8 +5,9 @@ Interactive requests are served before pipeline and background,
 even when submitted at the same time.
 
 Prerequisites:
-    # Until bastion-client is published to PyPI, install from source:
-    pip install ./clients/bastion-client/
+    # Until bastion-client is published to PyPI, install from source
+    # (path is relative to this example's directory):
+    pip install ../../clients/bastion-client/
 
 Make sure BASTION is running on localhost:11434 and a model is available
 (e.g., ollama pull llama3.1:8b).

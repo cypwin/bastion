@@ -1,8 +1,9 @@
 """BASTION Python client — basic usage example.
 
 Prerequisites:
-    # Until bastion-client is published to PyPI, install from source:
-    pip install ./clients/bastion-client/
+    # Until bastion-client is published to PyPI, install from source
+    # (path is relative to this example's directory):
+    pip install ../../clients/bastion-client/
 
     Then run from anywhere (BASTION_URL env var optional, defaults to
     http://127.0.0.1:11434).
