@@ -57,3 +57,8 @@ CRASH_most_recent_chat.md
 BASTION_LLM_INVENTORY.md
 QUERIES_DRs.txt
 TO_ADD_TO_DASHBOARD_BUTTONS_OPTION_TO_OPEN_NEW_TMUX.txt
+
+# Personal / interview / session artifacts (never commit)
+*.pdf
+LATEST_BASTION.md
+interview-aid-chunk-bastion.md

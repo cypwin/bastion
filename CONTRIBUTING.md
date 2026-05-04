@@ -11,7 +11,7 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/cyprian-w/bastion.git
+git clone https://github.com/cypwin/bastion.git
 cd bastion
 
 # Install in editable mode with dev dependencies

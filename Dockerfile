@@ -21,7 +21,7 @@ COPY --from=builder /install /usr/local
 # their own config via `-v $(pwd)/broker.yaml:/etc/bastion/broker.yaml` or the
 # startup will exit with a clear error directing them to the example file.
 # The example template is available at:
-#   https://github.com/cyprian-w/bastion/blob/main/config/broker.example.yaml
+#   https://github.com/cypwin/bastion/blob/main/config/broker.example.yaml
 
 # Create data directory with correct ownership (volume mount point)
 RUN mkdir -p /home/bastion/.local/share/bastion && \

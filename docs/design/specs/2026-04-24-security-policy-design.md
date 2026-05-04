@@ -81,7 +81,7 @@ No changes to `docs/security.md` (its content is operator-facing hardening guida
 
 ## Key Language Notes
 
-- **GPSA link:** `https://github.com/cyprian-w/bastion/security/advisories/new` (canonical repo URL per `pyproject.toml` and the `9d5f1da` unify-URLs commit).
+- **GPSA link:** `https://github.com/cypwin/bastion/security/advisories/new` (canonical repo URL per `pyproject.toml` and the `9d5f1da` unify-URLs commit).
 - **Response SLA wording:** "We aim to acknowledge reports within a few business days. BASTION is maintained by a single developer; please allow reasonable time for investigation."
 - **Safe harbor wording:** short, not a full legal license — "We will not pursue legal action against researchers who act in good faith, test only against their own instances, and do not access or exfiltrate data belonging to third parties."
 

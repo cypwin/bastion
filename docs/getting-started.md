@@ -92,7 +92,7 @@ Browse available models at [ollama.com/library](https://ollama.com/library).
 ## 5. Install BASTION
 
 ```bash
-git clone https://github.com/cyprian-w/bastion.git
+git clone https://github.com/cypwin/bastion.git
 cd bastion
 pip install -e ".[dev]"
 ```

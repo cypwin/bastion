@@ -21,7 +21,7 @@ against unsupported releases.
 **Preferred: GitHub Private Security Advisory**
 
 Open a private advisory at
-[github.com/cyprian-w/bastion/security/advisories/new](https://github.com/cyprian-w/bastion/security/advisories/new).
+[github.com/cypwin/bastion/security/advisories/new](https://github.com/cypwin/bastion/security/advisories/new).
 GitHub's private advisory flow keeps the report confidential until a fix is
 ready, and makes CVE coordination straightforward.
 

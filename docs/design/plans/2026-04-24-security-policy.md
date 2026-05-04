@@ -4,7 +4,7 @@
 
 **Goal:** Ship a top-level `SECURITY.md` so GitHub surfaces a vulnerability-disclosure policy and researchers have a clear path to report.
 
-**Architecture:** Single markdown file at repo root. No code changes. Rendered by GitHub on the Security tab after merge. Canonical repo is `cyprian-w/bastion` (verified in `pyproject.toml`).
+**Architecture:** Single markdown file at repo root. No code changes. Rendered by GitHub on the Security tab after merge. Canonical repo is `cypwin/bastion` (verified in `pyproject.toml`).
 
 **Tech Stack:** Markdown. No dependencies, no build step, no test framework involvement.
 
@@ -59,7 +59,7 @@ against unsupported releases.
 **Preferred: GitHub Private Security Advisory**
 
 Open a private advisory at
-[github.com/cyprian-w/bastion/security/advisories/new](https://github.com/cyprian-w/bastion/security/advisories/new).
+[github.com/cypwin/bastion/security/advisories/new](https://github.com/cypwin/bastion/security/advisories/new).
 GitHub's private advisory flow keeps the report confidential until a fix is
 ready, and makes CVE coordination straightforward.
 
@@ -179,9 +179,9 @@ No automated tests — this is a policy doc. These are manual sanity checks that
 
 Run: `grep -E 'Repository|Homepage' pyproject.toml`
 
-Expected: both values equal `https://github.com/cyprian-w/bastion`.
+Expected: both values equal `https://github.com/cypwin/bastion`.
 
-Then: `grep -c 'cyprian-w/bastion/security/advisories/new' SECURITY.md`
+Then: `grep -c 'cypwin/bastion/security/advisories/new' SECURITY.md`
 
 Expected: `1`. If 0, the link is wrong and the report button won't route.
 
@@ -211,7 +211,7 @@ Push the branch and view the file rendered by GitHub:
 git push -u origin docs/security-policy
 ```
 
-Then visit `https://github.com/cyprian-w/bastion/blob/docs/security-policy/SECURITY.md` and eyeball that:
+Then visit `https://github.com/cypwin/bastion/blob/docs/security-policy/SECURITY.md` and eyeball that:
 
 - Headings render at correct levels
 - Tables render (not as raw pipes)
@@ -260,11 +260,11 @@ gh pr merge --squash --delete-branch
 
 - [ ] **Step 3: Confirm Security tab shows the policy**
 
-Visit `https://github.com/cyprian-w/bastion/security/policy` and confirm the content renders. GitHub usually picks this up within a minute.
+Visit `https://github.com/cypwin/bastion/security/policy` and confirm the content renders. GitHub usually picks this up within a minute.
 
 - [ ] **Step 4: Confirm the "Report a vulnerability" button works**
 
-Visit `https://github.com/cyprian-w/bastion/security` and click "Report a vulnerability". Confirm the form opens (you don't need to submit). If it's missing, Private Vulnerability Reporting may be disabled — enable it in Settings → Code security → Private vulnerability reporting.
+Visit `https://github.com/cypwin/bastion/security` and click "Report a vulnerability". Confirm the form opens (you don't need to submit). If it's missing, Private Vulnerability Reporting may be disabled — enable it in Settings → Code security → Private vulnerability reporting.
 
 ---
 

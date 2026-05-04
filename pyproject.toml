@@ -54,11 +54,11 @@ bastion = "bastion.__main__:main"
 bastion-dashboard = "bastion.dashboard:main"
 
 [project.urls]
-Homepage = "https://github.com/cyprian-w/bastion"
-Repository = "https://github.com/cyprian-w/bastion"
-Documentation = "https://github.com/cyprian-w/bastion/tree/main/docs"
-Changelog = "https://github.com/cyprian-w/bastion/blob/main/CHANGELOG.md"
-"Bug Tracker" = "https://github.com/cyprian-w/bastion/issues"
+Homepage = "https://github.com/cypwin/bastion"
+Repository = "https://github.com/cypwin/bastion"
+Documentation = "https://github.com/cypwin/bastion/tree/main/docs"
+Changelog = "https://github.com/cypwin/bastion/blob/main/CHANGELOG.md"
+"Bug Tracker" = "https://github.com/cypwin/bastion/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/bastion"]

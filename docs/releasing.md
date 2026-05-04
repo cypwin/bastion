@@ -21,15 +21,15 @@ using OIDC trusted publishing. This requires a GitHub environment named
 1. Create the PyPI project (first publish can be manual: `python -m build && twine upload dist/*`).
 2. On PyPI, go to **Your projects → bastion → Settings → Publishing**.
 3. Add a new trusted publisher:
-   - Owner: `cyprian-w`
+   - Owner: `cypwin`
    - Repository name: `bastion`
    - Workflow name: `release.yml`
    - Environment name: `pypi`
 
 ### 3. ghcr.io image visibility
 
-Images are pushed to `ghcr.io/cyprian-w/bastion` by the `docker` job. After
-the first push, visit **<https://github.com/users/cyprian-w/packages/container/bastion/settings>**
+Images are pushed to `ghcr.io/cypwin/bastion` by the `docker` job. After
+the first push, visit **<https://github.com/users/cypwin/packages/container/bastion/settings>**
 and set visibility to Public (if desired).
 
 ## Cutting a release
@@ -53,7 +53,7 @@ and set visibility to Public (if desired).
    - `github-release` runs only if both succeed
 8. Verify:
    - PyPI: `pip install bastion==X.Y.Z`
-   - Docker: `docker pull ghcr.io/cyprian-w/bastion:X.Y.Z`
+   - Docker: `docker pull ghcr.io/cypwin/bastion:X.Y.Z`
    - GitHub: check the Release page and auto-generated notes
 
 ## Building bastion-client locally
