@@ -41,10 +41,22 @@ class TestCheckGPU:
         mock_status.vram_total_mb = 24576
         mock_status.temperature_c = 45
 
-        with patch("bastion.validate.query_gpu_status", new_callable=AsyncMock, return_value=mock_status):
-            with patch("bastion.validate._query_gpu_name", return_value="NVIDIA GeForce RTX 4090"):
-                with patch("bastion.validate._query_driver_version", return_value="565.57"):
-                    result = await check_gpu()
+        with (
+            patch(
+                "bastion.validate.query_gpu_status",
+                new_callable=AsyncMock,
+                return_value=mock_status,
+            ),
+            patch(
+                "bastion.validate._query_gpu_name",
+                return_value="NVIDIA GeForce RTX 4090",
+            ),
+            patch(
+                "bastion.validate._query_driver_version",
+                return_value="565.57",
+            ),
+        ):
+            result = await check_gpu()
         assert result.status == CheckStatus.PASS
         assert "RTX 4090" in result.message
 
@@ -70,7 +82,11 @@ class TestCheckOllama:
 
     @pytest.mark.asyncio
     async def test_ollama_unreachable(self) -> None:
-        with patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=Exception("Connection refused")):
+        with patch(
+            "httpx.AsyncClient.get",
+            new_callable=AsyncMock,
+            side_effect=Exception("Connection refused"),
+        ):
             result = await check_ollama(port=11435)
         assert result.status == CheckStatus.FAIL
 

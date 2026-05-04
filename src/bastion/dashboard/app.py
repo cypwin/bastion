@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import signal
 import time
@@ -241,16 +242,12 @@ class BastionDashboard(App):
 
             # Toggle secondary vs non-secondary panels within third-col
             for panel_id in secondary_ids:
-                try:
+                with contextlib.suppress(Exception):
                     self.query_one(f"#{panel_id}").display = self._show_secondary
-                except Exception:
-                    pass
 
             for panel_id in non_secondary_ids:
-                try:
+                with contextlib.suppress(Exception):
                     self.query_one(f"#{panel_id}").display = not self._show_secondary
-                except Exception:
-                    pass
 
         # Update status bar with layout mode
         status_bar = self.query_one("#status-bar", StatusBar)
@@ -646,14 +643,16 @@ class BastionDashboard(App):
         from bastion.dashboard import helpers
         helpers.HISTORY_LEN = min(helpers.HISTORY_LEN + 30, 600)
         self._resize_histories(helpers.HISTORY_LEN)
-        self.notify(f"History: {helpers.HISTORY_LEN} samples (~{helpers.HISTORY_LEN * self._interval:.0f}s)")
+        secs = helpers.HISTORY_LEN * self._interval
+        self.notify(f"History: {helpers.HISTORY_LEN} samples (~{secs:.0f}s)")
 
     def action_history_shorter(self) -> None:
         """Decrease history length by 30 samples."""
         from bastion.dashboard import helpers
         helpers.HISTORY_LEN = max(helpers.HISTORY_LEN - 30, 30)
         self._resize_histories(helpers.HISTORY_LEN)
-        self.notify(f"History: {helpers.HISTORY_LEN} samples (~{helpers.HISTORY_LEN * self._interval:.0f}s)")
+        secs = helpers.HISTORY_LEN * self._interval
+        self.notify(f"History: {helpers.HISTORY_LEN} samples (~{secs:.0f}s)")
 
     def _resize_histories(self, new_maxlen: int) -> None:
         """Resize all history deques to a new maxlen, preserving data."""

@@ -397,7 +397,8 @@ async def _startup_self_test(config: BrokerConfig) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator:
     """Manage proxy, tracker, queue, and scheduler lifecycle."""
-    global _proxy, _vram_tracker, _vram_manager, _queue, _scheduler, _a2a_handler, _a2a_http_client, _start_time
+    global _proxy, _vram_tracker, _vram_manager, _queue, _scheduler
+    global _a2a_handler, _a2a_http_client, _start_time
 
     config: BrokerConfig = app.state.config
 
@@ -425,12 +426,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                 PersistentQueue,
                 PersistentTaskStore,
             )
-        except ImportError:
+        except ImportError as exc:
             logger.error(
                 "Persistence requires aiosqlite. "
                 "Install with: pip install bastion[persistence]"
             )
-            raise SystemExit(1)
+            raise SystemExit(1) from exc
 
         # Resolve database path
         if config.persistence.database_path:
@@ -489,10 +490,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     _queue = AffinityQueue(config.scheduler)
 
     # Wrap audit logger with persistence if enabled
-    if _db_manager and config.persistence.enabled and config.persistence.persist_audit:
-        if audit._audit_logger is not None:
-            audit._audit_logger = PersistentAuditLog(audit._audit_logger, _db_manager)
-            logger.info("Audit persistence enabled (dual-write JSONL+SQLite)")
+    if (
+        _db_manager
+        and config.persistence.enabled
+        and config.persistence.persist_audit
+        and audit._audit_logger is not None
+    ):
+        audit._audit_logger = PersistentAuditLog(audit._audit_logger, _db_manager)
+        logger.info("Audit persistence enabled (dual-write JSONL+SQLite)")
 
     # Wrap queue with persistence if enabled
     if _db_manager and config.persistence.enabled and config.persistence.persist_queue:

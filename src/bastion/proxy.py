@@ -157,7 +157,10 @@ class OllamaProxy:
             if task_complexity == "complex":
                 return JSONResponse(
                     {
-                        "error": "Task complexity 'complex' requires Claude, not local model. Route to API.",
+                        "error": (
+                            "Task complexity 'complex' requires Claude, "
+                            "not local model. Route to API."
+                        ),
                         "complexity": "complex",
                     },
                     status_code=422,
@@ -192,7 +195,10 @@ class OllamaProxy:
                         "window_size": verdict.window_size,
                         "estimated_overhead_seconds": round(verdict.estimated_penalty_seconds, 1),
                         "cooloff_seconds": self.config.thrashing_detection.cooloff_seconds,
-                        "suggestion": "Reorganize calls to batch by model. Current pattern causes ~14s GPU penalty per swap.",
+                        "suggestion": (
+                            "Reorganize calls to batch by model. "
+                            "Current pattern causes ~14s GPU penalty per swap."
+                        ),
                     },
                     status_code=429,
                 )
