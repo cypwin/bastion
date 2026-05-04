@@ -6,13 +6,26 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import bastion.gpu as _gpu_pkg
+from bastion.gpu.nvidia import NvidiaBackend
 from bastion.health import check_gpu_safe, get_vram_free_gb, query_gpu_status
 from bastion.models import GPUConfig, GPUStatus
 
 
+@pytest.fixture
+def _force_nvidia_backend():
+    """Force NvidiaBackend so subprocess mocks are exercised on hosts without nvidia-smi."""
+    original = _gpu_pkg._backend
+    _gpu_pkg.set_backend(NvidiaBackend())
+    try:
+        yield
+    finally:
+        _gpu_pkg._backend = original
+
+
 class TestQueryGPUStatus:
     @pytest.mark.asyncio
-    async def test_parses_nvidia_smi_output(self):
+    async def test_parses_nvidia_smi_output(self, _force_nvidia_backend):
         """Parse well-formed nvidia-smi CSV output."""
         mock_proc = AsyncMock()
         mock_proc.communicate.return_value = (
@@ -30,7 +43,7 @@ class TestQueryGPUStatus:
         assert status.power_draw_watts == 185.5
 
     @pytest.mark.asyncio
-    async def test_handles_nvidia_smi_not_found(self):
+    async def test_handles_nvidia_smi_not_found(self, _force_nvidia_backend):
         """Graceful fallback when nvidia-smi is not installed."""
         with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError):
             status = await query_gpu_status()
@@ -39,7 +52,7 @@ class TestQueryGPUStatus:
         assert status.vram_used_mb is None
 
     @pytest.mark.asyncio
-    async def test_handles_timeout(self):
+    async def test_handles_timeout(self, _force_nvidia_backend):
         """Graceful fallback when nvidia-smi hangs."""
         mock_proc = AsyncMock()
         mock_proc.communicate.side_effect = TimeoutError()
@@ -52,7 +65,7 @@ class TestQueryGPUStatus:
         assert status.temperature_c is None
 
     @pytest.mark.asyncio
-    async def test_handles_empty_output(self):
+    async def test_handles_empty_output(self, _force_nvidia_backend):
         """Graceful fallback for empty nvidia-smi output."""
         mock_proc = AsyncMock()
         mock_proc.communicate.return_value = (b"", b"")
@@ -64,7 +77,7 @@ class TestQueryGPUStatus:
         assert status.temperature_c is None
 
     @pytest.mark.asyncio
-    async def test_handles_nonzero_return_code(self):
+    async def test_handles_nonzero_return_code(self, _force_nvidia_backend):
         mock_proc = AsyncMock()
         mock_proc.communicate.return_value = (b"", b"")
         mock_proc.returncode = 1
