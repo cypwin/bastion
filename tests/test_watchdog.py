@@ -20,6 +20,8 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+import bastion.gpu as _gpu_pkg
+from bastion.gpu.nvidia import NvidiaBackend
 from bastion.watchdog import (
     GPUState,
     OllamaState,
@@ -31,6 +33,18 @@ from bastion.watchdog import (
     notify_stopping,
     notify_watchdog,
 )
+
+
+@pytest.fixture
+def _force_nvidia_backend():
+    """Force NvidiaBackend so subprocess mocks are exercised on hosts without nvidia-smi."""
+    original = _gpu_pkg._backend
+    _gpu_pkg.set_backend(NvidiaBackend())
+    try:
+        yield
+    finally:
+        _gpu_pkg._backend = original
+
 
 # ---------------------------------------------------------------------------
 # sd_notify tests
@@ -214,7 +228,7 @@ class TestProcessMonitor:
         assert monitor.status.ollama_state == OllamaState.HEALTHY
 
     @pytest.mark.asyncio
-    async def test_gpu_unavailable_when_nvidia_smi_missing(self) -> None:
+    async def test_gpu_unavailable_when_nvidia_smi_missing(self, _force_nvidia_backend) -> None:
         """GPU check handles missing nvidia-smi gracefully."""
         monitor = ProcessMonitor()
 
@@ -225,7 +239,7 @@ class TestProcessMonitor:
         assert monitor.status.consecutive_gpu_timeouts == 0
 
     @pytest.mark.asyncio
-    async def test_gpu_responsive(self) -> None:
+    async def test_gpu_responsive(self, _force_nvidia_backend) -> None:
         """GPU check succeeds when nvidia-smi returns quickly."""
         monitor = ProcessMonitor()
 
@@ -243,7 +257,7 @@ class TestProcessMonitor:
         assert monitor.status.consecutive_gpu_timeouts == 0
 
     @pytest.mark.asyncio
-    async def test_gpu_timeout_detection(self) -> None:
+    async def test_gpu_timeout_detection(self, _force_nvidia_backend) -> None:
         """GPU check detects timeout (nvidia-smi hang)."""
         monitor = ProcessMonitor(gpu_timeout=1)
 
