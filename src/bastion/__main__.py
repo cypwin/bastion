@@ -118,7 +118,7 @@ def _generate_config() -> None:
         # Minimal inline config when example file isn't available (pip install)
         dest.write_text(
             "# BASTION configuration\n"
-            "# See https://github.com/cyprian-w/bastion for full reference.\n"
+            "# See https://github.com/cypwin/bastion for full reference.\n"
             "\n"
             "ollama:\n"
             "  host: \"127.0.0.1\"\n"

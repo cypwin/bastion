@@ -1,6 +1,6 @@
 # BASTION
 
-![CI](https://github.com/cyprian-w/bastion/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/cypwin/bastion/actions/workflows/ci.yml/badge.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)
 
@@ -51,7 +51,7 @@ standard Ollama port so every client benefits with zero configuration changes.
 ### 1. Install
 
 ```bash
-git clone https://github.com/cyprian-w/bastion.git
+git clone https://github.com/cypwin/bastion.git
 cd bastion
 pip install -e ".[dev]"
 ```

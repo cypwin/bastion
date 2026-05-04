@@ -22,7 +22,7 @@ responsibly:
 2. Email **cw.claustrum@gmail.com** with a description of the
    vulnerability, steps to reproduce, and any relevant logs or config.
 3. Alternatively, use GitHub's
-   [private security advisory](https://github.com/cyprian-w/bastion/security/advisories/new)
+   [private security advisory](https://github.com/cypwin/bastion/security/advisories/new)
    feature to report the issue confidentially.
 
 You should receive an acknowledgement within 72 hours. We will work with you to

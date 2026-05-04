@@ -12,7 +12,7 @@
 
 [Unit]
 Description=BASTION GPU/LLM Broker (Ollama proxy on :11434)
-Documentation=https://github.com/cyprian-w/bastion
+Documentation=https://github.com/cypwin/bastion
 After=network-online.target ollama.service nvidia-powercap.service
 Wants=network-online.target nvidia-powercap.service
 Requires=ollama.service
