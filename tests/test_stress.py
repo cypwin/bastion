@@ -108,14 +108,19 @@ class TestSingleLoadPhase:
                 return generate_resp
             return unload_resp
 
-        with patch("httpx.AsyncClient.post", new_callable=AsyncMock, side_effect=mock_post):
-            with patch("bastion.stress.query_gpu_status", new_callable=AsyncMock,
-                       return_value=mock_gpu):
-                result = await single_load_phase(
-                    bastion_url="http://localhost:11434",
-                    model="test:latest",
-                    baseline_temp=42,
-                )
+        with (
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock, side_effect=mock_post),
+            patch(
+                "bastion.stress.query_gpu_status",
+                new_callable=AsyncMock,
+                return_value=mock_gpu,
+            ),
+        ):
+            result = await single_load_phase(
+                bastion_url="http://localhost:11434",
+                model="test:latest",
+                baseline_temp=42,
+            )
 
         assert result.phase == "single_load"
         assert result.success

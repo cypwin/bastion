@@ -277,14 +277,21 @@ async def swap_ramp_phase(
                 # Check temperature
                 status = await query_gpu_status()
                 if status.temperature_c and status.temperature_c >= cutoff_temp:
+                    avg_swap = (
+                        round(statistics.mean(swap_durations), 2)
+                        if swap_durations else 0
+                    )
                     return PhaseResult(
                         phase="swap_ramp",
                         success=True,
                         data={
                             "safe_swap_rate_per_min": last_safe_rate or rate_per_min,
                             "stopped_at_interval_s": interval,
-                            "stop_reason": f"thermal cutoff ({status.temperature_c}C >= {cutoff_temp}C)",
-                            "swap_duration_avg_s": round(statistics.mean(swap_durations), 2) if swap_durations else 0,
+                            "stop_reason": (
+                                f"thermal cutoff ({status.temperature_c}C "
+                                f">= {cutoff_temp}C)"
+                            ),
+                            "swap_duration_avg_s": avg_swap,
                         },
                     )
 
@@ -292,6 +299,10 @@ async def swap_ramp_phase(
                     await asyncio.sleep(interval)
 
             if not interval_ok:
+                avg_swap = (
+                    round(statistics.mean(swap_durations), 2)
+                    if swap_durations else 0
+                )
                 return PhaseResult(
                     phase="swap_ramp",
                     success=True,
@@ -299,12 +310,16 @@ async def swap_ramp_phase(
                         "safe_swap_rate_per_min": last_safe_rate or 3,
                         "stopped_at_interval_s": interval,
                         "stop_reason": "swap failed or errored",
-                        "swap_duration_avg_s": round(statistics.mean(swap_durations), 2) if swap_durations else 0,
+                        "swap_duration_avg_s": avg_swap,
                     },
                 )
 
             last_safe_rate = rate_per_min
 
+    avg_swap = (
+        round(statistics.mean(swap_durations), 2)
+        if swap_durations else 0
+    )
     return PhaseResult(
         phase="swap_ramp",
         success=True,
@@ -312,7 +327,7 @@ async def swap_ramp_phase(
             "safe_swap_rate_per_min": last_safe_rate or 3,
             "stopped_at_interval_s": 2,
             "stop_reason": "completed all intervals",
-            "swap_duration_avg_s": round(statistics.mean(swap_durations), 2) if swap_durations else 0,
+            "swap_duration_avg_s": avg_swap,
         },
     )
 

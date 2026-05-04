@@ -280,7 +280,8 @@ class TestPersistentQueue:
             result = pq.enqueue(req)
             await asyncio.sleep(0.1)
             assert result is True
-            async with mgr.conn.execute("SELECT entry_id, model, completed FROM queue_entries") as cursor:
+            sql = "SELECT entry_id, model, completed FROM queue_entries"
+            async with mgr.conn.execute(sql) as cursor:
                 rows = await cursor.fetchall()
             assert len(rows) == 1
             assert rows[0][0] == "r-001"
@@ -342,15 +343,27 @@ class TestPersistentQueue:
         try:
             now = datetime.now(UTC).isoformat()
             old = "2020-01-01T00:00:00+00:00"
+            insert_sql = (
+                "INSERT INTO queue_entries "
+                "(entry_id, model, priority, payload, enqueued_at, completed) "
+                "VALUES (?, ?, ?, ?, ?, ?)"
+            )
+            payload_json = (
+                '{"model":"qwen3:14b","endpoint":"/api/generate",'
+                '"body":"","priority":50.0,"base_priority":50.0}'
+            )
             await mgr.conn.execute(
-                "INSERT INTO queue_entries (entry_id, model, priority, payload, enqueued_at, completed) VALUES (?, ?, ?, ?, ?, ?)",
-                ("fresh-1", "qwen3:14b", 50, '{"model":"qwen3:14b","endpoint":"/api/generate","body":"","priority":50.0,"base_priority":50.0}', now, 0))
+                insert_sql,
+                ("fresh-1", "qwen3:14b", 50, payload_json, now, 0),
+            )
             await mgr.conn.execute(
-                "INSERT INTO queue_entries (entry_id, model, priority, payload, enqueued_at, completed) VALUES (?, ?, ?, ?, ?, ?)",
-                ("stale-1", "qwen3:14b", 50, '{"model":"qwen3:14b","endpoint":"/api/generate","body":"","priority":50.0,"base_priority":50.0}', old, 0))
+                insert_sql,
+                ("stale-1", "qwen3:14b", 50, payload_json, old, 0),
+            )
             await mgr.conn.execute(
-                "INSERT INTO queue_entries (entry_id, model, priority, payload, enqueued_at, completed) VALUES (?, ?, ?, ?, ?, ?)",
-                ("done-1", "qwen3:14b", 50, '{}', now, 1))
+                insert_sql,
+                ("done-1", "qwen3:14b", 50, '{}', now, 1),
+            )
             await mgr.conn.commit()
             inner = self._make_queue()
             pq = PersistentQueue(inner, mgr)

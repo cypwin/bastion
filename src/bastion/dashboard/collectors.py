@@ -275,7 +275,8 @@ class SystemDataCollector:
             return []
 
         procs: list[dict[str, Any]] = []
-        for proc in psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent", "memory_info"]):
+        proc_attrs = ["pid", "name", "cpu_percent", "memory_percent", "memory_info"]
+        for proc in psutil.process_iter(proc_attrs):
             try:
                 info = proc.info
                 mem_info = info.get("memory_info")

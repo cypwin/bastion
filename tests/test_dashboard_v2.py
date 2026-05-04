@@ -1,6 +1,7 @@
 """Tests for BASTION Dashboard v2."""
 from __future__ import annotations
 
+from bastion.dashboard.collectors import SystemDataCollector
 from bastion.dashboard.helpers import (
     core_char,
     format_uptime,
@@ -99,8 +100,6 @@ def test_core_char_critical() -> None:
 # SystemDataCollector tests
 # ---------------------------------------------------------------------------
 
-from bastion.dashboard.collectors import SystemDataCollector
-
 
 def test_collector_init() -> None:
     c = SystemDataCollector()
@@ -138,7 +137,7 @@ def test_collector_get_memory_data() -> None:
 
 def test_collector_cpu_per_core_chars() -> None:
     c = SystemDataCollector()
-    data = c.get_cpu_data()
+    c.get_cpu_data()
     text = c.cpu_per_core_text()
     assert text is not None
     assert len(text) > 0

@@ -249,9 +249,14 @@ class PersistentTaskStore:
 
     async def hydrate(self) -> int:
         """Load active (non-terminal) tasks from SQLite into in-memory store. Returns count."""
-        terminal = {A2ATaskState.COMPLETED.value, A2ATaskState.FAILED.value, A2ATaskState.CANCELED.value}
+        terminal = {
+            A2ATaskState.COMPLETED.value,
+            A2ATaskState.FAILED.value,
+            A2ATaskState.CANCELED.value,
+        }
         count = 0
-        async with self._db.conn.execute("SELECT task_id, state, payload FROM task_state") as cursor:
+        query = "SELECT task_id, state, payload FROM task_state"
+        async with self._db.conn.execute(query) as cursor:
             async for row in cursor:
                 task_id, state, payload_json = row
                 if state in terminal:
@@ -338,15 +343,29 @@ class PersistentQueue:
 
     async def _persist_entry(self, request: Any) -> None:
         try:
+            body_str = (
+                request.body.decode("utf-8", errors="replace")
+                if isinstance(request.body, bytes)
+                else str(request.body)
+            )
+            payload = json.dumps({
+                "model": request.model,
+                "endpoint": request.endpoint,
+                "body": body_str,
+                "priority": request.priority,
+                "base_priority": request.base_priority,
+            })
             await self._db.conn.execute(
                 """INSERT OR REPLACE INTO queue_entries
                    (entry_id, model, priority, payload, enqueued_at, completed)
                    VALUES (?, ?, ?, ?, ?, 0)""",
-                (request.id, request.model, int(request.base_priority),
-                 json.dumps({"model": request.model, "endpoint": request.endpoint,
-                             "body": request.body.decode("utf-8", errors="replace") if isinstance(request.body, bytes) else str(request.body),
-                             "priority": request.priority, "base_priority": request.base_priority}),
-                 datetime.now(UTC).isoformat()),
+                (
+                    request.id,
+                    request.model,
+                    int(request.base_priority),
+                    payload,
+                    datetime.now(UTC).isoformat(),
+                ),
             )
             await self._db.conn.commit()
         except Exception as e:
@@ -361,14 +380,19 @@ class PersistentQueue:
             logger.warning("SQLite queue completion update failed for %s: %s", entry_id, e)
 
     async def hydrate(self, recovery_ttl: int = 300) -> tuple[int, int]:
-        """Replay pending queue entries from SQLite, respecting TTL. Returns (recovered, discarded)."""
+        """Replay pending queue entries from SQLite, respecting TTL.
+
+        Returns (recovered, discarded).
+        """
         from bastion.models import QueuedRequest
         recovered = 0
         discarded = 0
         now = time.time()
-        async with self._db.conn.execute(
-            "SELECT entry_id, model, priority, payload, enqueued_at FROM queue_entries WHERE completed = 0"
-        ) as cursor:
+        query = (
+            "SELECT entry_id, model, priority, payload, enqueued_at "
+            "FROM queue_entries WHERE completed = 0"
+        )
+        async with self._db.conn.execute(query) as cursor:
             async for row in cursor:
                 entry_id, model, priority, payload_json, enqueued_at = row
                 try:
@@ -378,14 +402,23 @@ class PersistentQueue:
                     age = recovery_ttl + 1
                 if age > recovery_ttl:
                     discarded += 1
-                    logger.info("Discarding stale queue entry %s (age=%.0fs, ttl=%ds)", entry_id, age, recovery_ttl)
+                    logger.info(
+                        "Discarding stale queue entry %s (age=%.0fs, ttl=%ds)",
+                        entry_id, age, recovery_ttl,
+                    )
                     continue
                 try:
                     data = json.loads(payload_json)
+                    body_field = data.get("body", "")
+                    body_bytes = (
+                        body_field.encode("utf-8")
+                        if isinstance(body_field, str)
+                        else b""
+                    )
                     req = QueuedRequest(
                         id=entry_id, model=data.get("model", model),
                         endpoint=data.get("endpoint", "/api/generate"),
-                        body=data.get("body", "").encode("utf-8") if isinstance(data.get("body"), str) else b"",
+                        body=body_bytes,
                         priority=float(data.get("priority", priority)),
                         base_priority=float(data.get("base_priority", priority)),
                     )

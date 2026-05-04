@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
 from bastion.models import (
     BrokerConfig,
     ComplexityRoutingConfig,
+    ModelInfo,
+    PriorityTier,
     ThrashingDetectionConfig,
 )
+from bastion.proxy import OllamaProxy
 
 
 class TestComplexityRoutingConfig:
@@ -59,15 +68,6 @@ class TestBrokerConfigWithComplexity:
 # ---------------------------------------------------------------------------
 # Proxy routing tests (Task 4)
 # ---------------------------------------------------------------------------
-
-import asyncio
-import json
-from unittest.mock import AsyncMock, MagicMock
-
-import pytest
-
-from bastion.models import ModelInfo, PriorityTier
-from bastion.proxy import OllamaProxy
 
 
 def _make_request(
