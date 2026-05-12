@@ -23,7 +23,7 @@ def temp_color(temp: int | None) -> str:
     if temp < 70:
         return "yellow"
     if temp < 80:
-        return "dark_orange"
+        return "yellow bold"
     return "red bold"
 
 
@@ -36,7 +36,7 @@ def usage_color(pct: float | None) -> str:
     if pct < 75:
         return "yellow"
     if pct < 90:
-        return "dark_orange"
+        return "yellow bold"
     return "red bold"
 
 

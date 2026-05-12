@@ -183,3 +183,17 @@ def test_safety_bar_ignores_none() -> None:
     bar.update_limits(None, None)
     assert bar._max_vram_gb == 26.0
     assert bar._max_temp_c == 82
+
+
+def test_temp_color_warning_band_uses_16_color_safe() -> None:
+    """`dark_orange` collapses in 16-color terminals; require an ANSI primary."""
+    color = temp_color(75)
+    assert "dark_orange" not in color
+    # Must be one of the 16 ANSI primaries (or "yellow")
+    assert color in {"yellow", "yellow bold", "red", "red bold"}
+
+
+def test_usage_color_warning_band_uses_16_color_safe() -> None:
+    color = usage_color(80)
+    assert "dark_orange" not in color
+    assert color in {"yellow", "yellow bold", "red", "red bold"}
