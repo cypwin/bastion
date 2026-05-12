@@ -435,11 +435,13 @@ class BastionDashboard(App):
 
         # Update right-col panels
         temp_panel = self.query_one("#temperatures", TemperaturePanel)
+        gpu_ceiling = data.get("max_temperature_c", 85)
         temp_panel.update(
             temp_panel.render_data(
                 cpu_temp=int(cpu_temp) if cpu_temp is not None else None,
                 nvme_temps=nvme_temps,
                 gpu_temp=temp,
+                gpu_ceiling_c=gpu_ceiling,
             )
         )
 

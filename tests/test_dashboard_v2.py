@@ -274,3 +274,40 @@ def test_vram_alert_uses_configured_budget_not_hardware_total() -> None:
     crit = [a for a in alerts if a.get("severity") == "critical"
             and "VRAM" in a.get("message", "")]
     assert crit, f"expected a CRITICAL VRAM alert at budget ceiling; got {alerts}"
+
+
+def test_gpu_temp_threshold_uses_profile_ceiling() -> None:
+    """An RTX 5090 with thermal_ceiling_c=80 at 82°C must render red,
+    not green."""
+    from bastion.dashboard.panels_system import TemperaturePanel
+
+    panel = TemperaturePanel()
+    table = panel.render_data(
+        cpu_temp=None,
+        nvme_temps=None,
+        gpu_temp=82,
+        gpu_ceiling_c=80,
+    )
+    # Rich Table stores markup strings in column._cells; str(table) does not
+    # include markup tokens.
+    temp_cells = table.columns[1]._cells  # "Temp" column
+    assert any("red" in cell for cell in temp_cells), (
+        f"82°C above ceiling=80 must render red; got temp cells: {temp_cells}"
+    )
+
+
+def test_gpu_temp_threshold_below_ceiling_is_green() -> None:
+    """70°C is well below ceiling=80, must render green."""
+    from bastion.dashboard.panels_system import TemperaturePanel
+
+    panel = TemperaturePanel()
+    table = panel.render_data(
+        cpu_temp=None,
+        nvme_temps=None,
+        gpu_temp=70,
+        gpu_ceiling_c=80,
+    )
+    temp_cells = table.columns[1]._cells  # "Temp" column
+    assert any("green" in cell for cell in temp_cells), (
+        f"70°C below ceiling=80 must render green; got temp cells: {temp_cells}"
+    )
