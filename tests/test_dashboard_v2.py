@@ -320,7 +320,9 @@ def test_service_restart_uses_async_subprocess() -> None:
     from bastion.dashboard import app as app_module
 
     source = inspect.getsource(app_module.BastionDashboard.action_service_restart)
-    assert "asyncio.create_subprocess_exec" in source or "run_worker" in source, (
-        "action_service_restart must dispatch to an async worker, not "
-        "call subprocess.run inline (blocks the TUI for up to 15s)"
+    assert "asyncio.create_subprocess_exec" in source, (
+        "action_service_restart must use asyncio.create_subprocess_exec, not subprocess.run"
+    )
+    assert "run_worker" in source, (
+        "action_service_restart must dispatch via run_worker to avoid blocking the TUI"
     )

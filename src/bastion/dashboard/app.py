@@ -850,7 +850,7 @@ class BastionDashboard(App):
             try:
                 proc = await asyncio.create_subprocess_exec(
                     "sudo", "systemctl", "restart", "bastion.service",
-                    stdout=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
                 )
                 try:
