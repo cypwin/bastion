@@ -141,6 +141,34 @@ def sparkline(values: list[float], width: int = 20) -> str:
     return "".join(blocks[min(int((v - lo) / span * 8), 8)] for v in recent)
 
 
+def sparkline_abs(
+    values: list[float],
+    lo_bound: float,
+    hi_bound: float,
+    width: int = 20,
+) -> str:
+    """Render a sparkline normalized against fixed absolute bounds.
+
+    Unlike sparkline(), this uses (lo_bound, hi_bound) as the y-axis range
+    so trend shape conveys absolute level, not local range. Values below
+    lo_bound render as blank; values above hi_bound clamp to a full block.
+
+    Use for metrics with semantic ceilings (VRAM vs total, temp vs profile
+    ceiling). Use sparkline() for metrics where only local trend matters.
+    """
+    if not values:
+        return ""
+    blocks = " ▁▂▃▄▅▆▇█"
+    span = hi_bound - lo_bound if hi_bound != lo_bound else 1.0
+    recent = values[-width:]
+    result = []
+    for v in recent:
+        clamped = max(lo_bound, min(hi_bound, v))
+        idx = min(int((clamped - lo_bound) / span * 8), 8)
+        result.append(blocks[idx])
+    return "".join(result)
+
+
 def vram_bar(used_mb: int | None, total_mb: int | None, width: int = 16) -> Text:
     """Render a VRAM usage bar with color."""
     if used_mb is None or total_mb is None or total_mb == 0:

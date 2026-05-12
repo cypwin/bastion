@@ -414,9 +414,13 @@ class BastionDashboard(App):
 
         # Update left-col panels
         gpu_panel = self.query_one("#gpu", GPUPanel)
+        vram_total_mb = data.get("gpu", {}).get("vram_total_mb")
+        gpu_ceiling = data.get("max_temperature_c", 85)
         gpu_panel.update(gpu_panel.render_data(
             data,
             power_history=list(self.power_history),
+            vram_total_mb=vram_total_mb,
+            gpu_ceiling_c=gpu_ceiling,
         ))
 
         models_panel = self.query_one("#models", ModelsPanel)

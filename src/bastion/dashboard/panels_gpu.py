@@ -12,6 +12,7 @@ from bastion.dashboard.helpers import (
     format_bytes_gb,
     format_bytes_mb,
     sparkline,
+    sparkline_abs,
     temp_color,
     usage_color,
     vram_bar,
@@ -25,6 +26,8 @@ class GPUPanel(Static):
         self,
         data: dict[str, Any],
         power_history: list[float] | None = None,
+        vram_total_mb: float | None = None,
+        gpu_ceiling_c: int = 85,
     ) -> Table:
         gpu = data.get("gpu", {})
         temp = gpu.get("temperature_c")
@@ -53,14 +56,22 @@ class GPUPanel(Static):
         # Sparkline rows
         app = self.app
         if hasattr(app, "vram_history") and app.vram_history:
+            vram_spark = (
+                sparkline_abs(list(app.vram_history), lo_bound=0, hi_bound=vram_total_mb, width=w)
+                if vram_total_mb
+                else sparkline(list(app.vram_history), w)
+            )
             table.add_row(
                 "VRAM  \u2581\u2582",
-                Text(sparkline(list(app.vram_history), w), style="cyan"),
+                Text(vram_spark, style="cyan"),
             )
         if hasattr(app, "temp_history") and app.temp_history:
             table.add_row(
                 "Temp  \u2581\u2582",
-                Text(sparkline(list(app.temp_history), w), style=temp_color(temp)),
+                Text(
+                    sparkline_abs(list(app.temp_history), lo_bound=20, hi_bound=gpu_ceiling_c, width=w),
+                    style=temp_color(temp),
+                ),
             )
         if power_history:
             table.add_row(
