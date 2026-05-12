@@ -224,3 +224,17 @@ def test_throughput_counter_reset_does_not_emit_negative_rate() -> None:
         history.append(rate_per_min)
 
     assert all(x >= 0 for x in history), "all rates must be non-negative"
+
+
+def test_toggle_secondary_guard_present_in_source() -> None:
+    """The [t] toggle must guard against non-full modes before flipping state."""
+    import inspect
+    from bastion.dashboard.app import BastionDashboard
+
+    source = inspect.getsource(BastionDashboard.action_toggle_secondary)
+    assert '_layout_mode != "full"' in source
+    assert "return" in source
+    # State flip must appear AFTER the guard, not before
+    guard_pos = source.index('_layout_mode != "full"')
+    flip_pos = source.index("_show_secondary = not")
+    assert flip_pos > guard_pos, "state flip must follow the guard"

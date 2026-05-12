@@ -66,6 +66,7 @@ packages = ["src/bastion"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["src"]
 markers = [
     "e2e: End-to-end stress tests (require live BASTION + Ollama)",
     "slow: Slow tests (integration, timing-sensitive) — excluded with -m 'not slow'",
