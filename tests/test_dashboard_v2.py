@@ -254,7 +254,7 @@ def test_vram_alert_uses_configured_budget_not_hardware_total() -> None:
             "vram_used_mb": 24 * 1024,
             "vram_total_mb": 32 * 1024,
         },
-        "config": {"max_vram_gb": 24.0},
+        "max_vram_gb": 24.0,  # top-level, matching server.py BrokerStatus response
         "queue_depth": 0,
         "scheduler_state": "running",
     }

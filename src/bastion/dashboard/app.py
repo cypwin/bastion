@@ -524,7 +524,7 @@ class BastionDashboard(App):
         # Use configured budget as the alert denominator, not the hardware total.
         # The broker refuses loads at max_vram_gb; alerts must fire at or before
         # that boundary, not 3 GB past it.
-        cfg_budget_gb = data.get("config", {}).get("max_vram_gb")
+        cfg_budget_gb = data.get("max_vram_gb")
         if cfg_budget_gb is not None:
             vram_budget = cfg_budget_gb * 1024
         else:
