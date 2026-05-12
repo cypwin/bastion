@@ -82,8 +82,8 @@ def test_temp_color_yellow() -> None:
 
 
 def test_temp_color_orange() -> None:
-    """temp_color(75) returns dark_orange (70-79 range)."""
-    assert temp_color(75) == "dark_orange"
+    """temp_color(75) returns yellow bold (70-79 range)."""
+    assert temp_color(75) == "yellow bold"
 
 
 def test_temp_color_red() -> None:
@@ -112,8 +112,8 @@ def test_usage_color_yellow() -> None:
 
 
 def test_usage_color_orange() -> None:
-    """usage_color(80.0) returns dark_orange (75-89 range)."""
-    assert usage_color(80.0) == "dark_orange"
+    """usage_color(80.0) returns yellow bold (75-89 range)."""
+    assert usage_color(80.0) == "yellow bold"
 
 
 def test_usage_color_red() -> None:
