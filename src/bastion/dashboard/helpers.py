@@ -155,6 +155,9 @@ def sparkline_abs(
 
     Use for metrics with semantic ceilings (VRAM vs total, temp vs profile
     ceiling). Use sparkline() for metrics where only local trend matters.
+
+    When lo_bound == hi_bound the span defaults to 1.0 and all samples
+    render as blank space — a silent degradation rather than an error.
     """
     if not values:
         return ""
