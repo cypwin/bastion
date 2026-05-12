@@ -1,6 +1,7 @@
 """Tests for BASTION Dashboard v2."""
 from __future__ import annotations
 
+import inspect
 from collections import deque
 
 from bastion.dashboard.collectors import SystemDataCollector
@@ -228,7 +229,6 @@ def test_throughput_counter_reset_does_not_emit_negative_rate() -> None:
 
 def test_toggle_secondary_guard_present_in_source() -> None:
     """The [t] toggle must guard against non-full modes before flipping state."""
-    import inspect
     from bastion.dashboard.app import BastionDashboard
 
     source = inspect.getsource(BastionDashboard.action_toggle_secondary)
@@ -316,7 +316,6 @@ def test_gpu_temp_threshold_below_ceiling_is_green() -> None:
 def test_service_restart_uses_async_subprocess() -> None:
     """The service-restart handler must NOT call subprocess.run inline;
     it must dispatch to an async worker. Verified by source inspection."""
-    import inspect
     from bastion.dashboard import app as app_module
 
     source = inspect.getsource(app_module.BastionDashboard.action_service_restart)
@@ -330,8 +329,9 @@ def test_service_restart_uses_async_subprocess() -> None:
 
 def test_all_modals_bind_escape_to_dismiss() -> None:
     """Every modal must dismiss on Escape — universal TUI contract."""
-    from bastion.dashboard import modals
     from textual.screen import ModalScreen
+
+    from bastion.dashboard import modals
 
     modal_classes = [
         cls for name, cls in vars(modals).items()

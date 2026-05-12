@@ -69,7 +69,9 @@ class GPUPanel(Static):
             table.add_row(
                 "Temp  \u2581\u2582",
                 Text(
-                    sparkline_abs(list(app.temp_history), lo_bound=20, hi_bound=gpu_ceiling_c, width=w),
+                    sparkline_abs(
+                        list(app.temp_history), lo_bound=20, hi_bound=gpu_ceiling_c, width=w
+                    ),
                     style=temp_color(temp),
                 ),
             )

@@ -531,10 +531,7 @@ class BastionDashboard(App):
         # The broker refuses loads at max_vram_gb; alerts must fire at or before
         # that boundary, not 3 GB past it.
         cfg_budget_gb = data.get("max_vram_gb")
-        if cfg_budget_gb is not None:
-            vram_budget = cfg_budget_gb * 1024
-        else:
-            vram_budget = vram_hw_total
+        vram_budget = cfg_budget_gb * 1024 if cfg_budget_gb is not None else vram_hw_total
 
         # VRAM alerts
         if vram_used is not None and vram_budget and vram_budget > 0:
@@ -861,7 +858,7 @@ class BastionDashboard(App):
                     _, stderr = await asyncio.wait_for(
                         proc.communicate(), timeout=15.0
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     proc.kill()
                     await proc.wait()
                     self.notify("Restart timed out after 15s", severity="error")
