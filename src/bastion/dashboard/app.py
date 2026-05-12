@@ -323,16 +323,18 @@ class BastionDashboard(App):
         served = data.get("total_requests_served", 0)
         if self._prev_requests_served is not None:
             delta = served - self._prev_requests_served
-            rate_per_min = delta * (60.0 / self._interval) if self._interval > 0 else 0
-            self.throughput_history.append(rate_per_min)
+            if delta >= 0:  # skip on broker restart (counter reset)
+                rate_per_min = delta * (60.0 / self._interval) if self._interval > 0 else 0
+                self.throughput_history.append(rate_per_min)
         self._prev_requests_served = served
 
         # Swap rate (swaps/poll interval → swaps/min)
         swaps = data.get("total_model_swaps", 0)
         if self._prev_model_swaps is not None:
             delta = swaps - self._prev_model_swaps
-            rate_per_min = delta * (60.0 / self._interval) if self._interval > 0 else 0
-            self.swap_rate_history.append(rate_per_min)
+            if delta >= 0:  # skip on broker restart (counter reset)
+                rate_per_min = delta * (60.0 / self._interval) if self._interval > 0 else 0
+                self.swap_rate_history.append(rate_per_min)
         self._prev_model_swaps = swaps
 
         # Auto-fan and alert evaluation
