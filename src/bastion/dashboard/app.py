@@ -844,29 +844,36 @@ class BastionDashboard(App):
             self.notify(f"Drain toggle failed: {exc}", severity="error")
 
     def action_service_restart(self) -> None:
-        """Restart bastion.service via systemctl."""
+        """Restart bastion.service via systemctl (dispatched off the UI thread)."""
+
+        async def _do_restart() -> None:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "sudo", "systemctl", "restart", "bastion.service",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    _, stderr = await asyncio.wait_for(
+                        proc.communicate(), timeout=15.0
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    self.notify("Restart timed out after 15s", severity="error")
+                    return
+                if proc.returncode == 0:
+                    self.notify("bastion.service restarted")
+                else:
+                    msg = stderr.decode("utf-8", errors="replace").strip()
+                    self.notify(f"Restart failed: {msg}", severity="error")
+            except Exception as exc:
+                self.notify(f"Restart failed: {exc}", severity="error")
 
         def _handle_confirm(confirmed: bool) -> None:
             if not confirmed:
                 return
-            import subprocess
-
-            try:
-                result = subprocess.run(
-                    ["sudo", "systemctl", "restart", "bastion.service"],
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                )
-                if result.returncode == 0:
-                    self.notify("bastion.service restarted")
-                else:
-                    self.notify(
-                        f"Restart failed: {result.stderr.strip()}",
-                        severity="error",
-                    )
-            except Exception as exc:
-                self.notify(f"Restart failed: {exc}", severity="error")
+            self.run_worker(_do_restart(), exclusive=True)
 
         self.push_screen(
             ConfirmActionModal(

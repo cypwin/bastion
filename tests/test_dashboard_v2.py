@@ -311,3 +311,16 @@ def test_gpu_temp_threshold_below_ceiling_is_green() -> None:
     assert any("green" in cell for cell in temp_cells), (
         f"70°C below ceiling=80 must render green; got temp cells: {temp_cells}"
     )
+
+
+def test_service_restart_uses_async_subprocess() -> None:
+    """The service-restart handler must NOT call subprocess.run inline;
+    it must dispatch to an async worker. Verified by source inspection."""
+    import inspect
+    from bastion.dashboard import app as app_module
+
+    source = inspect.getsource(app_module.BastionDashboard.action_service_restart)
+    assert "asyncio.create_subprocess_exec" in source or "run_worker" in source, (
+        "action_service_restart must dispatch to an async worker, not "
+        "call subprocess.run inline (blocks the TUI for up to 15s)"
+    )
