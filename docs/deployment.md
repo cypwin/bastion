@@ -158,9 +158,9 @@ with watchdog integration, automatic restart, and journal logging.
 
    | Placeholder | Example value |
    |-------------|---------------|
-   | `<USER>` | `cyprian` |
-   | `<BASTION_DIR>` | `/home/cyprian/BASTION` |
-   | `<PYTHON_PATH>` | `/home/cyprian/miniforge3/envs/phenotype/bin/python` |
+   | `<USER>` | `bastion` |
+   | `<BASTION_DIR>` | `/opt/bastion` |
+   | `<PYTHON_PATH>` | `/opt/bastion/.venv/bin/python` |
 
 4. **Enable GPU persistence:**
 

@@ -40,7 +40,10 @@ else
     echo "[!!] Could not find conda — continuing without activation"
 fi
 
-conda activate phenotype 2>/dev/null || true
+# Optionally activate a project-specific env by setting BASTION_CONDA_ENV.
+if [ -n "${BASTION_CONDA_ENV:-}" ]; then
+    conda activate "$BASTION_CONDA_ENV" 2>/dev/null || true
+fi
 
 python -c "import textual, httpx" 2>/dev/null || {
     echo "Installing required packages..."

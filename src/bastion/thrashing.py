@@ -2,7 +2,7 @@
 
 Tracks model swap patterns per agent and detects poorly-batched pipelines
 that cause GPU-damaging swap thrashing. Thresholds derived from RTX 5090
-crash investigation (Sessions S58-S62): crash zone >8 swaps/min.
+crash investigation: crash zone >8 swaps/min.
 
 Design: sliding window of recent requests per agent (keyed by X-Agent-Id
 or source IP). Computes swap ratio and returns a verdict (ok/warn/halt).
