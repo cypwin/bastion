@@ -623,10 +623,15 @@ class BastionDashboard(App):
         self._apply_layout()
 
     def action_toggle_secondary(self) -> None:
-        """Toggle secondary panels in full layout."""
+        """Toggle secondary panels (only effective in [3] full layout)."""
+        if self._layout_mode != "full":
+            self.notify(
+                "Secondary panels require [3] full layout",
+                severity="warning",
+            )
+            return
         self._show_secondary = not self._show_secondary
-        if self._layout_mode == "full":
-            self._apply_layout()
+        self._apply_layout()
 
     def action_sparkline_wider(self) -> None:
         """Increase sparkline width by 5 chars."""
