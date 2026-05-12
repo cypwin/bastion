@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add complexity-based model routing, response header enrichment, audit log extensions, and per-agent swap thrashing detection to BASTION, enabling SWARM_BRAIN M58 Smart Local Offloading.
+**Goal:** Add complexity-based model routing, response header enrichment, audit log extensions, and per-agent swap thrashing detection to BASTION, enabling M58 Smart Local Offloading for upstream agent orchestrators.
 
 **Architecture:** The proxy reads `X-Task-Complexity` headers and overrides the client-requested model before enqueueing. A new `ThrashingDetector` tracks per-agent swap patterns and issues warnings or halts. Audit events are enriched with routing metadata and token counts. All changes flow through existing proxy → queue → scheduler pipeline.
 
 **Tech Stack:** Python 3.12, FastAPI, Pydantic v2, httpx, pytest, asyncio
 
-**Spec:** `docs/superpowers/specs/2026-04-20-m58-bastion-integration-design.md`
+**Spec:** `docs/design/specs/2026-04-20-m58-bastion-integration-design.md`
 
 ---
 
@@ -100,7 +100,7 @@ class TestBrokerConfigWithComplexity:
 
 - [x] **Step 2: Run tests to verify they fail**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_complexity_routing.py -v`
+Run: `python -m pytest tests/test_complexity_routing.py -v`
 Expected: FAIL — `ImportError: cannot import name 'ComplexityRoutingConfig'`
 
 - [x] **Step 3: Implement config models**
@@ -143,7 +143,7 @@ In the `BrokerConfig` class (line 226), add two new fields after `request_overri
 
 - [x] **Step 4: Run tests to verify they pass**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_complexity_routing.py -v`
+Run: `python -m pytest tests/test_complexity_routing.py -v`
 Expected: 6 passed
 
 - [x] **Step 5: Update broker.yaml with new config sections**
@@ -177,7 +177,7 @@ thrashing_detection:
 
 - [x] **Step 6: Run full test suite to check for regressions**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_models.py tests/test_config.py tests/test_complexity_routing.py -v`
+Run: `python -m pytest tests/test_models.py tests/test_config.py tests/test_complexity_routing.py -v`
 Expected: all pass
 
 - [x] **Step 7: Commit**
@@ -379,7 +379,7 @@ class TestThrashingDetectorStats:
 
 - [x] **Step 2: Run tests to verify they fail**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_thrashing.py -v`
+Run: `python -m pytest tests/test_thrashing.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'bastion.thrashing'`
 
 - [x] **Step 3: Implement ThrashingDetector**
@@ -391,7 +391,7 @@ Create `src/bastion/thrashing.py`:
 
 Tracks model swap patterns per agent and detects poorly-batched pipelines
 that cause GPU-damaging swap thrashing. Thresholds derived from RTX 5090
-crash investigation (Sessions S58-S62): crash zone >8 swaps/min.
+crash investigation: crash zone >8 swaps/min.
 
 Design: sliding window of recent requests per agent (keyed by X-Agent-Id
 or source IP). Computes swap ratio and returns a verdict (ok/warn/halt).
@@ -550,7 +550,7 @@ class ThrashingDetector:
 
 - [x] **Step 4: Run tests to verify they pass**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_thrashing.py -v`
+Run: `python -m pytest tests/test_thrashing.py -v`
 Expected: all pass
 
 - [x] **Step 5: Commit**
@@ -577,7 +577,7 @@ EVENT_THRASHING = "thrashing"
 
 - [x] **Step 2: Run existing audit tests**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_audit.py tests/test_audit_tiered.py -v`
+Run: `python -m pytest tests/test_audit.py tests/test_audit_tiered.py -v`
 Expected: all pass (no functional change)
 
 - [x] **Step 3: Commit**
@@ -774,7 +774,7 @@ class TestComplexityRouting:
 
 - [x] **Step 2: Run tests to verify they fail**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_complexity_routing.py::TestComplexityRouting -v`
+Run: `python -m pytest tests/test_complexity_routing.py::TestComplexityRouting -v`
 Expected: FAIL — routing logic not implemented yet
 
 - [x] **Step 3: Implement complexity routing in proxy.py**
@@ -925,12 +925,12 @@ After receiving the response:
 
 - [x] **Step 4: Run tests to verify they pass**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_complexity_routing.py -v`
+Run: `python -m pytest tests/test_complexity_routing.py -v`
 Expected: all pass
 
 - [x] **Step 5: Run existing proxy tests for regressions**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_proxy.py -v`
+Run: `python -m pytest tests/test_proxy.py -v`
 Expected: all pass
 
 - [x] **Step 6: Commit**
@@ -1075,7 +1075,7 @@ And in `_stream_response` and `_forward_response`, inject the warning header if 
 
 - [x] **Step 4: Run all tests**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_complexity_routing.py tests/test_thrashing.py tests/test_proxy.py -v`
+Run: `python -m pytest tests/test_complexity_routing.py tests/test_thrashing.py tests/test_proxy.py -v`
 Expected: all pass
 
 - [x] **Step 5: Commit**
@@ -1125,7 +1125,7 @@ class TestStreamingTokenCapture:
 
 - [x] **Step 2: Run to verify failure**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_complexity_routing.py::TestStreamingTokenCapture -v`
+Run: `python -m pytest tests/test_complexity_routing.py::TestStreamingTokenCapture -v`
 Expected: FAIL — `_extract_streaming_tokens` not defined
 
 - [x] **Step 3: Implement streaming token extraction**
@@ -1193,7 +1193,7 @@ For now, the `_extract_streaming_tokens` helper exists and works — it can be w
 
 - [x] **Step 4: Run tests**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_complexity_routing.py::TestStreamingTokenCapture -v`
+Run: `python -m pytest tests/test_complexity_routing.py::TestStreamingTokenCapture -v`
 Expected: pass
 
 - [x] **Step 5: Commit**
@@ -1299,12 +1299,12 @@ class TestThrashingIntegration:
 
 - [x] **Step 2: Run full test suite**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_complexity_routing.py tests/test_thrashing.py -v`
+Run: `python -m pytest tests/test_complexity_routing.py tests/test_thrashing.py -v`
 Expected: all pass
 
 - [x] **Step 3: Run broader regression check**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/ -v --timeout=30`
+Run: `python -m pytest tests/ -v --timeout=30`
 Expected: all pass (or at least no new failures)
 
 - [x] **Step 4: Commit**

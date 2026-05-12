@@ -20,11 +20,11 @@ BASTION v0.3.0 is feature-complete for public release. Before setting up the Git
 
 ### Phase 1: Parallel Review (8 agents, read-only)
 
-All agents run simultaneously. No code changes during this phase. Each produces a structured findings report saved to `docs/superpowers/reviews/2026-04-08-<agent-name>.md`.
+All agents run simultaneously. No code changes during this phase. Each produces a structured findings report saved to `docs/design/reviews/2026-04-08-<agent-name>.md`.
 
 ### Phase 2: Merge & Prioritize
 
-Consolidate all 8 reports into a single master report at `docs/superpowers/reviews/2026-04-08-pre-launch-audit.md`. Deduplicate cross-agent findings with references.
+Consolidate all 8 reports into a single master report at `docs/design/reviews/2026-04-08-pre-launch-audit.md`. Deduplicate cross-agent findings with references.
 
 ### Phase 3: User Review
 

@@ -1,6 +1,6 @@
 # Implementation Plan: BASTION Observability-First Enhancement
 
-**Design Spec**: `docs/superpowers/specs/2026-03-13-observability-first-design.md`
+**Design Spec**: `docs/design/specs/2026-03-13-observability-first-design.md`
 **Audit Source**: `docs/audit/SYNTHESIS.md`
 **Workflow**: Implement -> Test -> Commit -> Q&A -> Plan next -> Context clear -> Repeat
 
@@ -56,7 +56,7 @@ Before modifying any code, each agent MUST verify the current state of fields/me
 
 ### Verification
 ```bash
-/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/ -v
+python -m pytest tests/ -v
 ```
 Confirm: `/broker/status` response includes all new fields. `/a2a/stats` returns store statistics.
 
@@ -95,7 +95,7 @@ Use qualified imports: `from bastion.metrics import record_queue_wait as metrics
 
 ### Verification
 ```bash
-/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/ -v
+python -m pytest tests/ -v
 ```
 Confirm: `/broker/metrics` returns non-zero values for all 17 metrics when prometheus_client is installed. OTel spans appear in trace output when SDK installed.
 
@@ -136,7 +136,7 @@ Confirm: `/broker/metrics` returns non-zero values for all 17 metrics when prome
 
 ### Verification
 ```bash
-/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/ -v
+python -m pytest tests/ -v
 ```
 Confirm: All 14 new endpoints return expected data. RequestID appears in response headers. Admin routes are rate-limited in two-port mode.
 
@@ -172,7 +172,7 @@ Confirm: All 14 new endpoints return expected data. RequestID appears in respons
 
 ### Verification
 ```bash
-/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/ -v
+python -m pytest tests/ -v
 ```
 Confirm: Dashboard shows all 12 new data dimensions. Alert conditions trigger visual changes. SSE endpoint streams events. Grafana artifacts are valid JSON/YAML.
 
@@ -200,7 +200,7 @@ Confirm: Dashboard shows all 12 new data dimensions. Alert conditions trigger vi
 
 ### Verification
 ```bash
-/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/ -v
+python -m pytest tests/ -v
 ```
 Full green. Documentation matches implementation.
 

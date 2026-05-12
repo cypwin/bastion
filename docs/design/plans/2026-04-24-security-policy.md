@@ -8,7 +8,7 @@
 
 **Tech Stack:** Markdown. No dependencies, no build step, no test framework involvement.
 
-**Spec:** `docs/superpowers/specs/2026-04-24-security-policy-design.md`
+**Spec:** `docs/design/specs/2026-04-24-security-policy-design.md`
 
 ---
 
@@ -245,7 +245,7 @@ gh pr create --base main --title "docs: add SECURITY.md" --body "$(cat <<'EOF'
 - [ ] Email smoke test received (Task 2 step 4)
 - [ ] GitHub markdown render verified (Task 2 step 5)
 
-Spec: docs/superpowers/specs/2026-04-24-security-policy-design.md
+Spec: docs/design/specs/2026-04-24-security-policy-design.md
 EOF
 )"
 ```

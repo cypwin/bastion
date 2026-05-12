@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.11+, argparse (CLI), httpx (HTTP checks), asyncio (GPU queries), Pydantic v2 (profile models), PyYAML (profile output), pytest + pytest-asyncio (tests)
 
-**Spec:** `docs/superpowers/specs/2026-04-23-production-readiness-design.md`
+**Spec:** `docs/design/specs/2026-04-23-production-readiness-design.md`
 
 ---
 
@@ -973,7 +973,7 @@ class TestGPUProfile:
 
 - [x] **Step 2: Run test to verify it fails**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_gpu_profiles.py -v`
+Run: `python -m pytest tests/test_gpu_profiles.py -v`
 
 Expected: `ModuleNotFoundError: No module named 'bastion.gpu_profiles'`
 
@@ -1156,7 +1156,7 @@ def lookup_profile(gpu_name: str) -> GPUProfile:
 
 - [x] **Step 4: Run tests to verify they pass**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_gpu_profiles.py -v`
+Run: `python -m pytest tests/test_gpu_profiles.py -v`
 
 Expected: All tests PASS
 
@@ -1310,7 +1310,7 @@ class TestRunAllChecks:
 
 - [x] **Step 2: Run tests to verify they fail**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_validate.py -v`
+Run: `python -m pytest tests/test_validate.py -v`
 
 Expected: `ModuleNotFoundError: No module named 'bastion.validate'`
 
@@ -1671,7 +1671,7 @@ def compute_exit_code(results: list[CheckResult]) -> int:
 
 - [x] **Step 4: Run tests to verify they pass**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_validate.py -v`
+Run: `python -m pytest tests/test_validate.py -v`
 
 Expected: All tests PASS (some may skip in environments without GPU/Ollama)
 
@@ -1736,7 +1736,7 @@ import sys
 
 - [x] **Step 4: Test manually**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m bastion --validate`
+Run: `python -m bastion --validate`
 
 Expected: Output showing PASS/WARN/FAIL for each check.
 
@@ -1891,7 +1891,7 @@ class TestSingleLoadPhase:
 
 - [x] **Step 2: Run tests to verify they fail**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_stress.py -v`
+Run: `python -m pytest tests/test_stress.py -v`
 
 Expected: `ModuleNotFoundError: No module named 'bastion.stress'`
 
@@ -2389,7 +2389,7 @@ def write_profile(result: CalibrationResult) -> Path:
 
 - [x] **Step 4: Run tests to verify they pass**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_stress.py -v`
+Run: `python -m pytest tests/test_stress.py -v`
 
 Expected: All tests PASS
 
@@ -2607,7 +2607,7 @@ def _confirm_continue() -> bool:
 
 - [x] **Step 4: Test that --stress-test flag is recognized**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m bastion --help`
+Run: `python -m bastion --help`
 
 Expected: `--stress-test` appears in the help output.
 
@@ -2736,7 +2736,7 @@ def _apply_gpu_profile(config: BrokerConfig, profile: dict) -> None:
 
 - [x] **Step 4: Run tests to verify they pass**
 
-Run: `/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/test_validate.py::TestGPUProfileLoading -v`
+Run: `python -m pytest tests/test_validate.py::TestGPUProfileLoading -v`
 
 Expected: PASS
 
@@ -2803,7 +2803,7 @@ git commit -m "feat: add Ctrl+C recovery handler to stress test"
 
 Print command for user:
 ```
-/home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/ -v
+python -m pytest tests/ -v
 ```
 
 Expected: All tests pass, including new tests in `test_gpu_profiles.py`, `test_validate.py`, and `test_stress.py`.
@@ -2811,8 +2811,8 @@ Expected: All tests pass, including new tests in `test_gpu_profiles.py`, `test_v
 - [x] **Step 2: Verify CLI flags work**
 
 ```bash
-/home/cyprian/miniforge3/envs/phenotype/bin/python -m bastion --help
-/home/cyprian/miniforge3/envs/phenotype/bin/python -m bastion --validate
+python -m bastion --help
+python -m bastion --validate
 ```
 
 - [x] **Step 3: Verify documentation links**
@@ -2824,7 +2824,7 @@ Check that all cross-references between docs resolve:
 
 - [x] **Step 4: Verify no internal references in public docs**
 
-Search all docs/ and README.md for: S1-S14, M58, RTX 5090, crash 7-9, session, forensic, investigation, cyprian (the user's name), SWARM_BRAIN, or any system-specific paths.
+Search all docs/ and README.md for: internal session tags, milestone codes, crash incident numbers, "session", "forensic", "investigation", the maintainer's username, upstream-orchestrator project names, or any system-specific paths.
 
 - [x] **Step 5: Final commit**
 

@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.11+, `httpx`, `pydantic` (used by the existing `bastion_client` package), Markdown. No new dependencies.
 
-**Spec:** `docs/superpowers/specs/2026-04-25-bastion-client-publish-prep-design.md`
+**Spec:** `docs/design/specs/2026-04-25-bastion-client-publish-prep-design.md`
 
 ---
 
@@ -16,7 +16,7 @@
 
 Working tree: `.worktrees/bastion-client/` on branch `chore/bastion-client-resolution`. Base commit: `1f85a0d` (spec commit) on top of `12a6ebb`.
 
-Canonical Python: `/home/cyprian/miniforge3/envs/phenotype/bin/python` (per `CLAUDE.md`).
+Canonical Python: `python` (per `CLAUDE.md`).
 
 Don't `git push`, don't `gh pr create`, don't run `twine`. The spec explicitly defers all of these to a future publish PR.
 
@@ -124,7 +124,7 @@ pip install ../../clients/bastion-client/
 Run:
 
 ```bash
-/home/cyprian/miniforge3/envs/phenotype/bin/python -c "import ast; ast.parse(open('examples/python-client/example.py').read())"
+python -c "import ast; ast.parse(open('examples/python-client/example.py').read())"
 ```
 
 Expected: no output, exit code 0. If syntax is broken, fix before continuing.
@@ -134,7 +134,7 @@ Expected: no output, exit code 0. If syntax is broken, fix before continuing.
 Run:
 
 ```bash
-PYTHONPATH=clients/bastion-client /home/cyprian/miniforge3/envs/phenotype/bin/python -c "from bastion_client import BastionClient; print('ok')"
+PYTHONPATH=clients/bastion-client python -c "from bastion_client import BastionClient; print('ok')"
 ```
 
 Expected output: `ok`. If `ImportError`, the package source has drifted from the example's expectations — stop and reconcile.
@@ -281,7 +281,7 @@ Expected: the fallback section still appears and references `X-Broker-Priority`.
 Run:
 
 ```bash
-/home/cyprian/miniforge3/envs/phenotype/bin/python -c "import ast; ast.parse(open('examples/priority-tiers/multi_client.py').read())"
+python -c "import ast; ast.parse(open('examples/priority-tiers/multi_client.py').read())"
 ```
 
 Expected: no output, exit code 0.
@@ -469,7 +469,7 @@ Expected: empty output.
 
 What we **expect to find** (and explicitly tolerate):
 - Hits inside `_archive/` — old artifacts, not user-facing
-- Hits inside `docs/superpowers/specs/` and `docs/superpowers/plans/` — internal design history
+- Hits inside `docs/design/specs/` and `docs/design/plans/` — internal design history
 - The single hit in `docs/releasing.md`'s future-publish numbered list, where the string is shown as the *eventual* post-publish command
 
 If anything else matches, edit that file to use the path-install form before continuing.
@@ -489,7 +489,7 @@ Expected: two matches, one in each file.
 Run from the repo root:
 
 ```bash
-cd clients/bastion-client && /home/cyprian/miniforge3/envs/phenotype/bin/python -m pytest tests/ -v && cd -
+cd clients/bastion-client && python -m pytest tests/ -v && cd -
 ```
 
 Expected: all tests pass. We didn't modify package source, so this should be green.
@@ -499,9 +499,9 @@ Expected: all tests pass. We didn't modify package source, so this should be gre
 Run:
 
 ```bash
-cd clients/bastion-client && /home/cyprian/miniforge3/envs/phenotype/bin/python -m build && cd -
+cd clients/bastion-client && python -m build && cd -
 ls clients/bastion-client/dist/
-/home/cyprian/miniforge3/envs/phenotype/bin/python -m zipfile -l clients/bastion-client/dist/bastion_client-0.2.0-py3-none-any.whl
+python -m zipfile -l clients/bastion-client/dist/bastion_client-0.2.0-py3-none-any.whl
 ```
 
 Expected:
@@ -511,7 +511,7 @@ Expected:
 If `python -m build` reports the `build` package isn't installed, install it into the env first:
 
 ```bash
-/home/cyprian/miniforge3/envs/phenotype/bin/python -m pip install build
+python -m pip install build
 ```
 
 - [ ] **Step 5: Confirm the path-install round-trips**
@@ -519,7 +519,7 @@ If `python -m build` reports the `build` package isn't installed, install it int
 Run:
 
 ```bash
-/home/cyprian/miniforge3/envs/phenotype/bin/python -m venv /tmp/bc-roundtrip
+python -m venv /tmp/bc-roundtrip
 /tmp/bc-roundtrip/bin/pip install clients/bastion-client/dist/bastion_client-0.2.0-py3-none-any.whl
 /tmp/bc-roundtrip/bin/python -c "from bastion_client import BastionClient; print(BastionClient)"
 rm -rf /tmp/bc-roundtrip clients/bastion-client/dist clients/bastion-client/bastion_client.egg-info

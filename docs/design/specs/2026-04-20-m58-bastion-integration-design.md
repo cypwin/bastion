@@ -2,14 +2,14 @@
 
 > **Date:** 2026-04-20
 > **Status:** Approved
-> **Source:** M58_BASTION_HANDOFF.md (from SWARM_BRAIN)
+> **Source:** Internal handoff document from the upstream agent orchestrator
 > **Scope:** BASTION-side implementation for M58 Smart Local Offloading
 
 ---
 
 ## 1. Problem Statement
 
-SWARM_BRAIN M58 introduces smart offloading — routing sub-tasks (summarization,
+The M58 design introduces smart offloading — routing sub-tasks (summarization,
 classification, advisory composition) to local LLMs via BASTION instead of
 consuming Claude API tokens. The client-side is complete (D0-D5 implemented).
 BASTION needs to:
@@ -36,7 +36,7 @@ BASTION needs to:
 
 ### 3.1 New Header: `X-Task-Complexity`
 
-Set by SWARM_BRAIN's `OllamaClient` on every outgoing request:
+Set by the upstream client's Ollama wrapper on every outgoing request:
 
 ```
 X-Task-Complexity: simple | moderate | complex
@@ -176,8 +176,7 @@ Emitted when the thrashing detector issues a warn or halt verdict:
 
 ### 6.1 Motivation
 
-The RTX 5090 crash investigation (Sessions S58-S62) established empirical
-thresholds:
+The RTX 5090 crash investigation established empirical thresholds:
 
 | Swap Rate | Observed Behavior |
 |-----------|-------------------|
