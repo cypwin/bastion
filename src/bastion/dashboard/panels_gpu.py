@@ -58,7 +58,7 @@ class GPUPanel(Static):
         if hasattr(app, "vram_history") and app.vram_history:
             vram_spark = (
                 sparkline_abs(list(app.vram_history), lo_bound=0, hi_bound=vram_total_mb, width=w)
-                if vram_total_mb
+                if vram_total_mb is not None
                 else sparkline(list(app.vram_history), w)
             )
             table.add_row(
