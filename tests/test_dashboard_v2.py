@@ -238,3 +238,39 @@ def test_toggle_secondary_guard_present_in_source() -> None:
     guard_pos = source.index('_layout_mode != "full"')
     flip_pos = source.index("_show_secondary = not")
     assert flip_pos > guard_pos, "state flip must follow the guard"
+
+
+def test_vram_alert_uses_configured_budget_not_hardware_total() -> None:
+    """VRAM alert thresholds must be evaluated against max_vram_gb, not the
+    raw hardware total — otherwise alerts fire after the broker is already
+    refusing loads."""
+    from bastion.dashboard.app import BastionDashboard
+
+    # 24 GB budget, 32 GB hardware. Used = 24 GB exactly.
+    # Hardware-percentage: 24 / 32 = 75% → no alert.
+    # Budget-percentage:   24 / 24 = 100% → CRIT.
+    data = {
+        "gpu": {
+            "vram_used_mb": 24 * 1024,
+            "vram_total_mb": 32 * 1024,
+        },
+        "config": {"max_vram_gb": 24.0},
+        "queue_depth": 0,
+        "scheduler_state": "running",
+    }
+
+    # Build a minimal shim that exposes the attributes _evaluate_alerts reads.
+    # _connected=True suppresses the unrelated "Broker unreachable" alert so
+    # that the assertions below focus purely on VRAM threshold behavior.
+    class _Shim:
+        alert_history: deque = deque(maxlen=100)
+        _connected: bool = True
+        _consecutive_failures: int = 0
+
+    shim = _Shim()
+    alerts = BastionDashboard._evaluate_alerts(shim, data)  # type: ignore[arg-type]
+
+    # Expect a CRITICAL VRAM alert (the broker is at budget ceiling)
+    crit = [a for a in alerts if a.get("severity") == "critical"
+            and "VRAM" in a.get("message", "")]
+    assert crit, f"expected a CRITICAL VRAM alert at budget ceiling; got {alerts}"
