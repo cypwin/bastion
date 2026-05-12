@@ -348,3 +348,36 @@ def test_all_modals_bind_escape_to_dismiss() -> None:
             if key:
                 keys.append(key)
         assert "escape" in keys, f"{cls.__name__} does not bind escape"
+
+
+def test_sparkline_abs_normalizes_against_fixed_bounds() -> None:
+    """sparkline_abs takes (lo_bound, hi_bound) and normalizes against them,
+    not against min(values)/max(values)."""
+    from bastion.dashboard.helpers import sparkline_abs
+    blocks = " ▁▂▃▄▅▆▇█"
+
+    # Values clustered near the top of the absolute range should render as
+    # near-full blocks, not as a flat low-amplitude line.
+    near_top = [90, 91, 92, 93, 94, 95]
+    out = sparkline_abs(near_top, lo_bound=0, hi_bound=100, width=6)
+    assert len(out) == 6
+    # Each char should be in the upper half of the block ramp (index >= 4)
+    for ch in out:
+        assert blocks.index(ch) >= 4, f"{ch!r} should be in upper half for value >=90 of 100"
+
+
+def test_sparkline_abs_below_lo_bound_clamps_to_zero() -> None:
+    from bastion.dashboard.helpers import sparkline_abs
+    out = sparkline_abs([-10, -5, 0], lo_bound=0, hi_bound=100, width=3)
+    assert out == "   ", f"values at/below lo_bound should render as blanks; got {out!r}"
+
+
+def test_sparkline_abs_above_hi_bound_clamps_to_full_block() -> None:
+    from bastion.dashboard.helpers import sparkline_abs
+    out = sparkline_abs([105, 110, 115], lo_bound=0, hi_bound=100, width=3)
+    assert all(ch == "█" for ch in out), f"values above hi_bound should clamp to full; got {out!r}"
+
+
+def test_sparkline_abs_empty_returns_empty() -> None:
+    from bastion.dashboard.helpers import sparkline_abs
+    assert sparkline_abs([], lo_bound=0, hi_bound=100) == ""
