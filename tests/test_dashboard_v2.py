@@ -326,3 +326,25 @@ def test_service_restart_uses_async_subprocess() -> None:
     assert "run_worker" in source, (
         "action_service_restart must dispatch via run_worker to avoid blocking the TUI"
     )
+
+
+def test_all_modals_bind_escape_to_dismiss() -> None:
+    """Every modal must dismiss on Escape — universal TUI contract."""
+    from bastion.dashboard import modals
+    from textual.screen import ModalScreen
+
+    modal_classes = [
+        cls for name, cls in vars(modals).items()
+        if isinstance(cls, type) and issubclass(cls, ModalScreen) and cls is not ModalScreen
+    ]
+    assert modal_classes, "no modal classes found in modals.py"
+
+    for cls in modal_classes:
+        bindings = getattr(cls, "BINDINGS", [])
+        keys = []
+        for b in bindings:
+            # Bindings may be Binding objects or tuples
+            key = getattr(b, "key", None) or (b[0] if isinstance(b, tuple) else None)
+            if key:
+                keys.append(key)
+        assert "escape" in keys, f"{cls.__name__} does not bind escape"
