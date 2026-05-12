@@ -1,0 +1,50 @@
+name: Release bastion-client
+
+on:
+  push:
+    tags:
+      - "client-v*"
+
+jobs:
+  pypi:
+    name: Publish bastion-client to PyPI
+    runs-on: ubuntu-latest
+    environment: pypi-client
+    permissions:
+      id-token: write
+    defaults:
+      run:
+        working-directory: clients/bastion-client
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: clients/bastion-client/dist
+
+  github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: pypi
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          name: "bastion-client ${{ github.ref_name }}"
