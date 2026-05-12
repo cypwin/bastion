@@ -21,6 +21,7 @@ class TemperaturePanel(Static):
         cpu_temp: int | None = None,
         nvme_temps: list[int] | None = None,
         gpu_temp: int | None = None,
+        gpu_ceiling_c: int = 85,
     ) -> Table:
         table = Table(title="Temperatures", expand=True, show_header=True)
         table.add_column("Component", style="cyan")
@@ -53,10 +54,13 @@ class TemperaturePanel(Static):
 
         if gpu_temp is not None:
             has_any = True
-            if gpu_temp >= 85:
+            # Crit at or above profile ceiling; warn within 8\u00b0C below it.
+            crit = gpu_ceiling_c
+            warn = crit - 8
+            if gpu_temp >= crit:
                 style, status = "red bold", "!"
-            elif gpu_temp >= 75:
-                style, status = "dark_orange", "?"
+            elif gpu_temp >= warn:
+                style, status = "yellow bold", "?"
             else:
                 style, status = "green", "ok"
             table.add_row("GPU", f"[{style}]{gpu_temp}\u00b0C[/]", f"[{style}]{status}[/]")
