@@ -736,6 +736,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
 
         # T1-10: max_vram_gb from config
         result["max_vram_gb"] = config.gpu.max_vram_gb
+        result["max_temperature_c"] = config.gpu.max_temperature_c
 
         # T1-06: gpu_is_safe computed from GPUStatus.is_safe(config.gpu)
         result["gpu_is_safe"] = gpu.is_safe(config.gpu)
@@ -1428,6 +1429,7 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
 
         # T1-10: max_vram_gb from config
         result["max_vram_gb"] = config.gpu.max_vram_gb
+        result["max_temperature_c"] = config.gpu.max_temperature_c
 
         # T1-06: gpu_is_safe computed from GPUStatus.is_safe(config.gpu)
         result["gpu_is_safe"] = gpu.is_safe(config.gpu)
