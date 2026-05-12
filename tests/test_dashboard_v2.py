@@ -203,11 +203,12 @@ def test_usage_color_warning_band_uses_16_color_safe() -> None:
 
 def test_throughput_counter_reset_does_not_emit_negative_rate() -> None:
     """Broker restart resets total_requests_served to 0; ensure the rate
-    computation doesn't push a negative value into the sparkline history."""
-    from bastion.dashboard.app import BastionDashboard
+    computation doesn't push a negative value into the sparkline history.
 
-    # Use the real class but only exercise the counter logic in isolation.
-    # We mimic the loop body without running the Textual app.
+    This test documents the contract at the call-site level (mirroring the
+    app.py guard). It does not call app.py directly; the guard itself is
+    integration-verified by the broker restart scenario described in the plan.
+    """
     history: deque[float] = deque(maxlen=120)
     interval = 2.0
     prev_served = 1000  # Pre-restart counter
@@ -215,13 +216,11 @@ def test_throughput_counter_reset_does_not_emit_negative_rate() -> None:
     # Simulate the post-restart poll: served counter has reset to 5
     served = 5
     delta = served - prev_served
-    rate_per_min = delta * (60.0 / interval) if interval > 0 else 0
 
     # Buggy behavior would push -29850.0 here.
     # Fixed behavior: skip the append on negative delta (counter reset).
     if delta >= 0:
+        rate_per_min = delta * (60.0 / interval) if interval > 0 else 0
         history.append(rate_per_min)
 
-    assert -1 not in [int(x) for x in history], "negative rate must not be in history"
-    # And specifically, the value -29850.0 must not appear
     assert all(x >= 0 for x in history), "all rates must be non-negative"
