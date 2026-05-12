@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Label
@@ -68,6 +69,8 @@ def set_fan_speed(speed: str) -> tuple[bool, str]:
 class ConfirmActionModal(ModalScreen[bool]):
     """Generic confirmation dialog for destructive actions."""
 
+    BINDINGS = [Binding("escape", "dismiss_cancel", "Cancel", show=False)]
+
     DEFAULT_CSS = """
     ConfirmActionModal {
         align: center middle;
@@ -108,6 +111,9 @@ class ConfirmActionModal(ModalScreen[bool]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "confirm-yes")
 
+    def action_dismiss_cancel(self) -> None:
+        self.dismiss(False)
+
 
 # ---------------------------------------------------------------------------
 # Model selection modal
@@ -115,6 +121,8 @@ class ConfirmActionModal(ModalScreen[bool]):
 
 class ModelSelectModal(ModalScreen[str]):
     """Modal to select a model from a list."""
+
+    BINDINGS = [Binding("escape", "dismiss_cancel", "Cancel", show=False)]
 
     DEFAULT_CSS = """
     ModelSelectModal {
@@ -149,6 +157,9 @@ class ModelSelectModal(ModalScreen[str]):
             model_name = event.button.id.replace("model-", "", 1) if event.button.id else ""
             self.dismiss(model_name)
 
+    def action_dismiss_cancel(self) -> None:
+        self.dismiss("")
+
 
 # ---------------------------------------------------------------------------
 # Help modal
@@ -156,6 +167,8 @@ class ModelSelectModal(ModalScreen[str]):
 
 class HelpModal(ModalScreen[bool]):
     """Help overlay showing all keyboard bindings."""
+
+    BINDINGS = [Binding("escape", "dismiss_cancel", "Cancel", show=False)]
 
     DEFAULT_CSS = """
     HelpModal {
@@ -217,6 +230,9 @@ class HelpModal(ModalScreen[bool]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(True)
 
+    def action_dismiss_cancel(self) -> None:
+        self.dismiss(False)
+
 
 # ---------------------------------------------------------------------------
 # Fan control modal
@@ -224,6 +240,8 @@ class HelpModal(ModalScreen[bool]):
 
 class FanControlModal(ModalScreen[str]):
     """Fan speed selection modal with auto-trigger toggle."""
+
+    BINDINGS = [Binding("escape", "dismiss_cancel", "Cancel", show=False)]
 
     DEFAULT_CSS = """
     FanControlModal {
@@ -301,6 +319,9 @@ class FanControlModal(ModalScreen[str]):
             speed = btn_id.replace("fan-", "")
             self.dismiss(speed)
 
+    def action_dismiss_cancel(self) -> None:
+        self.dismiss("")
+
 
 # ---------------------------------------------------------------------------
 # GPU process list modal
@@ -308,6 +329,8 @@ class FanControlModal(ModalScreen[str]):
 
 class GPUProcessListModal(ModalScreen[str]):
     """List GPU processes and select one to kill."""
+
+    BINDINGS = [Binding("escape", "dismiss_cancel", "Cancel", show=False)]
 
     DEFAULT_CSS = """
     GPUProcessListModal {
@@ -362,6 +385,9 @@ class GPUProcessListModal(ModalScreen[str]):
             pid = btn_id.replace("gpuproc-", "")
             self.dismiss(pid)
 
+    def action_dismiss_cancel(self) -> None:
+        self.dismiss("")
+
 
 # ---------------------------------------------------------------------------
 # Confirm GPU kill modal
@@ -369,6 +395,8 @@ class GPUProcessListModal(ModalScreen[str]):
 
 class ConfirmGPUKillModal(ModalScreen[str]):
     """Confirm kill of a GPU process with normal and force options."""
+
+    BINDINGS = [Binding("escape", "dismiss_cancel", "Cancel", show=False)]
 
     DEFAULT_CSS = """
     ConfirmGPUKillModal {
@@ -425,3 +453,6 @@ class ConfirmGPUKillModal(ModalScreen[str]):
             self.dismiss("kill")
         elif btn_id == "kill-force":
             self.dismiss("kill-9")
+
+    def action_dismiss_cancel(self) -> None:
+        self.dismiss("")
