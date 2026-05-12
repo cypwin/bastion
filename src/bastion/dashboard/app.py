@@ -517,13 +517,22 @@ class BastionDashboard(App):
 
         gpu = data.get("gpu", {})
         vram_used = gpu.get("vram_used_mb")
-        vram_total = gpu.get("vram_total_mb")
+        vram_hw_total = gpu.get("vram_total_mb")
         temp = gpu.get("temperature_c")
         queue_depth = data.get("queue_depth", 0)
 
+        # Use configured budget as the alert denominator, not the hardware total.
+        # The broker refuses loads at max_vram_gb; alerts must fire at or before
+        # that boundary, not 3 GB past it.
+        cfg_budget_gb = data.get("config", {}).get("max_vram_gb")
+        if cfg_budget_gb is not None:
+            vram_budget = cfg_budget_gb * 1024
+        else:
+            vram_budget = vram_hw_total
+
         # VRAM alerts
-        if vram_used is not None and vram_total and vram_total > 0:
-            pct = vram_used / vram_total * 100
+        if vram_used is not None and vram_budget and vram_budget > 0:
+            pct = vram_used / vram_budget * 100
             if pct >= AlertPanel.VRAM_CRIT_PCT:
                 alerts.append({
                     "severity": AlertPanel.SEVERITY_CRITICAL,
