@@ -36,10 +36,21 @@ class ThrashingCheckResult:
 
 
 @dataclass
+class AgentThrashingSnapshot:
+    """Point-in-time snapshot of one agent's thrashing state for the API."""
+    agent_id: str
+    verdict: ThrashingVerdict
+    cooloff_remaining_s: float
+    swap_ratio: float
+    last_run_s: float  # seconds since last record_request call (monotonic delta)
+
+
+@dataclass
 class _AgentWindow:
     """Sliding window of recent model requests for one agent."""
     models: deque[str] = field(default_factory=deque)
     cooloff_until: float = 0.0  # monotonic time when cooloff expires
+    last_seen: float = field(default_factory=time.monotonic)  # monotonic time of last record_request call
 
 
 class ThrashingDetector:
@@ -80,6 +91,7 @@ class ThrashingDetector:
             window = _AgentWindow(models=deque(maxlen=self._config.window_size))
             self._agents[agent_id] = window
         window.models.append(model)
+        window.last_seen = time.monotonic()
 
     def check(self, agent_id: str) -> ThrashingCheckResult:
         """Check if an agent is thrashing.
@@ -139,6 +151,29 @@ class ThrashingDetector:
             self._total_warnings += 1
 
         return result
+
+    def snapshot(self) -> list[AgentThrashingSnapshot]:
+        """Return a point-in-time snapshot of every tracked agent's state.
+
+        Each agent is evaluated via ``check()`` so verdict and cooloff_remaining
+        are computed consistently with existing logic.  ``last_run_s`` is derived
+        from ``_AgentWindow.last_seen`` (monotonic delta since last
+        ``record_request`` call).
+        """
+        now = time.monotonic()
+        results: list[AgentThrashingSnapshot] = []
+        for agent_id, window in self._agents.items():
+            result = self.check(agent_id)
+            results.append(
+                AgentThrashingSnapshot(
+                    agent_id=agent_id,
+                    verdict=result.level,
+                    cooloff_remaining_s=result.cooloff_remaining,
+                    swap_ratio=result.swap_ratio,
+                    last_run_s=now - window.last_seen,
+                )
+            )
+        return results
 
     @staticmethod
     def _compute_swap_ratio(models: list[str]) -> float:
