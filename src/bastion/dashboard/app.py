@@ -87,13 +87,6 @@ class BastionDashboard(App):
     #left-col, #right-col, #third-col {
         width: 1fr;
     }
-
-    Static {
-        border: solid $primary-background;
-        height: auto;
-        min-height: 5;
-        padding: 0 1;
-    }
     """
 
     BINDINGS = [

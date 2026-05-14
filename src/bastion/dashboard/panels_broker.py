@@ -6,7 +6,6 @@ from typing import Any
 
 from rich.table import Table
 from rich.text import Text
-from textual.widgets import Static
 
 from bastion.dashboard.helpers import (
     SPARKLINE_WIDTH,
@@ -15,9 +14,10 @@ from bastion.dashboard.helpers import (
     sparkline,
     state_color,
 )
+from bastion.dashboard.widgets import BastionPanel
 
 
-class QueuePanel(Static):
+class QueuePanel(BastionPanel):
     """Queue depth by model, scheduler state, and stall diagnostics."""
 
     def render_data(
@@ -91,7 +91,7 @@ class QueuePanel(Static):
         return table
 
 
-class SchedulerPanel(Static):
+class SchedulerPanel(BastionPanel):
     """Scheduler uptime, requests served, model swaps, throughput and swap rate sparklines."""
 
     def render_data(
@@ -135,7 +135,7 @@ class SchedulerPanel(Static):
         return table
 
 
-class CircuitBreakerPanel(Static):
+class CircuitBreakerPanel(BastionPanel):
     """Circuit breaker state, failure count, and recovery countdown."""
 
     def render_data(self, health_data: dict[str, Any]) -> Table:
@@ -167,7 +167,7 @@ class CircuitBreakerPanel(Static):
         return table
 
 
-class WatchdogPanel(Static):
+class WatchdogPanel(BastionPanel):
     """Process monitor status: Ollama health and GPU responsiveness."""
 
     def render_data(
@@ -249,7 +249,7 @@ class WatchdogPanel(Static):
         return table
 
 
-class AlertPanel(Static):
+class AlertPanel(BastionPanel):
     """Severity-tiered alert display with auto-dismiss."""
 
     SEVERITY_INFO = "info"

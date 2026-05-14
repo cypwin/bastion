@@ -5,7 +5,6 @@ from typing import Any
 
 from rich.table import Table
 from rich.text import Text
-from textual.widgets import Static
 
 from bastion.dashboard.helpers import (
     SPARKLINE_WIDTH,
@@ -17,9 +16,10 @@ from bastion.dashboard.helpers import (
     usage_color,
     vram_bar,
 )
+from bastion.dashboard.widgets import BastionPanel
 
 
-class GPUPanel(Static):
+class GPUPanel(BastionPanel):
     """GPU temperature, VRAM, and power status."""
 
     def render_data(
@@ -84,7 +84,7 @@ class GPUPanel(Static):
         return table
 
 
-class ModelsPanel(Static):
+class ModelsPanel(BastionPanel):
     """Currently loaded models in Ollama."""
 
     def render_data(self, data: dict[str, Any]) -> Table:
@@ -112,7 +112,7 @@ class ModelsPanel(Static):
         return table
 
 
-class VRAMLedgerPanel(Static):
+class VRAMLedgerPanel(BastionPanel):
     """VRAM budget panel showing VRAMManager's allocated/reserved ledger."""
 
     def render_data(self, ledger: dict[str, Any]) -> Table:
