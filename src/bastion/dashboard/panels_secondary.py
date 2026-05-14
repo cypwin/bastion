@@ -6,16 +6,16 @@ from typing import Any
 
 from rich.table import Table
 from rich.text import Text
-from textual.widgets import Static
 
 from bastion.dashboard.helpers import (
     a2a_state_color,
     format_countdown,
     lease_state_color,
 )
+from bastion.dashboard.widgets import BastionPanel
 
 
-class TracePanel(Static):
+class TracePanel(BastionPanel):
     """Live request trace viewer showing recent requests."""
 
     def render_data(self, recent: list[dict]) -> Table:
@@ -46,7 +46,7 @@ class TracePanel(Static):
         return table
 
 
-class A2ATaskPanel(Static):
+class A2ATaskPanel(BastionPanel):
     """Active A2A tasks display showing state and skill types."""
 
     def render_data(self, status_data: dict[str, Any]) -> Table:
@@ -94,7 +94,7 @@ class A2ATaskPanel(Static):
         return table
 
 
-class LeasePanel(Static):
+class LeasePanel(BastionPanel):
     """Active model leases/reservations panel."""
 
     def render_data(self, status_data: dict[str, Any]) -> Table:
@@ -136,7 +136,7 @@ class LeasePanel(Static):
         return table
 
 
-class AuditStreamPanel(Static):
+class AuditStreamPanel(BastionPanel):
     """Last N audit events panel."""
 
     def render_data(self, events: list[dict]) -> Table:

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from rich.table import Table
 from rich.text import Text
-from textual.widgets import Static
 
 from bastion.dashboard.helpers import (
     core_char,
@@ -11,9 +10,10 @@ from bastion.dashboard.helpers import (
     sparkline,
     usage_color,
 )
+from bastion.dashboard.widgets import BastionPanel
 
 
-class TemperaturePanel(Static):
+class TemperaturePanel(BastionPanel):
     """Displays CPU, NVMe, and GPU temperatures with status indicators."""
 
     def render_data(
@@ -71,7 +71,7 @@ class TemperaturePanel(Static):
         return table
 
 
-class MemoryPanel(Static):
+class MemoryPanel(BastionPanel):
     """Displays RAM and swap usage."""
 
     def render_data(self, mem: dict | None = None) -> Table:
@@ -104,7 +104,7 @@ class MemoryPanel(Static):
         return table
 
 
-class CPUPanel(Static):
+class CPUPanel(BastionPanel):
     """Displays CPU usage, load average, frequency, per-core map, and top processes."""
 
     def render_data(
@@ -156,7 +156,7 @@ class CPUPanel(Static):
         return table
 
 
-class NetworkPanel(Static):
+class NetworkPanel(BastionPanel):
     """Displays network throughput and totals."""
 
     def render_data(
