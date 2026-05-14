@@ -515,6 +515,22 @@ class BrokerStatus(BaseModel):
 # S7: A2A models (continued — these depend on PriorityTier)
 # ---------------------------------------------------------------------------
 
+class BrokerCounters(BaseModel):
+    """Cumulative broker counters since the last process start.
+
+    ``reset_epoch`` is set once at broker startup and is identical across all
+    calls within one process lifetime.  Consumers use it to detect a broker
+    restart: any change in ``reset_epoch`` means all counter deltas must be
+    discarded (or treated as a full-window reset) to avoid negative-delta rates.
+    """
+
+    reset_epoch: str  # ISO-8601 UTC timestamp of broker start
+    total_requests_served: int
+    total_dispatched: int
+    model_swap_total: int
+    thrashing_halt_total: int
+
+
 class BatchInferRequest(BaseModel):
     """Parameters for the batch_infer skill."""
     model: str

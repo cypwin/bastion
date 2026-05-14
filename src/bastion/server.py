@@ -24,6 +24,7 @@ import time
 from collections import deque
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -39,6 +40,7 @@ from bastion.metrics import CONTENT_TYPE_LATEST, PROMETHEUS_AVAILABLE, get_metri
 from bastion.middleware import MetricsMiddleware
 from bastion.models import (
     BrokerConfig,
+    BrokerCounters,
     BrokerStatus,
     IntentDeclaration,
     IntentResponse,
@@ -73,6 +75,7 @@ _config: BrokerConfig | None = None
 _process_monitor: ProcessMonitor | None = None
 _sweep_task: asyncio.Task | None = None
 _start_time: float = 0.0
+_reset_epoch: str = ""  # ISO-8601 UTC timestamp set once at broker startup
 _thrashing_detector: ThrashingDetector | None = None
 
 # Maps request ID -> asyncio.Event that the scheduler sets when the request
@@ -398,7 +401,7 @@ async def _startup_self_test(config: BrokerConfig) -> None:
 async def lifespan(app: FastAPI) -> AsyncGenerator:
     """Manage proxy, tracker, queue, and scheduler lifecycle."""
     global _proxy, _vram_tracker, _vram_manager, _queue, _scheduler
-    global _a2a_handler, _a2a_http_client, _start_time
+    global _a2a_handler, _a2a_http_client, _start_time, _reset_epoch
 
     config: BrokerConfig = app.state.config
 
@@ -529,6 +532,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     )
     _scheduler._dispatch_error_fn = _dispatch_error_cleanup
     _start_time = time.time()
+    _reset_epoch = datetime.now(timezone.utc).isoformat()
 
     # Initialize A2A handler if enabled
     if config.a2a.enabled:
@@ -935,6 +939,26 @@ def create_app(config: BrokerConfig) -> FastAPI:
     async def broker_recent():
         """Return last 50 completed requests for dashboard trace viewer."""
         return list(_recent_requests)
+
+    # ── Counters (WT-C-A-05) ────────────────────────────────────────
+
+    @broker_router.get("/counters")
+    async def broker_counters() -> BrokerCounters:
+        """Cumulative counters since broker startup with a reset_epoch sentinel.
+
+        Consumers compare ``reset_epoch`` across polls to detect a broker
+        restart; any change means all counter deltas must be discarded to
+        avoid computing negative-delta rates.
+        """
+        return BrokerCounters(
+            reset_epoch=_reset_epoch,
+            total_requests_served=_proxy._requests_served if _proxy else 0,
+            total_dispatched=_scheduler.total_dispatched if _scheduler else 0,
+            model_swap_total=_scheduler.total_swaps if _scheduler else 0,
+            thrashing_halt_total=(
+                _thrashing_detector.total_halts if _thrashing_detector else 0
+            ),
+        )
 
     # ── S6: Model Intent API ────────────────────────────────────────
 
@@ -1597,6 +1621,26 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
     async def broker_recent():
         """Return last 50 completed requests for dashboard trace viewer."""
         return list(_recent_requests)
+
+    # ── Counters (WT-C-A-05) ────────────────────────────────────────
+
+    @broker_router.get("/counters")
+    async def broker_counters() -> BrokerCounters:
+        """Cumulative counters since broker startup with a reset_epoch sentinel.
+
+        Consumers compare ``reset_epoch`` across polls to detect a broker
+        restart; any change means all counter deltas must be discarded to
+        avoid computing negative-delta rates.
+        """
+        return BrokerCounters(
+            reset_epoch=_reset_epoch,
+            total_requests_served=_proxy._requests_served if _proxy else 0,
+            total_dispatched=_scheduler.total_dispatched if _scheduler else 0,
+            model_swap_total=_scheduler.total_swaps if _scheduler else 0,
+            thrashing_halt_total=(
+                _thrashing_detector.total_halts if _thrashing_detector else 0
+            ),
+        )
 
     @broker_router.post("/intent")
     async def broker_intent(request: Request):
