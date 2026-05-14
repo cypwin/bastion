@@ -68,3 +68,46 @@ def test_broker_counters_shape_and_reset_epoch_stable():
     # reset_epoch is stable across multiple calls within one process lifetime
     assert resp2.status_code == 200
     assert resp2.json()["reset_epoch"] == data["reset_epoch"]
+
+
+def test_broker_thrashing_shape_and_verdicts():
+    """GET /broker/thrashing returns correct schema; fresh broker has zero agents."""
+    app = create_app(BrokerConfig())
+    with tempfile.TemporaryDirectory() as tmpdir:
+        audit_path = os.path.join(tmpdir, "bastion-audit.jsonl")
+        with (
+            patch("bastion.paths.audit_log_path", return_value=audit_path),
+            TestClient(app) as client,
+        ):
+            resp = client.get("/broker/thrashing")
+
+    assert resp.status_code == 200
+    data = resp.json()
+
+    # Top-level keys must be present
+    assert "detector_state" in data
+    assert "agents" in data
+
+    # detector_state must be a valid verdict label
+    valid_verdicts = {"OK", "WARNED", "HALTED"}
+    assert data["detector_state"] in valid_verdicts
+
+    # Fresh broker has no tracked agents; global verdict defaults to "OK"
+    assert data["agents"] == []
+    assert data["detector_state"] == "OK"
+
+    # If agents were present, each must have required fields with valid types
+    for agent in data["agents"]:
+        assert "agent_id" in agent
+        assert isinstance(agent["agent_id"], str)
+        assert "verdict" in agent
+        assert agent["verdict"] in valid_verdicts
+        assert "cooloff_remaining_s" in agent
+        assert isinstance(agent["cooloff_remaining_s"], (int, float))
+        assert agent["cooloff_remaining_s"] >= 0.0
+        assert "swap_ratio" in agent
+        assert isinstance(agent["swap_ratio"], (int, float))
+        assert 0.0 <= agent["swap_ratio"] <= 1.0
+        assert "last_run_s" in agent
+        assert isinstance(agent["last_run_s"], (int, float))
+        assert agent["last_run_s"] >= 0.0

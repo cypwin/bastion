@@ -41,6 +41,8 @@ from bastion.middleware import MetricsMiddleware
 from bastion.models import (
     BrokerConfig,
     BrokerCounters,
+    BrokerThrashing,
+    BrokerThrashingAgent,
     BrokerStatus,
     IntentDeclaration,
     IntentResponse,
@@ -51,7 +53,7 @@ from bastion.proxy import OllamaProxy
 from bastion.queue import AffinityQueue
 from bastion.ratelimit import RateLimitMiddleware
 from bastion.scheduler import Scheduler
-from bastion.thrashing import ThrashingDetector
+from bastion.thrashing import ThrashingDetector, ThrashingVerdict
 from bastion.vram import VRAMManager, VRAMTracker
 from bastion.watchdog import (
     ProcessMonitor,
@@ -77,6 +79,19 @@ _sweep_task: asyncio.Task | None = None
 _start_time: float = 0.0
 _reset_epoch: str = ""  # ISO-8601 UTC timestamp set once at broker startup
 _thrashing_detector: ThrashingDetector | None = None
+
+# Verdict label and ordering maps used by /broker/thrashing in both create_app
+# and create_admin_app.  Defined at module level to avoid duplication.
+_THRASHING_VERDICT_LABEL: dict[ThrashingVerdict, str] = {
+    ThrashingVerdict.OK: "OK",
+    ThrashingVerdict.WARN: "WARNED",
+    ThrashingVerdict.HALT: "HALTED",
+}
+_THRASHING_VERDICT_ORDER: dict[ThrashingVerdict, int] = {
+    ThrashingVerdict.OK: 0,
+    ThrashingVerdict.WARN: 1,
+    ThrashingVerdict.HALT: 2,
+}
 
 # Maps request ID -> asyncio.Event that the scheduler sets when the request
 # is granted (model loaded, ready to forward to Ollama).
@@ -960,6 +975,39 @@ def create_app(config: BrokerConfig) -> FastAPI:
             ),
         )
 
+    @broker_router.get("/thrashing")
+    async def broker_thrashing() -> BrokerThrashing:
+        """Per-agent thrashing detector state.
+
+        Returns the worst global verdict and one entry per tracked agent with
+        its individual verdict, cooloff_remaining_s, swap_ratio, and last_run_s.
+        ``detector_state`` is "OK" when no agents have been tracked yet.
+
+        Verdict mapping from ThrashingVerdict (internal) to API label:
+          ok   -> OK
+          warn -> WARNED
+          halt -> HALTED
+        """
+        if not _thrashing_detector:
+            return BrokerThrashing(detector_state="OK", agents=[])
+        snapshots = _thrashing_detector.snapshot()
+        agent_entries = [
+            BrokerThrashingAgent(
+                agent_id=s.agent_id,
+                verdict=_THRASHING_VERDICT_LABEL[s.verdict],
+                cooloff_remaining_s=s.cooloff_remaining_s,
+                swap_ratio=s.swap_ratio,
+                last_run_s=s.last_run_s,
+            )
+            for s in snapshots
+        ]
+        if agent_entries:
+            worst = max(snapshots, key=lambda s: _THRASHING_VERDICT_ORDER[s.verdict])
+            global_verdict: str = _THRASHING_VERDICT_LABEL[worst.verdict]
+        else:
+            global_verdict = "OK"
+        return BrokerThrashing(detector_state=global_verdict, agents=agent_entries)
+
     # ── S6: Model Intent API ────────────────────────────────────────
 
     @broker_router.post("/intent")
@@ -1641,6 +1689,33 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
                 _thrashing_detector.total_halts if _thrashing_detector else 0
             ),
         )
+
+    @broker_router.get("/thrashing")
+    async def broker_thrashing_admin() -> BrokerThrashing:
+        """Per-agent thrashing detector state (admin app mirror).
+
+        See the main app's /broker/thrashing for full documentation.
+        Verdict mapping: ok -> OK, warn -> WARNED, halt -> HALTED.
+        """
+        if not _thrashing_detector:
+            return BrokerThrashing(detector_state="OK", agents=[])
+        snapshots = _thrashing_detector.snapshot()
+        agent_entries = [
+            BrokerThrashingAgent(
+                agent_id=s.agent_id,
+                verdict=_THRASHING_VERDICT_LABEL[s.verdict],
+                cooloff_remaining_s=s.cooloff_remaining_s,
+                swap_ratio=s.swap_ratio,
+                last_run_s=s.last_run_s,
+            )
+            for s in snapshots
+        ]
+        if agent_entries:
+            worst = max(snapshots, key=lambda s: _THRASHING_VERDICT_ORDER[s.verdict])
+            global_verdict: str = _THRASHING_VERDICT_LABEL[worst.verdict]
+        else:
+            global_verdict = "OK"
+        return BrokerThrashing(detector_state=global_verdict, agents=agent_entries)
 
     @broker_router.post("/intent")
     async def broker_intent(request: Request):

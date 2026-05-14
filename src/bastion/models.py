@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 import uuid
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, computed_field
 
@@ -529,6 +529,30 @@ class BrokerCounters(BaseModel):
     total_dispatched: int
     model_swap_total: int
     thrashing_halt_total: int
+
+
+ThrashingVerdictLabel = Literal["OK", "WARNED", "HALTED"]
+
+
+class BrokerThrashingAgent(BaseModel):
+    """Per-agent thrashing state returned by GET /broker/thrashing."""
+
+    agent_id: str
+    verdict: ThrashingVerdictLabel
+    cooloff_remaining_s: float
+    swap_ratio: float
+    last_run_s: float
+
+
+class BrokerThrashing(BaseModel):
+    """Response body for GET /broker/thrashing.
+
+    ``detector_state`` is the worst verdict across all tracked agents
+    (HALTED > WARNED > OK).  Empty agent list yields "OK".
+    """
+
+    detector_state: ThrashingVerdictLabel
+    agents: list[BrokerThrashingAgent]
 
 
 class BatchInferRequest(BaseModel):
