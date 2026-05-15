@@ -8,7 +8,7 @@ instrumentation code to remain unconditional.
 Metrics exposed:
   - bastion_requests_total: Total requests by endpoint, status, tier
   - bastion_request_duration_seconds: Request latency histogram
-  - bastion_queue_wait_seconds: Time spent waiting in queue
+  - bastion_request_queue_wait_seconds: Time spent waiting in queue (priority/model)
   - bastion_queue_depth: Current queue size per model
   - bastion_model_swap_total: Model transitions (from_model -> to_model)
   - bastion_model_swap_duration_seconds: Model swap time histogram
@@ -132,13 +132,6 @@ REQUEST_DURATION = Histogram(
     buckets=(0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0),
 )
 
-QUEUE_WAIT_TIME = Histogram(
-    "bastion_queue_wait_seconds",
-    "Time spent waiting in queue before dispatch",
-    labelnames=["model", "tier"],
-    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
-)
-
 # Queue state
 QUEUE_DEPTH = Gauge(
     "bastion_queue_depth",
@@ -163,8 +156,9 @@ COOLDOWN_WAITS_TOTAL = Counter(
 )
 
 # Vision C schema-frozen metric: bastion_request_queue_wait_seconds
-# Replaces the older bastion_queue_wait_seconds; the older name remains as
-# QUEUE_WAIT_TIME for backwards compatibility but is not part of the v0.4 contract.
+# This is the single canonical queue-wait histogram for v0.4+. The legacy
+# bastion_queue_wait_seconds (tier label) was dropped before schema-freeze;
+# /metrics had no public contract before v0.4 so there is nothing to preserve.
 REQUEST_QUEUE_WAIT = Histogram(
     "bastion_request_queue_wait_seconds",
     "Time a request waited in the affinity queue before dispatch",
@@ -319,10 +313,9 @@ def record_request(
 def record_queue_wait(model: str, priority: str, wait_seconds: float) -> None:
     """Record time a request spent waiting in the queue.
 
-    Vision C schema-frozen metric. Writes to both the new
-    ``bastion_request_queue_wait_seconds`` (priority/model labels) and the
-    legacy ``bastion_queue_wait_seconds`` (model/tier labels) histograms so
-    existing scrapers keep working during the v0.3 -> v0.4 transition.
+    Vision C schema-frozen metric. Writes to
+    ``bastion_request_queue_wait_seconds`` (priority/model labels) — the single
+    canonical queue-wait histogram for v0.4+.
 
     Parameters
     ----------
@@ -334,8 +327,6 @@ def record_queue_wait(model: str, priority: str, wait_seconds: float) -> None:
         Time from enqueue to dispatch.
     """
     REQUEST_QUEUE_WAIT.labels(priority=priority, model=model).observe(wait_seconds)
-    # Maintain legacy histogram for any existing scrapers; remove in v1.0.
-    QUEUE_WAIT_TIME.labels(model=model, tier=priority).observe(wait_seconds)
 
 
 def update_queue_depth(model: str, depth: int) -> None:
@@ -595,7 +586,6 @@ __all__ = [
     # Existing proxy/scheduler metrics
     "REQUESTS_TOTAL",
     "REQUEST_DURATION",
-    "QUEUE_WAIT_TIME",
     "QUEUE_DEPTH",
     "MODEL_SWAP_TOTAL",
     "MODEL_SWAP_DURATION",

@@ -99,7 +99,7 @@ Available at `GET /broker/metrics` (requires `pip install -e ".[metrics]"`).
 | `bastion_vram_used_bytes` | Gauge | Current VRAM usage |
 | `bastion_gpu_temperature_celsius` | Gauge | GPU temperature |
 | `bastion_request_duration_seconds` | Histogram | Request latency |
-| `bastion_queue_wait_seconds` | Histogram | Time spent waiting in queue |
+| `bastion_request_queue_wait_seconds` | Histogram | Time spent waiting in queue (labels: priority, model) |
 
 ### What to Watch
 
