@@ -218,7 +218,7 @@ Install with: `pip install bastion[metrics]`
 **Metrics exported:**
 - `bastion_requests_total` -- total requests by endpoint, status, tier
 - `bastion_request_duration_seconds` -- request latency histogram
-- `bastion_queue_wait_seconds` -- time in queue
+- `bastion_request_queue_wait_seconds` -- time in queue (labels: priority, model)
 - `bastion_queue_depth` -- current queue size per model
 - `bastion_model_swap_total` -- model transitions
 - `bastion_model_swap_duration_seconds` -- swap time histogram
