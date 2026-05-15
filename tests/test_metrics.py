@@ -158,11 +158,19 @@ class TestMetricsIncrement:
         # Should substitute "_none" for None
 
     def test_model_swap_counter_with_swap(self):
-        """MODEL_SWAP_TOTAL should track model transitions."""
+        """MODEL_SWAP_TOTAL should track model transitions and reason."""
         from bastion.metrics import record_model_swap
 
-        record_model_swap(from_model="llama3.1:8b", to_model="qwen3:14b")
-        record_model_swap(from_model="qwen3:14b", to_model="mistral-nemo:12b")
+        record_model_swap(
+            from_model="llama3.1:8b",
+            to_model="qwen3:14b",
+            reason="scheduler_pick",
+        )
+        record_model_swap(
+            from_model="qwen3:14b",
+            to_model="mistral-nemo:12b",
+            reason="eviction",
+        )
 
     def test_cooldown_wait_counter(self):
         """COOLDOWN_WAITS_TOTAL should increment on each cooldown."""
@@ -189,12 +197,46 @@ class TestMetricsIncrement:
         update_gpu_temperature(45.0)
 
     def test_queue_wait_time_histogram(self):
-        """QUEUE_WAIT_TIME should observe wait durations."""
+        """REQUEST_QUEUE_WAIT (Vision C schema-frozen name) should observe wait durations.
+
+        record_queue_wait now takes ``priority`` (was ``tier``) to match the
+        v0.4 metric schema.
+        """
         from bastion.metrics import record_queue_wait
 
-        record_queue_wait("qwen3:14b", "interactive", 0.05)
-        record_queue_wait("qwen3:14b", "agent", 1.2)
-        record_queue_wait("mistral-nemo:12b", "pipeline", 5.0)
+        record_queue_wait(model="qwen3:14b", priority="interactive", wait_seconds=0.05)
+        record_queue_wait(model="qwen3:14b", priority="agent", wait_seconds=1.2)
+        record_queue_wait(model="mistral-nemo:12b", priority="pipeline", wait_seconds=5.0)
+
+    def test_vram_used_mb_gauge(self):
+        """VRAM_USED_MB gauge should accept gpu_index and MB value."""
+        from bastion.metrics import update_vram_used_mb
+
+        # Should not raise (no-op stubs also accept these calls)
+        update_vram_used_mb(gpu_index="0", mb=8192.0)
+        update_vram_used_mb(gpu_index="0", mb=16384.0)
+        update_vram_used_mb(gpu_index="1", mb=0.0)
+
+    def test_thrashing_halt_counter(self):
+        """THRASHING_DETECTOR_HALT_TOTAL should accept HALTED and WARNED verdicts.
+
+        Vision C contract: agent_id is a stable identifier (registered name or
+        /24 IP prefix), NEVER a task UUID. The helper accepts whatever string
+        it is given; enforcement is at the call site in thrashing.py.
+        """
+        from bastion.metrics import record_thrashing_verdict
+
+        record_thrashing_verdict(agent_id="agent-1", verdict="HALTED")
+        record_thrashing_verdict(agent_id="agent-1", verdict="WARNED")
+        record_thrashing_verdict(agent_id="10.0.0.0/24", verdict="HALTED")
+
+    def test_concurrent_requests_active_gauge(self):
+        """CONCURRENT_REQUESTS_ACTIVE should accept the inflight count."""
+        from bastion.metrics import set_concurrent_requests_active
+
+        set_concurrent_requests_active(0)
+        set_concurrent_requests_active(3)
+        set_concurrent_requests_active(1)
 
 
 class TestPrometheusExposition:
