@@ -20,6 +20,7 @@ import httpx
 
 from bastion import audit
 from bastion.health import get_vram_free_gb, query_gpu_status
+from bastion.metrics import update_vram_used_mb
 from bastion.models import BrokerConfig, LoadedModel
 
 logger = logging.getLogger(__name__)
@@ -136,10 +137,18 @@ class VRAMTracker:
     async def get_loaded_vram_gb(self) -> float:
         """Total VRAM used by currently loaded models (from Ollama).
 
-        Emits audit alert if VRAM usage exceeds 85% threshold.
+        Emits audit alert if VRAM usage exceeds 85% threshold. Also publishes
+        the Vision C ``bastion_vram_used_mb`` gauge (single-GPU label
+        ``gpu_index="0"``), reusing the value already computed for the ledger
+        so no extra GPU query is issued.
         """
         models = await self.get_loaded_models()
         total_vram = sum(m.vram_gb for m in models)
+
+        # Vision C schema-frozen metric: bastion_vram_used_mb
+        # Single-GPU deployments use gpu_index="0". Reuses the ledger total
+        # (no new GPU queries). 1 GB = 1024 MB.
+        update_vram_used_mb(gpu_index="0", mb=total_vram * 1024.0)
 
         # Check for VRAM threshold alerts
         vram_budget = self.config.gpu.max_vram_gb

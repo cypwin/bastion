@@ -109,3 +109,13 @@ request_overrides:
 #   enabled: true
 #   exporter: "otlp"
 #   endpoint: "http://localhost:4317"
+
+# ── Observability (Prometheus / Grafana) ───────────────────────────
+# Scrape hint for prometheus.yml generation. BASTION itself does not
+# read this — it is documentation for operators and the docker-compose stack.
+observability:
+  metrics_path: "/metrics"
+  scrape_interval_seconds: 15
+  # BASTION_OTLP_ENDPOINT env var activates OTLP export in telemetry.py.
+  # Set to empty string (default) to disable. See WT-E5.
+  otlp_endpoint_env: "BASTION_OTLP_ENDPOINT"

@@ -15,6 +15,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from bastion.metrics import record_thrashing_verdict
 from bastion.models import ThrashingDetectionConfig
 
 
@@ -146,9 +147,22 @@ class ThrashingDetector:
             window.cooloff_until = now + self._config.cooloff_seconds
             self._total_warnings += 1  # halt implies a warning
             self._total_halts += 1
+            # Vision C schema-frozen metric: bastion_thrashing_detector_halt_total
+            # Emit HALTED only (do NOT also emit WARNED — the council R3
+            # contract requires single-emit per verdict transition; the
+            # _total_warnings bump above is internal book-keeping for the
+            # /broker/thrashing API and is not exposed as a metric label).
+            #
+            # IMPORTANT: agent_id MUST be a registered agent name or /24 IP
+            # prefix here. The detector's caller (proxy.py / a2a.py) is
+            # responsible for not passing task UUIDs. See Risk R3 and the
+            # docstring on record_thrashing_verdict in bastion.metrics.
+            record_thrashing_verdict(agent_id=agent_id, verdict="HALTED")
         elif swap_ratio >= self._config.warn_swap_ratio:
             result.level = ThrashingVerdict.WARN
             self._total_warnings += 1
+            # Vision C metric: only emit WARNED in the pure-warn branch.
+            record_thrashing_verdict(agent_id=agent_id, verdict="WARNED")
 
         return result
 

@@ -147,15 +147,29 @@ QUEUE_DEPTH = Gauge(
 )
 
 # Scheduler metrics
+#
+# Vision C schema-frozen metric: bastion_model_swap_total
+# Cardinality formula: |models| × |models| × |reason enum (3)|
+# For 17 registered models: 17 × 17 × 3 = 867 series worst case. See Risk R1.
 MODEL_SWAP_TOTAL = Counter(
     "bastion_model_swap_total",
-    "Total number of model swaps performed",
-    labelnames=["from_model", "to_model"],
+    "Total model transitions; reason in {scheduler_pick, affinity_miss, eviction}",
+    labelnames=["from_model", "to_model", "reason"],
 )
 
 COOLDOWN_WAITS_TOTAL = Counter(
     "bastion_cooldown_waits_total",
     "Total number of cooldown waits enforced by scheduler",
+)
+
+# Vision C schema-frozen metric: bastion_request_queue_wait_seconds
+# Replaces the older bastion_queue_wait_seconds; the older name remains as
+# QUEUE_WAIT_TIME for backwards compatibility but is not part of the v0.4 contract.
+REQUEST_QUEUE_WAIT = Histogram(
+    "bastion_request_queue_wait_seconds",
+    "Time a request waited in the affinity queue before dispatch",
+    labelnames=["priority", "model"],
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
 )
 
 # GPU metrics
@@ -164,9 +178,35 @@ VRAM_USED_BYTES = Gauge(
     "Current VRAM usage in bytes",
 )
 
+# Vision C schema-frozen metric: bastion_vram_used_mb
+# Reports the same value as VRAM_USED_BYTES but in MB units, matching the
+# Grafana dashboard panel and Prometheus rule expressions.
+VRAM_USED_MB = Gauge(
+    "bastion_vram_used_mb",
+    "VRAM used in megabytes as reported by nvidia-smi / Ollama fusion",
+    labelnames=["gpu_index"],
+)
+
 GPU_TEMPERATURE = Gauge(
     "bastion_gpu_temperature_celsius",
     "GPU temperature in degrees Celsius",
+)
+
+# Vision C schema-frozen metric: bastion_thrashing_detector_halt_total
+# IMPORTANT: agent_id MUST be a registered agent name (X-Agent-Id header value)
+# OR a source IP truncated to /24 prefix. NEVER a task UUID — that would
+# unbound the label cardinality and OOM Prometheus. See Risk R3.
+THRASHING_DETECTOR_HALT_TOTAL = Counter(
+    "bastion_thrashing_detector_halt_total",
+    "Cumulative thrashing verdict transitions per agent (WARNED, HALTED)",
+    labelnames=["agent_id", "verdict"],
+)
+
+# Vision C schema-frozen metric: bastion_concurrent_requests_active
+# Pure gauge — no labels. Represents currently in-flight inference requests.
+CONCURRENT_REQUESTS_ACTIVE = Gauge(
+    "bastion_concurrent_requests_active",
+    "Number of inference requests currently inflight to Ollama",
 )
 
 # Model swap duration histogram
@@ -276,19 +316,26 @@ def record_request(
         ).observe(duration)
 
 
-def record_queue_wait(model: str, tier: str, wait_seconds: float) -> None:
+def record_queue_wait(model: str, priority: str, wait_seconds: float) -> None:
     """Record time a request spent waiting in the queue.
+
+    Vision C schema-frozen metric. Writes to both the new
+    ``bastion_request_queue_wait_seconds`` (priority/model labels) and the
+    legacy ``bastion_queue_wait_seconds`` (model/tier labels) histograms so
+    existing scrapers keep working during the v0.3 -> v0.4 transition.
 
     Parameters
     ----------
     model : str
         Model name the request was targeting.
-    tier : str
-        Priority tier.
+    priority : str
+        Priority tier (interactive, agent, pipeline, background).
     wait_seconds : float
         Time from enqueue to dispatch.
     """
-    QUEUE_WAIT_TIME.labels(model=model, tier=tier).observe(wait_seconds)
+    REQUEST_QUEUE_WAIT.labels(priority=priority, model=model).observe(wait_seconds)
+    # Maintain legacy histogram for any existing scrapers; remove in v1.0.
+    QUEUE_WAIT_TIME.labels(model=model, tier=priority).observe(wait_seconds)
 
 
 def update_queue_depth(model: str, depth: int) -> None:
@@ -304,19 +351,29 @@ def update_queue_depth(model: str, depth: int) -> None:
     QUEUE_DEPTH.labels(model=model).set(depth)
 
 
-def record_model_swap(from_model: str | None, to_model: str) -> None:
+def record_model_swap(
+    from_model: str | None,
+    to_model: str,
+    reason: str = "scheduler_pick",
+) -> None:
     """Record a model swap event.
+
+    Vision C schema-frozen metric. The ``reason`` enum is one of
+    ``scheduler_pick``, ``affinity_miss``, ``eviction``.
 
     Parameters
     ----------
     from_model : str | None
-        Previously loaded model (None if loading from idle).
+        Previously loaded model (None or "_none" if loading from idle).
     to_model : str
         Model being loaded.
+    reason : str
+        Why the swap happened. Bounded enum to cap cardinality.
     """
     MODEL_SWAP_TOTAL.labels(
         from_model=from_model or "_none",
         to_model=to_model,
+        reason=reason,
     ).inc()
 
 
@@ -334,6 +391,59 @@ def update_vram_usage(bytes_used: int) -> None:
         Current VRAM usage in bytes.
     """
     VRAM_USED_BYTES.set(bytes_used)
+
+
+def update_vram_used_mb(gpu_index: str, mb: float) -> None:
+    """Update the per-GPU VRAM-used-in-MB gauge.
+
+    Vision C schema-frozen metric. Single-GPU deployments use
+    ``gpu_index="0"``. The value is the same quantity already computed by the
+    VRAM ledger refresh — no new GPU queries should be issued for this metric.
+
+    Parameters
+    ----------
+    gpu_index : str
+        GPU identifier (string form so it round-trips through Prometheus labels).
+    mb : float
+        Current VRAM usage in megabytes.
+    """
+    VRAM_USED_MB.labels(gpu_index=gpu_index).set(mb)
+
+
+def record_thrashing_verdict(agent_id: str, verdict: str) -> None:
+    """Record a thrashing detector verdict for an agent.
+
+    Vision C schema-frozen metric. The ``verdict`` enum is one of ``WARNED``,
+    ``HALTED``. The ``agent_id`` MUST be a registered agent name OR a source
+    IP truncated to /24 prefix — NEVER a task UUID. See Risk R3 in the
+    Vision C plan: task-UUID values would unbound the label cardinality and
+    OOM Prometheus. Enforcement is the caller's responsibility; this helper
+    accepts whatever string it is given.
+
+    Parameters
+    ----------
+    agent_id : str
+        Stable per-agent identifier (header value or /24 IP prefix).
+    verdict : str
+        Detector verdict ("WARNED" or "HALTED").
+    """
+    THRASHING_DETECTOR_HALT_TOTAL.labels(
+        agent_id=agent_id,
+        verdict=verdict,
+    ).inc()
+
+
+def set_concurrent_requests_active(count: int) -> None:
+    """Update the gauge of in-flight inference requests.
+
+    Vision C schema-frozen metric. Pure gauge with no labels.
+
+    Parameters
+    ----------
+    count : int
+        Current number of concurrent inflight requests.
+    """
+    CONCURRENT_REQUESTS_ACTIVE.set(count)
 
 
 def update_gpu_temperature(celsius: float) -> None:
@@ -492,6 +602,11 @@ __all__ = [
     "COOLDOWN_WAITS_TOTAL",
     "VRAM_USED_BYTES",
     "GPU_TEMPERATURE",
+    # Vision C schema-frozen metrics (do not rename — public contract)
+    "REQUEST_QUEUE_WAIT",
+    "VRAM_USED_MB",
+    "THRASHING_DETECTOR_HALT_TOTAL",
+    "CONCURRENT_REQUESTS_ACTIVE",
     # A2A metrics
     "A2A_TASKS_TOTAL",
     "A2A_ERRORS_TOTAL",
@@ -509,6 +624,10 @@ __all__ = [
     "record_cooldown_wait",
     "update_vram_usage",
     "update_gpu_temperature",
+    # Vision C schema-frozen helpers
+    "update_vram_used_mb",
+    "record_thrashing_verdict",
+    "set_concurrent_requests_active",
     # A2A helpers
     "emit_a2a_task",
     "emit_a2a_error",

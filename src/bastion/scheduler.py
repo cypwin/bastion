@@ -24,6 +24,11 @@ from collections.abc import Callable
 
 from bastion import audit
 from bastion.health import check_gpu_safe, query_gpu_status  # noqa: F401
+from bastion.metrics import (
+    record_model_swap,
+    record_queue_wait,
+    set_concurrent_requests_active,
+)
 from bastion.models import BrokerConfig, QueuedRequest
 from bastion.queue import AffinityQueue
 from bastion.vram import VRAMManager, VRAMTracker
@@ -363,6 +368,11 @@ class Scheduler:
             # Clear stall reason on successful dispatch
             self._last_stall_reason = ""
 
+        # Vision C schema-frozen metric: bastion_concurrent_requests_active
+        # Update after each dispatch decision so the Grafana gauge reflects
+        # real-time in-flight counts without an extra polling loop.
+        set_concurrent_requests_active(self._inflight_count_fn())
+
         return dispatched_any
 
     async def _diagnose_stall(self) -> None:
@@ -529,6 +539,16 @@ class Scheduler:
             "vram_before_gb": round(loaded_before, 2),
         })
 
+        # Vision C schema-frozen metric: bastion_model_swap_total
+        # reason="scheduler_pick" for the normal swap path (queue advanced to a
+        # non-resident model). The eviction path uses reason="eviction" inside
+        # _unload_model (see that helper).
+        record_model_swap(
+            from_model=self._current_model,
+            to_model=candidate.model,
+            reason="scheduler_pick",
+        )
+
         self._current_model = candidate.model
         self._last_swap_time = time.time()
         self._swap_timestamps.append(self._last_swap_time)
@@ -634,6 +654,16 @@ class Scheduler:
         if request is None:
             return False
 
+        # Vision C schema-frozen metric: bastion_request_queue_wait_seconds
+        # Record the time the request spent in the affinity queue. submitted_at
+        # is the enqueue timestamp (Pydantic default at construction).
+        wait_seconds = max(0.0, time.time() - request.submitted_at)
+        record_queue_wait(
+            model=request.model,
+            priority=request.tier.value,
+            wait_seconds=wait_seconds,
+        )
+
         try:
             logger.debug(
                 "Dispatching %s -> %s (age=%.1fs, priority=%.1f, blocking=%s)",
@@ -672,6 +702,15 @@ class Scheduler:
         logger.info("Unloading model '%s' to free VRAM", model)
         success = await self.vram.unload_model(model)
         if success:
+            # Vision C: count the eviction as a model transition with
+            # reason="eviction" (no to_model in the strict sense; we use
+            # "_none" to signal the unloaded slot, mirroring the from_model
+            # convention for idle-load).
+            record_model_swap(
+                from_model=model,
+                to_model="_none",
+                reason="eviction",
+            )
             if self._current_model == model:
                 self._current_model = None
             # Release VRAMManager allocation so the ledger reflects the unload
