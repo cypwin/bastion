@@ -40,14 +40,37 @@ else
     echo "[!!] Could not find conda — continuing without activation"
 fi
 
-# Optionally activate a project-specific env by setting BASTION_CONDA_ENV.
+# Activate a project-specific conda env if BASTION_CONDA_ENV is set.
 if [ -n "${BASTION_CONDA_ENV:-}" ]; then
     conda activate "$BASTION_CONDA_ENV" 2>/dev/null || true
 fi
 
+# Resolve Python: prefer the activated conda env's python; if not found, walk
+# common conda env locations that are known to have the project installed.
+if ! command -v python &>/dev/null; then
+    for _py_candidate in \
+        "$HOME/miniforge3/envs/bastion/bin/python" \
+        "$HOME/miniconda3/envs/bastion/bin/python" \
+        "$HOME/anaconda3/envs/bastion/bin/python" \
+        "$HOME/miniforge3/envs/bastion/bin/python" \
+        "$HOME/miniconda3/envs/bastion/bin/python"; do
+        if [ -x "$_py_candidate" ]; then
+            export PATH="$(dirname "$_py_candidate"):$PATH"
+            echo "[..] Using Python: $_py_candidate"
+            break
+        fi
+    done
+fi
+if ! command -v python &>/dev/null; then
+    echo "[!!] No Python found. Set BASTION_CONDA_ENV to your conda environment name"
+    echo "     or run:  conda activate <your-env>  before launching."
+    rm -f "$LOCK_FILE"
+    exit 1
+fi
+
 python -c "import textual, httpx" 2>/dev/null || {
     echo "Installing required packages..."
-    pip install "textual>=1.0" "httpx>=0.27" -q
+    python -m pip install "textual>=1.0" "httpx>=0.27" -q
 }
 
 LOG_DIR="${PROJECT_DIR}/logs"
