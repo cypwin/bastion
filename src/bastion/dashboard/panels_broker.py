@@ -249,6 +249,62 @@ class WatchdogPanel(BastionPanel):
         return table
 
 
+class ThrashingPanel(BastionPanel):
+    """Thrashing detector: global verdict, halt counter, per-agent rows."""
+
+    _VERDICT_STYLES: dict[str, str] = {
+        "OK": "green",
+        "WARNED": "yellow bold",
+        "HALTED": "red bold",
+    }
+
+    def render_data(
+        self,
+        thrashing_data: dict[str, Any],
+        halt_total: int | None = None,
+        reset_epoch: str | None = None,
+    ) -> Table:
+        table = Table(title="Thrashing", expand=True, show_edge=False, pad_edge=False)
+        table.add_column("key", style="bold", width=10)
+        table.add_column("value")
+
+        if not thrashing_data:
+            table.add_row(Text("(no data)", style="dim"), "")
+            return table
+
+        state = thrashing_data.get("detector_state", "OK")
+        state_style = self._VERDICT_STYLES.get(state, "dim")
+        table.add_row("State", Text(state, style=state_style))
+
+        if halt_total is not None:
+            halt_style = "red bold" if halt_total > 0 else "dim"
+            table.add_row("Halts", Text(str(halt_total), style=halt_style))
+
+        if reset_epoch:
+            # Show only HH:MM:SS suffix; epoch is helpful but full ISO is noisy
+            label = reset_epoch[11:19] if len(reset_epoch) >= 19 else reset_epoch
+            table.add_row("Since", Text(label, style="dim"))
+
+        agents = thrashing_data.get("agents", [])
+        if not agents:
+            table.add_row(Text("Agents", style="bold"), Text("(none tracked)", style="dim"))
+            return table
+
+        # Header for agent rows
+        table.add_row("", "")
+        table.add_row(Text("Agent", style="bold"), Text("Verdict · ratio · cooloff", style="bold"))
+        for agent in agents:
+            agent_id = agent.get("agent_id", "?")
+            verdict = agent.get("verdict", "OK")
+            ratio = agent.get("swap_ratio", 0.0)
+            cooloff = agent.get("cooloff_remaining_s", 0.0)
+            style = self._VERDICT_STYLES.get(verdict, "dim")
+            detail = f"{verdict} · {ratio:.2f} · {cooloff:.0f}s"
+            table.add_row(Text(agent_id[:18], style="dim"), Text(detail, style=style))
+
+        return table
+
+
 class AlertPanel(BastionPanel):
     """Severity-tiered alert display with auto-dismiss."""
 

@@ -31,6 +31,7 @@ from bastion.dashboard.panels_broker import (
     CircuitBreakerPanel,
     QueuePanel,
     SchedulerPanel,
+    ThrashingPanel,
     WatchdogPanel,
 )
 from bastion.dashboard.panels_gpu import GPUPanel, ModelsPanel, VRAMLedgerPanel
@@ -186,6 +187,7 @@ class BastionDashboard(App):
                 yield SchedulerPanel(id="scheduler")
                 yield WatchdogPanel(id="watchdog")
                 yield CircuitBreakerPanel(id="circuit-breaker")
+                yield ThrashingPanel(id="thrashing")
                 yield TracePanel(id="trace")
                 yield A2ATaskPanel(id="a2a-tasks")
                 yield LeasePanel(id="leases")
@@ -220,7 +222,7 @@ class BastionDashboard(App):
         # Secondary panels: hidden by default, shown with [t] toggle
         secondary_ids = {"a2a-tasks", "leases", "audit-stream"}
         # Always visible in full mode (trace is request history — essential)
-        non_secondary_ids = {"scheduler", "watchdog", "circuit-breaker", "trace"}
+        non_secondary_ids = {"scheduler", "watchdog", "circuit-breaker", "thrashing", "trace"}
 
         if self._layout_mode == "compact":
             right_col.display = False
@@ -335,13 +337,15 @@ class BastionDashboard(App):
         alerts = self._evaluate_alerts(data)
 
         # Fetch supplemental data in parallel
-        health_data, vram_ledger, watchdog_data, queue_diag, recent = (
+        health_data, vram_ledger, watchdog_data, queue_diag, recent, counters, thrashing = (
             await asyncio.gather(
                 self._client.get_health(),
                 self._client.get_vram_ledger(),
                 self._client.get_watchdog(),
                 self._client.get_queue(),
                 self._client.get_recent(),
+                self._client.get_counters(),
+                self._client.get_thrashing(),
                 return_exceptions=True,
             )
         )
@@ -357,6 +361,10 @@ class BastionDashboard(App):
             queue_diag = {}
         if isinstance(recent, BaseException):
             recent = []
+        if isinstance(counters, BaseException):
+            counters = {}
+        if isinstance(thrashing, BaseException):
+            thrashing = {}
 
         # Compute latency percentiles from recent requests
         if isinstance(recent, list) and recent:
@@ -488,6 +496,13 @@ class BastionDashboard(App):
 
         cb_panel = self.query_one("#circuit-breaker", CircuitBreakerPanel)
         cb_panel.update(cb_panel.render_data(health_data))
+
+        thrashing_panel = self.query_one("#thrashing", ThrashingPanel)
+        thrashing_panel.update(thrashing_panel.render_data(
+            thrashing,
+            halt_total=counters.get("thrashing_halt_total") if isinstance(counters, dict) else None,
+            reset_epoch=counters.get("reset_epoch") if isinstance(counters, dict) else None,
+        ))
 
         alert_panel = self.query_one("#alerts", AlertPanel)
         alert_panel.update(alert_panel.render_data(alerts))

@@ -70,6 +70,24 @@ class BastionClient:
         except Exception:
             return {}
 
+    async def get_counters(self) -> dict:
+        """Fetch /broker/counters for cumulative counters + reset_epoch."""
+        try:
+            resp = await self._client.get(f"{self.base_url}/broker/counters")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            return {}
+
+    async def get_thrashing(self) -> dict:
+        """Fetch /broker/thrashing for per-agent verdicts."""
+        try:
+            resp = await self._client.get(f"{self.base_url}/broker/thrashing")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            return {}
+
     async def post_preload(self, model: str) -> dict:
         """Preload a model via /broker/preload."""
         resp = await self._client.post(
