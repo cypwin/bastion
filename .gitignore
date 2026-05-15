@@ -62,3 +62,13 @@ TO_ADD_TO_DASHBOARD_BUTTONS_OPTION_TO_OPEN_NEW_TMUX.txt
 *.pdf
 LATEST_BASTION.md
 interview-aid-chunk-bastion.md
+
+# Session-scoped artifacts (transient plans, council runs, visual companions)
+tmp/
+tmp_*.md
+tmp_*.sh
+tmp_*.txt
+.council-output/
+.council_topic.txt
+ROADMAP.md
+reference/
