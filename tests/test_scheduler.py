@@ -906,6 +906,65 @@ class TestEvictForModel:
 
         assert result is False
 
+    @pytest.mark.asyncio
+    async def test_eviction_stuck_streak_increments_then_clears(
+        self, evict_config: BrokerConfig,
+    ) -> None:
+        """T3.2: _evict_for_model maintains a per-candidate stuck-streak counter
+        that grows on consecutive failures and clears on success.  Used to
+        suppress log spam when all resident models are temporarily un-evictable."""
+        async def dispatch_fn(request, needs_swap=True) -> None:
+            pass
+
+        queue = AffinityQueue(evict_config.scheduler)
+        tracker = VRAMTracker(evict_config)
+
+        # Only an always_allowed model is loaded so eviction is impossible.
+        loaded_protected = [LoadedModel(name="nomic-embed-text", vram_gb=0.4)]
+        # Recovery scenario: an evictable model also appears, freeing space.
+        loaded_recovered = [
+            LoadedModel(name="nomic-embed-text", vram_gb=0.4),
+            LoadedModel(name="qwen3:14b", vram_gb=9.3),
+        ]
+
+        get_loaded_mock = AsyncMock(side_effect=[
+            loaded_protected,   # 1st failure
+            loaded_protected,   # 2nd failure
+            loaded_recovered,   # 3rd call: succeeds
+        ])
+
+        can_load_calls = [0]
+
+        async def mock_can_load(model):
+            can_load_calls[0] += 1
+            # First two _evict calls fail (empty evictable, returns False
+            # before reaching can_load).  Third call evicts qwen3:14b and
+            # then queries can_load which returns True.
+            return (True, "OK") if can_load_calls[0] >= 1 else (False, "no space")
+
+        with patch.object(
+                 tracker, "get_loaded_models",
+                 side_effect=get_loaded_mock,
+             ),              patch.object(tracker, "can_load_model", side_effect=mock_can_load),              patch.object(tracker, "unload_model", new_callable=AsyncMock, return_value=True):
+            sched = Scheduler(evict_config, queue, tracker, dispatch_fn)
+            candidate = make_request(model="llama3.1:8b")
+
+            # First failed eviction: streak 0 -> 1
+            r1 = await sched._evict_for_model(candidate)
+            assert r1 is False
+            assert sched._eviction_stuck_streak["llama3.1:8b"] == 1
+
+            # Second failed eviction: streak 1 -> 2 (log suppressed)
+            r2 = await sched._evict_for_model(candidate)
+            assert r2 is False
+            assert sched._eviction_stuck_streak["llama3.1:8b"] == 2
+
+            # Third call: evictable list non-empty, unload succeeds, can_load
+            # returns True; streak cleared.
+            r3 = await sched._evict_for_model(candidate)
+            assert r3 is True
+            assert "llama3.1:8b" not in sched._eviction_stuck_streak
+
 
 # ---------------------------------------------------------------------------
 # Sync current model on startup tests
