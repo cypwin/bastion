@@ -547,7 +547,7 @@ class OllamaProxy:
                 headers=response_headers,
             )
         except Exception as e:
-            logger.error("Forward proxy error to %s: %s", url, e)
+            logger.error("Forward proxy error to %s: %s: %s", url, type(e).__name__, repr(e))
             if self.circuit_breaker:
                 await self.circuit_breaker.record_failure()
             return JSONResponse({"error": f"Ollama backend unavailable: {e}"}, status_code=502)
