@@ -12,10 +12,12 @@ Phase D3 additions:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
 import logging.handlers
+import os
 from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
@@ -150,6 +152,54 @@ def recent_events(limit: int = 10) -> list[dict]:
     return list(_recent_events)[-limit:]
 
 
+def _open_audit_handler(
+    primary_path: str,
+    max_bytes: int,
+    backup_count: int,
+) -> logging.Handler:
+    """Open a RotatingFileHandler with writable-path fallbacks.
+
+    Audit logs default to the XDG data dir but the root filesystem may be
+    mounted read-only (e.g., immutable-base setups, error remounts).  Try the
+    configured path first; on OSError fall back to ``$XDG_RUNTIME_DIR`` then
+    ``/tmp``.  As a last resort return a NullHandler so emit() never crashes
+    the caller, and log a clear error so the operator can see audit is off.
+    """
+    candidates = [primary_path]
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        candidates.append(os.path.join(runtime, "bastion-audit.jsonl"))
+    candidates.append("/tmp/bastion-audit.jsonl")
+
+    audit_log = logging.getLogger("bastion.audit")
+    for idx, candidate in enumerate(candidates):
+        try:
+            Path(candidate).parent.mkdir(parents=True, exist_ok=True)
+            handler = logging.handlers.RotatingFileHandler(
+                candidate, maxBytes=max_bytes, backupCount=backup_count,
+            )
+        except OSError as exc:
+            audit_log.warning(
+                "Audit path %s unwritable (%s)%s",
+                candidate, exc,
+                "; trying fallback" if idx < len(candidates) - 1 else "",
+            )
+            continue
+        with contextlib.suppress(OSError):
+            os.chmod(candidate, 0o600)
+        if idx > 0:
+            audit_log.warning(
+                "Using fallback audit path %s; audit is not durable across reboots",
+                candidate,
+            )
+        return handler
+
+    audit_log.error(
+        "Audit disabled: no writable path among %s", candidates,
+    )
+    return logging.NullHandler()
+
+
 class AuditLogger:
     """Structured JSON-lines audit logger with rotation.
 
@@ -185,15 +235,7 @@ class AuditLogger:
         # Remove existing handlers to avoid duplicates
         self.logger.handlers.clear()
 
-        # Ensure parent directory exists (survives /tmp cleanup on reboot)
-        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-
-        # Rotating file handler
-        handler = logging.handlers.RotatingFileHandler(
-            log_path,
-            maxBytes=max_bytes,
-            backupCount=backup_count,
-        )
+        handler = _open_audit_handler(log_path, max_bytes, backup_count)
         handler.setFormatter(logging.Formatter("%(message)s"))  # Raw JSON only
         self.logger.addHandler(handler)
 
