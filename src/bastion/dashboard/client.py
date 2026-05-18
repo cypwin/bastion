@@ -94,6 +94,7 @@ class BastionClient:
             f"{self.base_url}/broker/preload",
             json={"model": model},
         )
+        resp.raise_for_status()
         return resp.json()
 
     async def post_unload(self, model: str) -> dict:
@@ -102,14 +103,17 @@ class BastionClient:
             f"{self.base_url}/broker/unload",
             json={"model": model},
         )
+        resp.raise_for_status()
         return resp.json()
 
     async def post_drain(self) -> dict:
         """Toggle drain mode via /broker/drain."""
         resp = await self._client.post(f"{self.base_url}/broker/drain")
+        resp.raise_for_status()
         return resp.json()
 
     async def post_resume(self) -> dict:
         """Resume from drain mode via /broker/resume."""
         resp = await self._client.post(f"{self.base_url}/broker/resume")
+        resp.raise_for_status()
         return resp.json()

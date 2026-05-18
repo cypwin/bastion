@@ -788,7 +788,12 @@ class BastionDashboard(App):
         """Execute preload request."""
         try:
             result = await self._client.post_preload(model)
-            self.notify(f"Preload: {result.get('status', 'ok')}")
+            status = result.get("status")
+            if status:
+                self.notify(f"Preload: {status}")
+            else:
+                detail = result.get("detail") or result.get("error") or "unknown response"
+                self.notify(f"Preload failed: {detail}", severity="warning")
         except Exception as exc:
             self.notify(f"Preload failed: {exc}", severity="error")
 
@@ -818,7 +823,13 @@ class BastionDashboard(App):
         """Execute unload request."""
         try:
             result = await self._client.post_unload(model)
-            self.notify(f"Unload: {result.get('status', 'ok')}")
+            status = result.get("status")
+            ok = status not in (None, "", "failed")
+            if ok:
+                self.notify(f"Unload: {status}")
+            else:
+                detail = result.get("detail") or result.get("error") or status or "unknown response"
+                self.notify(f"Unload failed: {detail}", severity="warning")
         except Exception as exc:
             self.notify(f"Unload failed: {exc}", severity="error")
 
@@ -848,7 +859,12 @@ class BastionDashboard(App):
                 result = await self._client.post_resume()
             else:
                 result = await self._client.post_drain()
-            self.notify(f"Drain toggle: {result.get('status', 'ok')}")
+            status = result.get("status")
+            if status in ("draining", "running"):
+                self.notify(f"Drain toggle: {status}")
+            else:
+                detail = result.get("detail") or result.get("error") or "unknown response"
+                self.notify(f"Drain toggle failed: {detail}", severity="warning")
         except Exception as exc:
             self.notify(f"Drain toggle failed: {exc}", severity="error")
 
@@ -858,7 +874,7 @@ class BastionDashboard(App):
         async def _do_restart() -> None:
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    "sudo", "systemctl", "restart", "bastion.service",
+                    "sudo", "-n", "systemctl", "restart", "bastion.service",
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
                 )
