@@ -95,6 +95,12 @@ class OllamaProxy:
         self._requests_served = 0
         self._model_swaps = 0
 
+        # Drain-state callable; wired by server.py after the scheduler is built
+        # so that _handle_passthrough can reject inference-adjacent requests
+        # while management endpoints (/api/tags, /api/show, /api/ps, etc.)
+        # continue to serve.  When None, drain has no effect on passthrough.
+        self._is_draining_fn: Callable[[], bool] | None = None
+
         # Circuit breaker for Ollama backend
         cb_config = config.circuit_breaker
         self.circuit_breaker: CircuitBreaker | None = (
@@ -375,6 +381,21 @@ class OllamaProxy:
         self, request: Request, path: str, body: bytes,
     ) -> StreamingResponse | JSONResponse:
         """Forward request to Ollama without scheduling."""
+        # Drain mode: reject anything not in the operator-configured management
+        # set.  This catches inference-adjacent endpoints that fall through to
+        # passthrough by default (e.g., /api/embeddings plural), while keeping
+        # /api/tags, /api/ps, /api/show etc. available so operators can still
+        # observe state during a drain.
+        if (
+            self._is_draining_fn is not None
+            and self._is_draining_fn()
+            and path not in self._passthrough_endpoints
+        ):
+            return JSONResponse(
+                {"error": "Broker is draining - try again later"},
+                status_code=503,
+            )
+
         target_url = f"{self._backend_url}{path}"
         method = request.method.upper()
 

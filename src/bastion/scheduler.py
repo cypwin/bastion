@@ -720,6 +720,52 @@ class Scheduler:
         else:
             logger.warning("Failed to unload model '%s'", model)
 
+    async def unload_model_admin(self, model: str) -> tuple[str, dict]:
+        """Operator-driven unload with safety checks and ledger release.
+
+        Mirrors the safety logic in :meth:`_unload_model` but returns a
+        discriminated outcome so the admin API can map it to honest HTTP
+        statuses (409 for in-use, 200 for confirmed unload, 500 for tracker
+        failure).  Also releases the VRAMManager allocation on success so the
+        ledger stays consistent with reality (the private path missed this for
+        user-driven unloads pre-2026-05-19).
+
+        Returns
+        -------
+        tuple[str, dict]
+            ``(status, details)`` where status is one of:
+            ``"unloaded"``    - confirmed gone from /api/ps; VRAMManager released.
+            ``"reserved"``    - active A2A reservation; unload deferred.
+            ``"inflight"``    - in-flight inference request; unload deferred.
+            ``"failed"``      - vram tracker reported failure or could not confirm
+                                the model left /api/ps within the timeout.
+        """
+        if self._reservation_check_fn and self._reservation_check_fn(model):
+            return ("reserved", {"model": model, "reason": "active A2A reservation"})
+        if self._has_inflight_fn(model):
+            return ("inflight", {"model": model, "reason": "in-flight inference request"})
+
+        confirmed = await self.vram.unload_model(model)
+        if not confirmed:
+            return (
+                "failed",
+                {
+                    "model": model,
+                    "reason": (
+                        "Ollama did not confirm unload within the configured timeout; "
+                        "the model may still be resident"
+                    ),
+                },
+            )
+
+        record_model_swap(from_model=model, to_model="_none", reason="eviction")
+        if self._current_model == model:
+            self._current_model = None
+        if self.vram_manager is not None:
+            await self.vram_manager.release_model(model)
+            await self.vram_manager.wait_for_vram_convergence()
+        return ("unloaded", {"model": model})
+
     async def _sync_current_model(self) -> None:
         """Detect which model is currently loaded in Ollama.
 

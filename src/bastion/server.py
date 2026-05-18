@@ -546,6 +546,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         vram_manager=_vram_manager,
     )
     _scheduler._dispatch_error_fn = _dispatch_error_cleanup
+
+    # Wire drain visibility into the proxy passthrough handler so /api/embeddings
+    # and any other inference-adjacent path that isn't in scheduled_endpoints
+    # still respects drain mode (management endpoints in passthrough_endpoints
+    # continue to serve).
+    if _proxy is not None:
+        _proxy._is_draining_fn = lambda: _scheduler is not None and _scheduler.is_draining
     _start_time = time.time()
     _reset_epoch = datetime.now(timezone.utc).isoformat()
 
@@ -887,16 +894,33 @@ def create_app(config: BrokerConfig) -> FastAPI:
 
     @broker_router.post("/unload")
     async def broker_unload(request: Request):
-        """Force-unload a model from VRAM."""
+        """Force-unload a model from VRAM with safety checks.
+
+        Routes through the scheduler so in-flight inference and active A2A
+        reservations are honoured; returns 409 in those cases instead of
+        silently failing to free VRAM.  On success the VRAMManager allocation
+        is released so the ledger stays consistent with reality.
+        """
         body = await request.json()
         model = body.get("model")
         if not model:
             return JSONResponse({"error": "Missing 'model' field"}, status_code=400)
 
-        if _vram_tracker:
-            success = await _vram_tracker.unload_model(model)
-            return {"status": "unloaded" if success else "failed", "model": model}
-        return JSONResponse({"error": "VRAM tracker not initialized"}, status_code=503)
+        if not _scheduler:
+            return JSONResponse({"error": "Scheduler not initialized"}, status_code=503)
+
+        status, details = await _scheduler.unload_model_admin(model)
+        if status == "unloaded":
+            return {"status": "unloaded", **details}
+        if status in ("reserved", "inflight"):
+            return JSONResponse(
+                {"status": "failed", "error": details.get("reason", status), **details},
+                status_code=409,
+            )
+        return JSONResponse(
+            {"status": "failed", "error": details.get("reason", "unknown"), **details},
+            status_code=500,
+        )
 
     @broker_router.post("/drain")
     async def broker_drain():
@@ -1615,15 +1639,32 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
 
     @broker_router.post("/unload")
     async def broker_unload(request: Request):
-        """Force-unload a model from VRAM."""
+        """Force-unload a model from VRAM with safety checks (admin app).
+
+        See create_app's broker_unload for the contract.  Routes through the
+        scheduler so in-flight inference and active A2A reservations are
+        honoured.
+        """
         body = await request.json()
         model = body.get("model")
         if not model:
             return JSONResponse({"error": "Missing 'model' field"}, status_code=400)
-        if _vram_tracker:
-            success = await _vram_tracker.unload_model(model)
-            return {"status": "unloaded" if success else "failed", "model": model}
-        return JSONResponse({"error": "VRAM tracker not initialized"}, status_code=503)
+
+        if not _scheduler:
+            return JSONResponse({"error": "Scheduler not initialized"}, status_code=503)
+
+        status, details = await _scheduler.unload_model_admin(model)
+        if status == "unloaded":
+            return {"status": "unloaded", **details}
+        if status in ("reserved", "inflight"):
+            return JSONResponse(
+                {"status": "failed", "error": details.get("reason", status), **details},
+                status_code=409,
+            )
+        return JSONResponse(
+            {"status": "failed", "error": details.get("reason", "unknown"), **details},
+            status_code=500,
+        )
 
     @broker_router.post("/drain")
     async def broker_drain():

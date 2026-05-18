@@ -269,7 +269,9 @@ class VRAMTracker:
                 logger.info("Unloaded model '%s' from VRAM (confirmed)", model_name)
             else:
                 logger.warning(
-                    "Model '%s' still in /api/ps after %.0fs — proceeding anyway",
+                    "Model '%s' still in /api/ps after %.0fs - Ollama will unload "
+                    "it when current inference finishes; treating as not-yet-unloaded "
+                    "so the caller does not get a false success",
                     model_name, self.config.ollama.unload_timeout_seconds,
                 )
 
@@ -279,7 +281,7 @@ class VRAMTracker:
                 "model": model_name,
                 "confirmed": confirmed,
             })
-            return True
+            return confirmed
         except Exception as e:
             logger.warning("Failed to unload model '%s': %s", model_name, e)
             return False
