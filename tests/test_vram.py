@@ -425,8 +425,11 @@ class TestUnloadModelPolling:
              ):
             success = await tracker.unload_model("qwen3:14b")
 
-        # Still returns True (proceeds anyway), but model wasn't confirmed removed
-        assert success is True
+        # T2.3 fix: when poll cannot confirm the unload, return False so callers
+        # know they cannot rely on the model being unloaded yet.  Previously this
+        # returned True with only a warning, masking real-world cases where
+        # Ollama refused to unload a model with in-flight inference.
+        assert success is False
 
 
 # ---------------------------------------------------------------------------
