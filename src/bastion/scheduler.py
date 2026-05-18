@@ -102,6 +102,13 @@ class Scheduler:
         self._last_stall_reason: str = ""
         self._last_stall_time: float = 0.0
 
+        # T3.2: per-model consecutive eviction-stuck counter.  Increments each
+        # time _evict_for_model returns False for a given candidate; cleared on
+        # success.  Used to suppress the ~10/sec "Cannot load X after evicting
+        # 0 models" log spam when all resident models are in-flight (system
+        # genuinely stuck — operator should know once, not every tick).
+        self._eviction_stuck_streak: dict[str, int] = {}
+
     @property
     def current_model(self) -> str | None:
         """Last dispatched model (used for affinity bonus and admin API).
@@ -631,12 +638,26 @@ class Scheduler:
 
             can_load, vram_reason = await self.vram.can_load_model(candidate.model)
             if can_load:
+                self._eviction_stuck_streak.pop(candidate.model, None)
                 return True
 
-        logger.error(
-            "Cannot load '%s' after evicting %d models",
-            candidate.model, evicted_count,
-        )
+        # T3.2: suppress per-tick spam.  Log loudly the first time, then a
+        # heartbeat every ~10s (100 ticks at 0.1s loop_interval) while stuck;
+        # cleared on success above so the next genuine failure logs again.
+        streak = self._eviction_stuck_streak.get(candidate.model, 0) + 1
+        self._eviction_stuck_streak[candidate.model] = streak
+        if streak == 1:
+            logger.error(
+                "Cannot load '%s' after evicting %d models "
+                "(entering stuck streak; will suppress until cleared)",
+                candidate.model, evicted_count,
+            )
+        elif streak % 100 == 0:
+            logger.warning(
+                "Still cannot load '%s' after %d consecutive eviction attempts; "
+                "all resident models appear to be in-flight or reserved",
+                candidate.model, streak,
+            )
         return False
 
     async def _dispatch_for_model(self, model: str, needs_swap: bool = True) -> bool:
