@@ -40,12 +40,16 @@ from bastion.circuitbreaker import CircuitBreakerTransport
 from bastion.health import check_gpu_safe, query_gpu_status
 from bastion.metrics import CONTENT_TYPE_LATEST, PROMETHEUS_AVAILABLE, get_metrics_text
 from bastion.middleware import MetricsMiddleware
+from bastion.latency_aggregator import aggregate_latency
 from bastion.models import (
+    BrokerCatalog,
     BrokerConfig,
     BrokerCounters,
+    BrokerLatency,
     BrokerStatus,
     BrokerThrashing,
     BrokerThrashingAgent,
+    CatalogEntry,
     IntentDeclaration,
     IntentResponse,
     PriorityTier,
@@ -1225,6 +1229,22 @@ def create_app(config: BrokerConfig) -> FastAPI:
         logger.info("Intent deleted: %s", intent_id)
         return {"status": "deleted", "intent_id": intent_id}
 
+    @broker_router.get("/latency")
+    async def broker_latency(window_s: float = 300.0) -> BrokerLatency:
+        """Per-model latency percentiles over the rolling window.
+
+        Aggregates the ``_recent_requests`` ring buffer. Models with fewer
+        than 3 samples in the window are omitted from ``per_model``
+        (single-call noise); the ``overall`` bucket aggregates everything.
+
+        Query parameters
+        ----------------
+        window_s : float
+            Default 300.0 (5 min). Clamped to ``[10.0, 3600.0]``.
+        """
+        window_s = max(10.0, min(3600.0, window_s))
+        return aggregate_latency(list(_recent_requests), window_s)
+
     # ── A2A Interface Routes ────────────────────────────────────────
 
     async def _sse_wrapper(generator: AsyncGenerator[dict, None]) -> AsyncGenerator[bytes, None]:
@@ -1952,6 +1972,22 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
         _resolved_intents.pop(intent_id, None)
         logger.info("Intent deleted: %s", intent_id)
         return {"status": "deleted", "intent_id": intent_id}
+
+    @broker_router.get("/latency")
+    async def broker_latency(window_s: float = 300.0) -> BrokerLatency:
+        """Per-model latency percentiles over the rolling window.
+
+        Aggregates the ``_recent_requests`` ring buffer. Models with fewer
+        than 3 samples in the window are omitted from ``per_model``
+        (single-call noise); the ``overall`` bucket aggregates everything.
+
+        Query parameters
+        ----------------
+        window_s : float
+            Default 300.0 (5 min). Clamped to ``[10.0, 3600.0]``.
+        """
+        window_s = max(10.0, min(3600.0, window_s))
+        return aggregate_latency(list(_recent_requests), window_s)
 
     # ── A2A Interface Routes ────────────────────────────────────────
 
