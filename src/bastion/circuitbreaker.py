@@ -259,6 +259,11 @@ class CircuitBreakerTransport(httpx.AsyncBaseTransport):
                 remaining = self._breaker._recovery_remaining()
                 raise CircuitOpenError(remaining)
             if effective is _State.HALF_OPEN:
+                # _state is still OPEN here; _effective_state() returned
+                # HALF_OPEN as the logical state after recovery_timeout
+                # elapsed. Materialise the transition so a subsequent
+                # record_failure() can correctly take the HALF_OPEN ->
+                # OPEN-with-reset-timer branch.
                 self._breaker._state = _State.HALF_OPEN
 
         try:

@@ -31,12 +31,14 @@ jobs:
         run: mypy src/bastion --ignore-missing-imports --no-strict-optional
 
       - name: Test
-        # Coverage gate ratchets up across the test campaign:
-        #   Phase 0  (now)    : 58  — honest current floor, prevents regression
-        #   Phase 1  (after P1 fills): 70
-        #   Phase 2  (after dashboard): 75
-        #   Phase 3+ (after behavioral depth): 80
-        run: pytest tests/ -v --ignore=tests/test_e2e_stress.py --cov=src/bastion --cov-report=term-missing --cov-fail-under=58
+        # Coverage gate ratchet across the test campaign:
+        #   Phase 0  (CI hardening)     : 58 — honest floor, prevents regression
+        #   Phase 1  (P1 fills)         : 64
+        #   Phase 2  (dashboard)        : 78
+        #   Phase 3  (behavioral depth) : 79 — current actual ~79.9%
+        # Future work raises this further as server.py /a2a/* and the
+        # remaining dashboard collectors get exercised.
+        run: pytest tests/ -v --ignore=tests/test_e2e_stress.py --cov=src/bastion --cov-report=term-missing --cov-fail-under=79
 
       - name: Test bastion-client package
         working-directory: clients/bastion-client

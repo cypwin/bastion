@@ -225,28 +225,40 @@ async def _queue_sweep_loop(ttl_seconds: float) -> None:
 
     For each swept request: unblocks any waiting proxy handler by setting
     grant and completion events, and logs an audit event.
+
+    The body is wrapped in a per-iteration ``try/except`` so a transient
+    exception (audit init race, queue invariant violation, etc.) doesn't
+    kill the task and leave stale requests piling up forever — see
+    scheduler._loop() for the matching pattern.
     """
     while True:
-        await asyncio.sleep(60.0)
-        if not _queue:
-            continue
-        swept = _queue.sweep_stale(ttl_seconds)
-        for req in swept:
-            grant_evt = _pending_grants.pop(req.id, None)
-            if grant_evt:
-                grant_evt.set()  # Unblock proxy handler waiting for grant
-            completion_evt = _pending_completions.pop(req.id, None)
-            if completion_evt:
-                completion_evt.set()
-            logger.warning(
-                "Swept stale request %s (model=%s, age=%.0fs)",
-                req.id, req.model, req.age_seconds,
-            )
-            audit.emit("queue_sweep", {
-                "request_id": req.id,
-                "model": req.model,
-                "age_seconds": round(req.age_seconds, 1),
-            })
+        try:
+            await asyncio.sleep(60.0)
+            if not _queue:
+                continue
+            swept = _queue.sweep_stale(ttl_seconds)
+            for req in swept:
+                grant_evt = _pending_grants.pop(req.id, None)
+                if grant_evt:
+                    grant_evt.set()  # Unblock proxy handler waiting for grant
+                completion_evt = _pending_completions.pop(req.id, None)
+                if completion_evt:
+                    completion_evt.set()
+                logger.warning(
+                    "Swept stale request %s (model=%s, age=%.0fs)",
+                    req.id, req.model, req.age_seconds,
+                )
+                audit.emit("queue_sweep", {
+                    "request_id": req.id,
+                    "model": req.model,
+                    "age_seconds": round(req.age_seconds, 1),
+                })
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Queue sweep loop iteration failed; continuing")
+            # Brief backoff so a deterministic crash doesn't spin
+            await asyncio.sleep(5.0)
 
 
 def _dispatch_error_cleanup(request_id: str) -> None:
