@@ -4,14 +4,32 @@ Originally added after [u] (unload) crashed the dashboard with BadIdentifier
 because real Ollama model names like ``granite4.1:8b`` contain ``:`` and ``.``,
 which Textual rejects when used inside a widget ``id``. The fix uses index-based
 button ids and dereferences the model name on click.
+
+Extended (2026-05-19) with coverage for every other modal: HelpModal,
+ConfirmActionModal, GPUProcessListModal, ConfirmGPUKillModal, FanControlModal.
 """
 
 from __future__ import annotations
 
+import re
+from typing import Any
+from unittest.mock import patch
+
 import pytest
 from textual.app import App
 
-from bastion.dashboard.modals import ModelSelectModal
+from bastion.dashboard.modals import (
+    ConfirmActionModal,
+    ConfirmGPUKillModal,
+    FanControlModal,
+    GPUProcessListModal,
+    HelpModal,
+    ModelSelectModal,
+)
+
+# Textual identifier rule: ASCII letter/underscore start, then letters,
+# digits, underscore, or hyphen.
+_TEXTUAL_ID = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]*$")
 
 REAL_MODEL_NAMES = [
     "granite4.1:8b",
@@ -126,3 +144,503 @@ async def test_modal_with_empty_model_list_still_composes() -> None:
         await pilot.click(cancel)
         await pilot.pause()
         assert app.result == ""
+
+
+# ===========================================================================
+# Generic harness for the remaining modals
+# ===========================================================================
+
+
+class _ModalHarness(App[Any]):
+    """Mount an arbitrary ModalScreen and record its dismiss value."""
+
+    def __init__(self, modal_factory: Any) -> None:
+        super().__init__()
+        self._factory = modal_factory
+        self.result: Any = None
+        self.result_set: bool = False
+
+    def on_mount(self) -> None:
+        def _cb(value: Any) -> None:
+            self.result = value
+            self.result_set = True
+
+        self.push_screen(self._factory(), callback=_cb)
+
+
+# ---------------------------------------------------------------------------
+# HelpModal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_help_modal_composes() -> None:
+    app = _ModalHarness(HelpModal)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert any(isinstance(s, HelpModal) for s in app.screen_stack)
+
+
+@pytest.mark.asyncio
+async def test_help_modal_close_button_dismisses_true() -> None:
+    app = _ModalHarness(HelpModal)
+    async with app.run_test(size=(120, 50)) as pilot:
+        await pilot.pause()
+        modal = next(s for s in app.screen_stack if isinstance(s, HelpModal))
+        # Drive the handler directly so the test is robust against the
+        # modal extending past the simulated viewport when other tests
+        # have mutated SPARKLINE_WIDTH/HISTORY_LEN module globals.
+        btn = modal.query_one("#close-help")
+        from textual.widgets import Button
+        modal.on_button_pressed(Button.Pressed(btn))
+        await pilot.pause()
+        assert app.result is True
+
+
+@pytest.mark.asyncio
+async def test_help_modal_escape_dismisses_false() -> None:
+    app = _ModalHarness(HelpModal)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.result is False
+
+
+# ---------------------------------------------------------------------------
+# ConfirmActionModal
+# ---------------------------------------------------------------------------
+
+
+def _confirm_factory() -> ConfirmActionModal:
+    return ConfirmActionModal("Restart", "Really restart?")
+
+
+@pytest.mark.asyncio
+async def test_confirm_action_modal_composes() -> None:
+    app = _ModalHarness(_confirm_factory)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        modal = next(
+            s for s in app.screen_stack if isinstance(s, ConfirmActionModal)
+        )
+        # Title + details rendered.
+        assert modal.action_name == "Restart"
+        assert modal.action_details == "Really restart?"
+
+
+@pytest.mark.asyncio
+async def test_confirm_action_yes_dismisses_true() -> None:
+    app = _ModalHarness(_confirm_factory)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        modal = next(
+            s for s in app.screen_stack if isinstance(s, ConfirmActionModal)
+        )
+        await pilot.click(modal.query_one("#confirm-yes"))
+        await pilot.pause()
+        assert app.result is True
+
+
+@pytest.mark.asyncio
+async def test_confirm_action_no_dismisses_false() -> None:
+    app = _ModalHarness(_confirm_factory)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        modal = next(
+            s for s in app.screen_stack if isinstance(s, ConfirmActionModal)
+        )
+        await pilot.click(modal.query_one("#confirm-no"))
+        await pilot.pause()
+        assert app.result is False
+
+
+@pytest.mark.asyncio
+async def test_confirm_action_escape_dismisses_false() -> None:
+    app = _ModalHarness(_confirm_factory)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.result is False
+
+
+# ---------------------------------------------------------------------------
+# GPUProcessListModal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_gpu_process_list_modal_empty_composes() -> None:
+    """With no GPU processes, modal renders 'No GPU compute processes found'."""
+    with patch(
+        "bastion.dashboard.modals.SystemDataCollector.query_gpu_processes",
+        return_value=[],
+    ):
+        app = _ModalHarness(GPUProcessListModal)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            modal = next(
+                s for s in app.screen_stack if isinstance(s, GPUProcessListModal)
+            )
+            assert modal._procs == []
+            # Cancel still present.
+            assert modal.query_one("#gpuproc-cancel") is not None
+
+
+@pytest.mark.asyncio
+async def test_gpu_process_list_modal_populated_dismisses_with_pid() -> None:
+    procs = [
+        {"pid": "12345", "name": "ollama", "vram_mb": "8192"},
+        {"pid": "67890", "name": "python", "vram_mb": "2048"},
+    ]
+    with patch(
+        "bastion.dashboard.modals.SystemDataCollector.query_gpu_processes",
+        return_value=procs,
+    ):
+        app = _ModalHarness(GPUProcessListModal)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            modal = next(
+                s for s in app.screen_stack if isinstance(s, GPUProcessListModal)
+            )
+            # Click the first process button.
+            await pilot.click(modal.query_one("#gpuproc-12345"))
+            await pilot.pause()
+            assert app.result == "12345"
+
+
+@pytest.mark.asyncio
+async def test_gpu_process_list_modal_cancel_returns_empty() -> None:
+    with patch(
+        "bastion.dashboard.modals.SystemDataCollector.query_gpu_processes",
+        return_value=[{"pid": "1", "name": "n", "vram_mb": "1"}],
+    ):
+        app = _ModalHarness(GPUProcessListModal)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            modal = next(
+                s for s in app.screen_stack if isinstance(s, GPUProcessListModal)
+            )
+            await pilot.click(modal.query_one("#gpuproc-cancel"))
+            await pilot.pause()
+            assert app.result == ""
+
+
+@pytest.mark.asyncio
+async def test_gpu_process_list_modal_escape_returns_empty() -> None:
+    with patch(
+        "bastion.dashboard.modals.SystemDataCollector.query_gpu_processes",
+        return_value=[],
+    ):
+        app = _ModalHarness(GPUProcessListModal)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.result == ""
+
+
+@pytest.mark.asyncio
+async def test_gpu_process_list_button_ids_textual_safe() -> None:
+    """Process PIDs are integers in string form; ids must still be valid."""
+    procs = [
+        {"pid": "1234", "name": "ollama", "vram_mb": "1024"},
+        {"pid": "5678", "name": "x", "vram_mb": "2048"},
+    ]
+    with patch(
+        "bastion.dashboard.modals.SystemDataCollector.query_gpu_processes",
+        return_value=procs,
+    ):
+        app = _ModalHarness(GPUProcessListModal)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            modal = next(
+                s for s in app.screen_stack if isinstance(s, GPUProcessListModal)
+            )
+            for btn in modal.query("Button"):
+                assert btn.id is not None
+                assert _TEXTUAL_ID.match(btn.id), f"bad id: {btn.id!r}"
+
+
+# ---------------------------------------------------------------------------
+# ConfirmGPUKillModal
+# ---------------------------------------------------------------------------
+
+
+def _kill_factory() -> ConfirmGPUKillModal:
+    return ConfirmGPUKillModal(pid="9999", name="ollama", vram_mb="4096")
+
+
+@pytest.mark.asyncio
+async def test_confirm_gpu_kill_normal_dismisses_kill() -> None:
+    app = _ModalHarness(_kill_factory)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        modal = next(
+            s for s in app.screen_stack if isinstance(s, ConfirmGPUKillModal)
+        )
+        await pilot.click(modal.query_one("#kill-normal"))
+        await pilot.pause()
+        assert app.result == "kill"
+
+
+@pytest.mark.asyncio
+async def test_confirm_gpu_kill_force_dismisses_kill_9() -> None:
+    app = _ModalHarness(_kill_factory)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        modal = next(
+            s for s in app.screen_stack if isinstance(s, ConfirmGPUKillModal)
+        )
+        await pilot.click(modal.query_one("#kill-force"))
+        await pilot.pause()
+        assert app.result == "kill-9"
+
+
+@pytest.mark.asyncio
+async def test_confirm_gpu_kill_cancel_dismisses_empty() -> None:
+    app = _ModalHarness(_kill_factory)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        modal = next(
+            s for s in app.screen_stack if isinstance(s, ConfirmGPUKillModal)
+        )
+        await pilot.click(modal.query_one("#kill-cancel"))
+        await pilot.pause()
+        assert app.result == ""
+
+
+@pytest.mark.asyncio
+async def test_confirm_gpu_kill_escape_dismisses_empty() -> None:
+    app = _ModalHarness(_kill_factory)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.result == ""
+
+
+# ---------------------------------------------------------------------------
+# FanControlModal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fan_modal_available_speed_button_dismisses_with_speed() -> None:
+    """With fan control available, each speed button dismisses with its number."""
+    with patch(
+        "bastion.dashboard.modals.fan_control_available", return_value=True
+    ):
+        app = _ModalHarness(FanControlModal)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            modal = next(
+                s for s in app.screen_stack if isinstance(s, FanControlModal)
+            )
+            await pilot.click(modal.query_one("#fan-70"))
+            await pilot.pause()
+            assert app.result == "70"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("button_id,expected", [
+    ("fan-30", "30"),
+    ("fan-50", "50"),
+    ("fan-90", "90"),
+    ("fan-100", "100"),
+    ("fan-auto", "auto"),
+])
+async def test_fan_modal_each_speed_dismisses_with_correct_value(
+    button_id: str, expected: str
+) -> None:
+    with patch(
+        "bastion.dashboard.modals.fan_control_available", return_value=True
+    ):
+        app = _ModalHarness(FanControlModal)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            modal = next(
+                s for s in app.screen_stack if isinstance(s, FanControlModal)
+            )
+            await pilot.click(modal.query_one(f"#{button_id}"))
+            await pilot.pause()
+            assert app.result == expected
+
+
+@pytest.mark.asyncio
+async def test_fan_modal_toggle_auto_dismisses_with_special_value() -> None:
+    with patch(
+        "bastion.dashboard.modals.fan_control_available", return_value=True
+    ):
+        app = _ModalHarness(FanControlModal)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            modal = next(
+                s for s in app.screen_stack if isinstance(s, FanControlModal)
+            )
+            await pilot.click(modal.query_one("#fan-toggle-auto"))
+            await pilot.pause()
+            assert app.result == "toggle-auto"
+
+
+@pytest.mark.asyncio
+async def test_fan_modal_cancel_dismisses_empty() -> None:
+    with patch(
+        "bastion.dashboard.modals.fan_control_available", return_value=True
+    ):
+        app = _ModalHarness(FanControlModal)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            modal = next(
+                s for s in app.screen_stack if isinstance(s, FanControlModal)
+            )
+            await pilot.click(modal.query_one("#fan-cancel"))
+            await pilot.pause()
+            assert app.result == ""
+
+
+@pytest.mark.asyncio
+async def test_fan_modal_escape_dismisses_empty() -> None:
+    with patch(
+        "bastion.dashboard.modals.fan_control_available", return_value=True
+    ):
+        app = _ModalHarness(FanControlModal)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.result == ""
+
+
+@pytest.mark.asyncio
+async def test_fan_modal_unavailable_shows_close_button() -> None:
+    """When fan control wrapper missing, only Close button is offered."""
+    with patch(
+        "bastion.dashboard.modals.fan_control_available", return_value=False
+    ):
+        app = _ModalHarness(FanControlModal)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            modal = next(
+                s for s in app.screen_stack if isinstance(s, FanControlModal)
+            )
+            # Close button uses the same id ('fan-cancel').
+            await pilot.click(modal.query_one("#fan-cancel"))
+            await pilot.pause()
+            assert app.result == ""
+
+
+# ---------------------------------------------------------------------------
+# Module-wide invariant: every modal's button ids match Textual's rule.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_all_modal_button_ids_textual_safe() -> None:
+    """Each modal in turn: every Button id matches Textual's identifier rule."""
+    factories: list[Any] = [
+        HelpModal,
+        _confirm_factory,
+        _kill_factory,
+        FanControlModal,
+        lambda: ModelSelectModal("pick", ["a:b", "c.d"]),
+    ]
+    for factory in factories:
+        app = _ModalHarness(factory)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            modal = app.screen_stack[-1]
+            for btn in modal.query("Button"):
+                assert btn.id is not None
+                assert _TEXTUAL_ID.match(btn.id), (
+                    f"{type(modal).__name__} bad id: {btn.id!r}"
+                )
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers: fan_control_available + set_fan_speed
+# ---------------------------------------------------------------------------
+
+
+def test_fan_control_available_returns_bool() -> None:
+    from bastion.dashboard.modals import fan_control_available
+
+    assert isinstance(fan_control_available(), bool)
+
+
+def test_set_fan_speed_when_wrapper_missing_returns_false() -> None:
+    from bastion.dashboard.modals import set_fan_speed
+
+    with patch(
+        "bastion.dashboard.modals.fan_control_available", return_value=False
+    ):
+        ok, msg = set_fan_speed("70")
+        assert ok is False
+        assert "wrapper not found" in msg
+
+
+def test_set_fan_speed_subprocess_success() -> None:
+    from bastion.dashboard.modals import set_fan_speed
+
+    class _Result:
+        returncode = 0
+        stdout = "ok\n"
+        stderr = ""
+
+    with patch(
+        "bastion.dashboard.modals.fan_control_available", return_value=True
+    ), patch(
+        "bastion.dashboard.modals.subprocess.run", return_value=_Result()
+    ):
+        ok, msg = set_fan_speed("70")
+        assert ok is True
+        assert msg == "ok"
+
+
+def test_set_fan_speed_subprocess_failure() -> None:
+    from bastion.dashboard.modals import set_fan_speed
+
+    class _Result:
+        returncode = 1
+        stdout = ""
+        stderr = "permission denied\n"
+
+    with patch(
+        "bastion.dashboard.modals.fan_control_available", return_value=True
+    ), patch(
+        "bastion.dashboard.modals.subprocess.run", return_value=_Result()
+    ):
+        ok, msg = set_fan_speed("70")
+        assert ok is False
+        assert msg == "permission denied"
+
+
+def test_set_fan_speed_timeout_returns_false() -> None:
+    import subprocess
+
+    from bastion.dashboard.modals import set_fan_speed
+
+    with patch(
+        "bastion.dashboard.modals.fan_control_available", return_value=True
+    ), patch(
+        "bastion.dashboard.modals.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd="x", timeout=10),
+    ):
+        ok, msg = set_fan_speed("70")
+        assert ok is False
+        assert "timed out" in msg
+
+
+def test_set_fan_speed_generic_exception_returns_false() -> None:
+    from bastion.dashboard.modals import set_fan_speed
+
+    with patch(
+        "bastion.dashboard.modals.fan_control_available", return_value=True
+    ), patch(
+        "bastion.dashboard.modals.subprocess.run",
+        side_effect=FileNotFoundError("no sudo"),
+    ):
+        ok, msg = set_fan_speed("70")
+        assert ok is False
+        assert "no sudo" in msg
