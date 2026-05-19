@@ -7,7 +7,9 @@ import uuid
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, computed_field
+from pathlib import Path
+
+from pydantic import BaseModel, Field, PrivateAttr, computed_field
 
 # ---------------------------------------------------------------------------
 # Configuration models
@@ -286,6 +288,18 @@ class BrokerConfig(BaseModel):
     request_overrides: RequestOverrides = Field(default_factory=RequestOverrides)
     complexity_routing: ComplexityRoutingConfig = Field(default_factory=ComplexityRoutingConfig)
     thrashing_detection: ThrashingDetectionConfig = Field(default_factory=ThrashingDetectionConfig)
+
+    # Resolved path of the broker.yaml that loaded this config. Set by
+    # ``bastion.config.load_config`` post-construction. ``None`` when the
+    # config was built from defaults (no file found) or in tests that
+    # bypass ``load_config``. Exposed via ``/broker/catalog`` as a string;
+    # callers should use ``str(cfg.loaded_from) if cfg.loaded_from else "<unknown>"``.
+    _loaded_from: Path | None = PrivateAttr(default=None)
+
+    @property
+    def loaded_from(self) -> Path | None:
+        """Resolved path of the source broker.yaml, or ``None``."""
+        return self._loaded_from
 
 
 # ---------------------------------------------------------------------------
