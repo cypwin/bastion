@@ -88,6 +88,33 @@ class BastionClient:
         except Exception:
             return {}
 
+    async def get_latency(self, window_s: float = 300.0) -> dict:
+        """Fetch /broker/latency for per-model latency percentiles.
+
+        Parameters
+        ----------
+        window_s
+            Rolling window in seconds. Server clamps to [10, 3600].
+        """
+        try:
+            resp = await self._client.get(
+                f"{self.base_url}/broker/latency",
+                params={"window_s": window_s},
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            return {}
+
+    async def get_catalog(self) -> dict:
+        """Fetch /broker/catalog for the registered-models + residency view."""
+        try:
+            resp = await self._client.get(f"{self.base_url}/broker/catalog")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            return {}
+
     async def post_preload(self, model: str) -> dict:
         """Preload a model via /broker/preload."""
         resp = await self._client.post(

@@ -155,6 +155,40 @@ async def test_get_thrashing_returns_dict() -> None:
         assert await client.get_thrashing() == payload
 
 
+async def test_get_latency_returns_dict() -> None:
+    payload = {"sample_total": 0, "per_model": [], "overall": None}
+    client = BastionClient("http://localhost:11434")
+    with patch.object(
+        client._client, "get", new=AsyncMock(return_value=_resp(200, payload))
+    ) as get:
+        assert await client.get_latency() == payload
+        get.assert_awaited_once_with(
+            "http://localhost:11434/broker/latency",
+            params={"window_s": 300.0},
+        )
+
+
+async def test_get_latency_forwards_custom_window() -> None:
+    client = BastionClient("http://localhost:11434")
+    with patch.object(
+        client._client, "get", new=AsyncMock(return_value=_resp(200, {}))
+    ) as get:
+        await client.get_latency(window_s=60.0)
+        get.assert_awaited_once_with(
+            "http://localhost:11434/broker/latency",
+            params={"window_s": 60.0},
+        )
+
+
+async def test_get_catalog_returns_dict() -> None:
+    payload = {"models": [], "total": 0, "registry_source": "<unknown>"}
+    client = BastionClient("http://localhost:11434")
+    with patch.object(
+        client._client, "get", new=AsyncMock(return_value=_resp(200, payload))
+    ):
+        assert await client.get_catalog() == payload
+
+
 # ---------------------------------------------------------------------------
 # GET error handling — methods must swallow errors and return safe defaults
 # ---------------------------------------------------------------------------
@@ -170,6 +204,8 @@ async def test_get_thrashing_returns_dict() -> None:
         ("get_watchdog", {}),
         ("get_counters", {}),
         ("get_thrashing", {}),
+        ("get_latency", {}),
+        ("get_catalog", {}),
     ],
 )
 async def test_get_methods_return_default_on_http_error(
@@ -194,6 +230,8 @@ async def test_get_methods_return_default_on_http_error(
         ("get_watchdog", {}),
         ("get_counters", {}),
         ("get_thrashing", {}),
+        ("get_latency", {}),
+        ("get_catalog", {}),
     ],
 )
 async def test_get_methods_return_default_on_network_error(
