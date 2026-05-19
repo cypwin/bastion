@@ -20,6 +20,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import subprocess
 import time
 from collections import deque
 from collections.abc import AsyncGenerator, Callable
@@ -79,6 +81,42 @@ _process_monitor: ProcessMonitor | None = None
 _sweep_task: asyncio.Task | None = None
 _start_time: float = 0.0
 _reset_epoch: str = ""  # ISO-8601 UTC timestamp set once at broker startup
+
+
+def _detect_git_sha() -> str:
+    """Return the BASTION git SHA for this install, or ``unknown``.
+
+    Order of precedence:
+      1. ``BASTION_GIT_SHA`` env var (set by deploy tooling for wheels).
+      2. ``git rev-parse HEAD`` in the package root (development installs).
+      3. ``unknown`` (no git, no env var — e.g., wheel install without deploy SHA).
+
+    Captured once at module load by ``_GIT_SHA``; the /broker/version route
+    returns this value so A2A clients (KATAMARAN) can pin SHA across a
+    long batch and detect mid-run redeploys.
+    """
+    sha = os.environ.get("BASTION_GIT_SHA", "").strip()
+    if sha:
+        return sha
+    try:
+        # __file__ -> .../src/bastion/server.py; package repo root is two up.
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "unknown"
+
+
+_GIT_SHA: str = _detect_git_sha()
 _thrashing_detector: ThrashingDetector | None = None
 
 # Verdict label and ordering maps used by /broker/thrashing in both create_app
@@ -349,29 +387,62 @@ async def _dispatch_request(request: QueuedRequest, needs_swap: bool = True) -> 
         # Wrap the done_fn cleanup: when the proxy signals completion,
         # also clean up inflight tracking
         async def _cleanup_inflight() -> None:
-            if original_done_event is not None:
-                timeout = (_config.proxy.inference_timeout_seconds if _config else 300.0) + 60.0
-                try:
-                    await asyncio.wait_for(original_done_event.wait(), timeout=timeout)
-                except TimeoutError:
-                    logger.warning(
-                        "Completion event timed out for non-blocking request %s (%.0fs)",
-                        request.id, timeout,
-                    )
-                    _pending_completions.pop(request.id, None)
-            # Clean up inflight tracking
-            if _inflight_lock is not None:
-                async with _inflight_lock:
-                    count = _inflight_models.get(request.model, 1) - 1
-                    if count <= 0:
-                        _inflight_models.pop(request.model, None)
-                    else:
-                        _inflight_models[request.model] = count
-            # Wake the scheduler so it can dispatch queued same-model requests
-            # immediately instead of waiting for the next loop_interval timeout.
-            # (Fix for issue #3: see reference/QUEUE_STALENESS_INVESTIGATION.md)
-            if _scheduler:
-                _scheduler.notify()
+            # The wait + decrement are wrapped in try/finally so the
+            # inflight counter decrement ALWAYS runs — otherwise a raise
+            # inside done_event.wait() (CancelledError, network errors, ...)
+            # would pin the counter above its true value and block the
+            # scheduler from evicting this model forever. KNOWN_ISSUES,
+            # resolved in v0.4.1.
+            try:
+                if original_done_event is not None:
+                    timeout = (
+                        _config.proxy.inference_timeout_seconds
+                        if _config else 300.0
+                    ) + 60.0
+                    try:
+                        await asyncio.wait_for(
+                            original_done_event.wait(), timeout=timeout,
+                        )
+                    except TimeoutError:
+                        logger.warning(
+                            "Completion event timed out for non-blocking request %s (%.0fs)",
+                            request.id, timeout,
+                        )
+                        _pending_completions.pop(request.id, None)
+            except Exception:
+                logger.exception(
+                    "Unexpected error waiting on completion event "
+                    "(request=%s); decrementing inflight anyway",
+                    request.id,
+                )
+            finally:
+                # Decrement inflight tracking even when the wait failed —
+                # otherwise this model's counter is stuck above its true
+                # value and the scheduler refuses to evict it.
+                if _inflight_lock is not None:
+                    try:
+                        async with _inflight_lock:
+                            count = _inflight_models.get(request.model, 1) - 1
+                            if count <= 0:
+                                _inflight_models.pop(request.model, None)
+                            else:
+                                _inflight_models[request.model] = count
+                    except Exception:
+                        logger.exception(
+                            "Failed to decrement _inflight_models for request=%s",
+                            request.id,
+                        )
+                # Wake the scheduler so it can dispatch queued same-model requests
+                # immediately instead of waiting for the next loop_interval timeout.
+                # (Fix for issue #3: see reference/QUEUE_STALENESS_INVESTIGATION.md)
+                if _scheduler:
+                    try:
+                        _scheduler.notify()
+                    except Exception:
+                        logger.exception(
+                            "Failed to notify scheduler after cleanup (request=%s)",
+                            request.id,
+                        )
 
         # Fire-and-forget: track completion in background
         asyncio.create_task(_cleanup_inflight(), name=f"inflight-cleanup-{request.id}")
@@ -726,7 +797,10 @@ def create_app(config: BrokerConfig) -> FastAPI:
         fields (total_dispatched, swap_rate_level, stall diagnostics,
         inflight models, circuit breaker state, GPU safety, VRAM budget).
         """
-        loaded = await _vram_tracker.get_loaded_models() if _vram_tracker else []
+        loaded_raw = await _vram_tracker.get_loaded_models() if _vram_tracker else []
+        # State-unknown sentinel (None) coerced to [] so the BrokerStatus
+        # contract (loaded_models: list) stays satisfied during outages.
+        loaded = loaded_raw if loaded_raw is not None else []
         gpu = await query_gpu_status()
         status = BrokerStatus(
             uptime_seconds=time.time() - _start_time,
@@ -1044,6 +1118,26 @@ def create_app(config: BrokerConfig) -> FastAPI:
         else:
             global_verdict = "OK"
         return BrokerThrashing(detector_state=global_verdict, agents=agent_entries)
+
+    @broker_router.get("/version")
+    async def broker_version() -> dict[str, Any]:
+        """Build identity for client SHA-pinning during long batches.
+
+        Returns the BASTION version, git SHA, and process boot timestamp.
+        A2A clients (KATAMARAN) can pin ``git_sha`` at the start of a long
+        batch and refuse to retry against a different SHA — the signal that
+        a mid-run redeploy (not a transient infra blip) caused the errors.
+        ``boot_time_unix`` distinguishes process restarts at unchanged SHA.
+        """
+        return {
+            "version": bastion.__version__,
+            "git_sha": _GIT_SHA,
+            "boot_time_unix": _start_time,
+            "boot_time_iso": (
+                datetime.fromtimestamp(_start_time, UTC).isoformat()
+                if _start_time else ""
+            ),
+        }
 
     # ── S6: Model Intent API ────────────────────────────────────────
 
@@ -1489,7 +1583,10 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
         fields (total_dispatched, swap_rate_level, stall diagnostics,
         inflight models, circuit breaker state, GPU safety, VRAM budget).
         """
-        loaded = await _vram_tracker.get_loaded_models() if _vram_tracker else []
+        loaded_raw = await _vram_tracker.get_loaded_models() if _vram_tracker else []
+        # State-unknown sentinel (None) coerced to [] so the BrokerStatus
+        # contract (loaded_models: list) stays satisfied during outages.
+        loaded = loaded_raw if loaded_raw is not None else []
         gpu = await query_gpu_status()
         status = BrokerStatus(
             uptime_seconds=time.time() - _start_time,
@@ -1770,6 +1867,26 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
         else:
             global_verdict = "OK"
         return BrokerThrashing(detector_state=global_verdict, agents=agent_entries)
+
+    @broker_router.get("/version")
+    async def broker_version() -> dict[str, Any]:
+        """Build identity for client SHA-pinning during long batches.
+
+        Returns the BASTION version, git SHA, and process boot timestamp.
+        A2A clients (KATAMARAN) can pin ``git_sha`` at the start of a long
+        batch and refuse to retry against a different SHA — the signal that
+        a mid-run redeploy (not a transient infra blip) caused the errors.
+        ``boot_time_unix`` distinguishes process restarts at unchanged SHA.
+        """
+        return {
+            "version": bastion.__version__,
+            "git_sha": _GIT_SHA,
+            "boot_time_unix": _start_time,
+            "boot_time_iso": (
+                datetime.fromtimestamp(_start_time, UTC).isoformat()
+                if _start_time else ""
+            ),
+        }
 
     @broker_router.post("/intent")
     async def broker_intent(request: Request):

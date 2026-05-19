@@ -48,24 +48,49 @@ class ResidencyCache:
         self._cache_timestamp: float = 0.0
         self._lock = asyncio.Lock()
 
-    async def _refresh_if_needed(self) -> None:
-        """Refresh cache if expired (TTL exceeded)."""
+    async def _refresh_if_needed(self) -> bool:
+        """Refresh cache if expired. Returns whether cache holds usable state.
+
+        When the tracker returns ``None`` (Ollama /api/ps unreachable), the
+        prior cache (if any) is preserved — a brief Ollama hiccup must not
+        promote known-good residency data to "unknown". The next call retries
+        immediately because the timestamp is not advanced.
+
+        Returns
+        -------
+        bool
+            True if the cache contains usable state (fresh or stale-OK).
+            False only when we have never had a successful read AND the
+            current attempt failed — caller should treat as unknown.
+        """
         now = time.time()
         if self._cache is None or (now - self._cache_timestamp) > self._ttl_seconds:
-            self._cache = await self._vram_tracker.get_loaded_models()
+            fresh = await self._vram_tracker.get_loaded_models()
+            if fresh is None:
+                # Preserve prior cache; do not advance timestamp so the next
+                # call retries instead of serving stale-and-stale forever.
+                logger.debug("Residency cache refresh skipped: tracker state unknown")
+                return self._cache is not None
+            self._cache = fresh
             self._cache_timestamp = now
             logger.debug("Residency cache refreshed: %d models loaded", len(self._cache))
+        return True
 
-    async def get_resident_models(self) -> set[str]:
+    async def get_resident_models(self) -> set[str] | None:
         """Get set of currently resident model names.
 
         Returns
         -------
         set[str]
-            Names of all loaded models (from cache if fresh, otherwise refreshed).
+            Names of loaded models (fresh or stale-OK from the cache).
+        None
+            Tracker state is unknown (Ollama unreachable and no prior cache).
+            Callers gating VRAM decisions MUST treat this as fail-closed.
         """
         async with self._lock:
-            await self._refresh_if_needed()
+            known = await self._refresh_if_needed()
+            if not known:
+                return None
             return {m.name for m in (self._cache or [])}
 
     async def is_model_resident(self, model_name: str) -> bool:
@@ -82,6 +107,8 @@ class ResidencyCache:
             True if model is resident (according to cache), False otherwise.
         """
         resident = await self.get_resident_models()
+        if resident is None:
+            return False  # state unknown — safer to treat as not-resident
         return model_name in resident
 
     def invalidate(self) -> None:
@@ -110,8 +137,21 @@ class VRAMTracker:
         cache_ttl = getattr(config.scheduler, "residency_cache_ttl_seconds", 1.0)
         self.residency_cache = ResidencyCache(self, ttl_seconds=cache_ttl)
 
-    async def get_loaded_models(self) -> list[LoadedModel]:
-        """Query Ollama /api/ps for currently loaded models."""
+    async def get_loaded_models(self) -> list[LoadedModel] | None:
+        """Query Ollama /api/ps for currently loaded models.
+
+        Returns
+        -------
+        list[LoadedModel]
+            Loaded models on a successful query (may be empty).
+        None
+            ``/api/ps`` was unreachable or returned an error. Callers that
+            gate VRAM admission MUST treat this as "state unknown" and
+            refuse to approve new loads — returning ``[]`` would be
+            indistinguishable from "no models loaded" and could let the
+            scheduler approve a load that exceeds the VRAM budget (the
+            exact crash failure mode BASTION exists to prevent).
+        """
         try:
             resp = await self._http.get(f"{self.config.ollama.base_url}/api/ps")
             resp.raise_for_status()
@@ -132,7 +172,7 @@ class VRAMTracker:
             return models
         except Exception as e:
             logger.warning("Failed to query Ollama /api/ps: %s", e)
-            return []
+            return None
 
     async def get_loaded_vram_gb(self) -> float:
         """Total VRAM used by currently loaded models (from Ollama).
@@ -141,8 +181,15 @@ class VRAMTracker:
         the Vision C ``bastion_vram_used_mb`` gauge (single-GPU label
         ``gpu_index="0"``), reusing the value already computed for the ledger
         so no extra GPU query is issued.
+
+        When ``/api/ps`` is unreachable, returns 0.0 and skips alert + metric
+        publication — emitting a "0 MB used" gauge during an Ollama outage
+        would mislead operators into thinking VRAM is free.
         """
         models = await self.get_loaded_models()
+        if models is None:
+            logger.warning("get_loaded_vram_gb: tracker state unknown — skipping alert/metric")
+            return 0.0
         total_vram = sum(m.vram_gb for m in models)
 
         # Vision C schema-frozen metric: bastion_vram_used_mb
@@ -193,8 +240,19 @@ class VRAMTracker:
                 f" > {self.config.gpu.max_temperature_c}\u00b0C"
             )
 
-        # Check VRAM budget
+        # Check VRAM budget. Fail-closed when Ollama /api/ps is unreachable —
+        # approving a load on unknown state can exceed the budget and crash
+        # the GPU (the failure mode BASTION exists to prevent).
         loaded = await self.get_loaded_models()
+        if loaded is None:
+            await self.log_vram_snapshot("hard_gate_blocked", {
+                "model": model_name,
+                "reason": "tracker state unknown",
+            })
+            return False, (
+                "Cannot determine VRAM state: Ollama /api/ps unreachable. "
+                "Refusing to admit load while broker/Ollama is in transition."
+            )
         loaded_names = {m.name for m in loaded}
 
         # Already loaded? No additional VRAM needed
@@ -255,12 +313,14 @@ class VRAMTracker:
             )
             resp.raise_for_status()
 
-            # Poll /api/ps until model disappears (confirms VRAM freed)
+            # Poll /api/ps until model disappears (confirms VRAM freed).
+            # When state is unknown (None) we cannot confirm — keep polling
+            # until either confirmation or timeout, then surface the failure.
             confirmed = False
             deadline = time.time() + self.config.ollama.unload_timeout_seconds
             while time.time() < deadline:
                 loaded = await self.get_loaded_models()
-                if model_name not in {m.name for m in loaded}:
+                if loaded is not None and model_name not in {m.name for m in loaded}:
                     confirmed = True
                     break
                 await asyncio.sleep(0.2)
@@ -304,14 +364,25 @@ class VRAMTracker:
 
             gpu = await query_gpu_status()
             loaded = await self.get_loaded_models()
+            if loaded is None:
+                # Preserve the journal entry so the outage is visible in
+                # crash forensics rather than silently writing "no models".
+                loaded_payload: list[dict[str, Any]] = []
+                total_loaded_vram_gb: float | None = None
+                tracker_state = "unknown"
+            else:
+                loaded_payload = [{"name": m.name, "vram_gb": m.vram_gb} for m in loaded]
+                total_loaded_vram_gb = round(sum(m.vram_gb for m in loaded), 2)
+                tracker_state = "ok"
             snapshot = {
                 "timestamp": datetime.now(UTC).isoformat(),
                 "event": event,
                 "gpu_vram_used_mb": gpu.vram_used_mb,
                 "gpu_vram_free_mb": gpu.vram_free_mb,
                 "gpu_temp_c": gpu.temperature_c,
-                "loaded_models": [{"name": m.name, "vram_gb": m.vram_gb} for m in loaded],
-                "total_loaded_vram_gb": round(sum(m.vram_gb for m in loaded), 2),
+                "loaded_models": loaded_payload,
+                "total_loaded_vram_gb": total_loaded_vram_gb,
+                "tracker_state": tracker_state,
             }
             if extra:
                 snapshot.update(extra)
@@ -545,7 +616,7 @@ class VRAMManager:
                 )
             return freed
 
-    async def reconcile(self, loaded_model_names: set[str]) -> int:
+    async def reconcile(self, loaded_model_names: set[str] | None) -> int:
         """Reconcile ledger with actual Ollama state.
 
         Removes allocations for models that Ollama no longer reports as loaded
@@ -554,14 +625,19 @@ class VRAMManager:
 
         Parameters
         ----------
-        loaded_model_names : set[str]
-            Model names currently reported by Ollama /api/ps.
+        loaded_model_names : set[str] | None
+            Model names currently reported by Ollama /api/ps. ``None`` means
+            tracker state is unknown (transient backend failure); the ledger
+            is left untouched to prevent wiping per-model allocations during
+            a brief outage.
 
         Returns
         -------
         int
-            Total bytes freed by reconciliation.
+            Total bytes freed by reconciliation. ``0`` when state is unknown.
         """
+        if loaded_model_names is None:
+            return 0
         self._reclaim_expired_sync()
 
         async with self._lock:

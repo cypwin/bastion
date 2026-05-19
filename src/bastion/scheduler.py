@@ -294,6 +294,20 @@ class Scheduler:
         if self.vram_manager is not None:
             await self.vram_manager.reconcile(resident_models)
 
+        # State unknown (Ollama unreachable). Reconcile above was a no-op so
+        # the ledger is preserved. Bail out of this tick rather than make
+        # dispatch decisions on missing residency data; scheduler retries
+        # on the next 100ms loop.
+        if resident_models is None:
+            if self._last_stall_reason != "tracker_state_unknown":
+                logger.info(
+                    "Scheduler tick skipped: VRAM tracker state unknown "
+                    "(Ollama /api/ps unreachable); ledger preserved",
+                )
+                self._last_stall_reason = "tracker_state_unknown"
+                self._last_stall_time = time.time()
+            return False
+
         dispatch_delay = self.config.scheduler.concurrent_dispatch_delay_seconds
 
         while current_inflight < max_concurrent:
@@ -393,6 +407,11 @@ class Scheduler:
         current_inflight = self._inflight_count_fn()
         resident_models = await self.vram.residency_cache.get_resident_models()
         models_with_work = self.queue.get_models_with_requests()
+
+        # _process_tick bails before invoking this when state is unknown,
+        # but guard defensively in case future callers reuse this helper.
+        if resident_models is None:
+            resident_models = set()
 
         reason = "unknown"
         detail = ""
@@ -563,10 +582,11 @@ class Scheduler:
         self._total_swaps += 1
 
         # Proactive eviction: if resident count exceeds max_loaded_models,
-        # evict the least-useful excess model
+        # evict the least-useful excess model. Skip when tracker state is
+        # unknown — we cannot decide what to evict without ground truth.
         max_loaded = self.config.scheduler.ollama_max_loaded_models
         resident_after = await self.vram.get_loaded_models()
-        if len(resident_after) > max_loaded:
+        if resident_after is not None and len(resident_after) > max_loaded:
             excess = [
                 m for m in resident_after
                 if m.name != candidate.model
@@ -616,6 +636,13 @@ class Scheduler:
         Returns True if enough VRAM was freed, False otherwise.
         """
         resident = await self.vram.get_loaded_models()
+        if resident is None:
+            logger.warning(
+                "_evict_for_model: tracker state unknown for '%s' — refusing to "
+                "evict on unknown state; caller will retry",
+                candidate.model,
+            )
+            return False
         evictable = [
             m for m in resident
             if m.name != candidate.model
@@ -628,7 +655,12 @@ class Scheduler:
 
         evicted_count = 0
         for model_to_evict in evictable:
-            await self._unload_model(model_to_evict.name)
+            if not await self._unload_model(model_to_evict.name):
+                # Failed/deferred unload — no VRAM freed, so skip the
+                # convergence wait and the can_load_model retry. Try the
+                # next candidate. Avoids counting a no-op as eviction
+                # progress (KNOWN_ISSUES, resolved in v0.4.1).
+                continue
             evicted_count += 1
 
             # Wait for VRAM to stabilize after unload
@@ -705,21 +737,30 @@ class Scheduler:
 
     # ── Model management helpers ───────────────────────────────────
 
-    async def _unload_model(self, model: str) -> None:
+    async def _unload_model(self, model: str) -> bool:
         """Unload a model from VRAM with logging.
 
         Checks for active A2A reservations and in-flight requests before unloading.
         Releases VRAMManager allocation so the ledger stays in sync with reality.
+
+        Returns
+        -------
+        bool
+            True only when VRAM was actually freed (Ollama confirmed unload
+            and the ledger was updated). False for deferred evictions (active
+            reservation, in-flight request) and for unload failures. Callers
+            in the eviction loop must check this so a failed unload is not
+            counted as progress — see KNOWN_ISSUES (resolved in v0.4.1).
         """
         # Check if model has an active reservation (A2A integration)
         if self._reservation_check_fn and self._reservation_check_fn(model):
             logger.info("Deferring eviction of '%s' — active A2A reservation", model)
-            return
+            return False
 
         # Check if model has in-flight inference requests
         if self._has_inflight_fn(model):
             logger.info("Deferring eviction of '%s' — in-flight inference request", model)
-            return
+            return False
 
         logger.info("Unloading model '%s' to free VRAM", model)
         success = await self.vram.unload_model(model)
@@ -739,8 +780,9 @@ class Scheduler:
             if self.vram_manager is not None:
                 await self.vram_manager.release_model(model)
                 await self.vram_manager.wait_for_vram_convergence()
-        else:
-            logger.warning("Failed to unload model '%s'", model)
+            return True
+        logger.warning("Failed to unload model '%s'", model)
+        return False
 
     async def unload_model_admin(self, model: str) -> tuple[str, dict]:
         """Operator-driven unload with safety checks and ledger release.

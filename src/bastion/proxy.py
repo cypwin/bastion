@@ -282,10 +282,19 @@ class OllamaProxy:
                     status_code=503,
                 )
             except Exception:
-                logger.error("Queue full — rejecting request for model '%s'", model)
+                # A non-RuntimeError from _enqueue_fn is a programming bug
+                # or genuine infrastructure failure — NOT a queue-full
+                # signal. Log with traceback so operators see the real
+                # cause, and surface 500 so clients distinguish 'broker
+                # bug, retrying won't help' from 503 'try again later'.
+                # KNOWN_ISSUES (resolved in v0.4.1).
+                logger.error(
+                    "Unexpected error from enqueue_fn for model '%s'",
+                    model, exc_info=True,
+                )
                 return JSONResponse(
-                    {"error": "Broker queue full — try again later"},
-                    status_code=503,
+                    {"error": "Internal broker error"},
+                    status_code=500,
                 )
 
             # Wait for scheduler to grant this request (model loaded and ready)
