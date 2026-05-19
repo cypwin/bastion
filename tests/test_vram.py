@@ -67,7 +67,14 @@ class TestGetLoadedModels:
         assert 4.0 < models[0].vram_gb < 4.5
 
     @pytest.mark.asyncio
-    async def test_connection_failure_returns_empty(self, vram_config):
+    async def test_connection_failure_returns_none(self, vram_config):
+        """When /api/ps is unreachable, return None (state unknown), NOT [].
+
+        Returning ``[]`` would be indistinguishable from "no models loaded"
+        and could let the scheduler approve a load that exceeds the VRAM
+        budget — the exact crash failure mode BASTION is built to prevent.
+        See ``can_load_model`` for the fail-closed gate.
+        """
         tracker = VRAMTracker(vram_config)
         with patch.object(
             tracker._http, "get",
@@ -76,7 +83,7 @@ class TestGetLoadedModels:
         ):
             models = await tracker.get_loaded_models()
 
-        assert models == []
+        assert models is None
 
 
 class TestCanLoadModel:
@@ -153,16 +160,45 @@ class TestCanLoadModel:
         assert can is False
         assert "hot" in reason.lower()
 
+    @pytest.mark.asyncio
+    async def test_fail_closed_when_tracker_state_unknown(self, vram_config):
+        """Regression: when /api/ps is unreachable, can_load_model must refuse.
+
+        Documented in KNOWN_ISSUES.md (Critical): a transient /api/ps failure
+        used to return ``[]`` and let the budget check approve any load.
+        On a 24 GB GPU mid-restart, that approved a second 31B load on top
+        of an unflushed one and crashed the device. The fix returns ``None``
+        from ``get_loaded_models`` and gates ``can_load_model`` on it.
+        """
+        tracker = VRAMTracker(vram_config)
+        with patch.object(
+            tracker._http, "get",
+            new_callable=AsyncMock,
+            side_effect=httpx.ConnectError("refused"),
+        ), patch(
+            "bastion.vram.query_gpu_status",
+            AsyncMock(return_value=GPUStatus(temperature_c=50)),
+        ):
+            can, reason = await tracker.can_load_model("qwen3:14b")
+        assert can is False
+        assert "unknown" in reason.lower() or "unreachable" in reason.lower()
+
 
 class TestUnloadModel:
     @pytest.mark.asyncio
     async def test_successful_unload(self, vram_config):
+        """Successful unload: POST returns 200 and the model disappears from /api/ps."""
         tracker = VRAMTracker(vram_config)
-        mock_resp = httpx.Response(
+        post_resp = httpx.Response(
             200, json={},
             request=httpx.Request("POST", "http://mock"),
         )
-        with patch.object(tracker._http, "post", new_callable=AsyncMock, return_value=mock_resp):
+        get_resp = httpx.Response(
+            200, json={"models": []},  # model gone from /api/ps → confirms unload
+            request=httpx.Request("GET", "http://mock"),
+        )
+        with patch.object(tracker._http, "post", new_callable=AsyncMock, return_value=post_resp), \
+             patch.object(tracker._http, "get", new_callable=AsyncMock, return_value=get_resp):
             success = await tracker.unload_model("qwen3:14b")
         assert success is True
 
@@ -174,6 +210,33 @@ class TestUnloadModel:
             new_callable=AsyncMock,
             side_effect=httpx.ConnectError("refused"),
         ):
+            success = await tracker.unload_model("qwen3:14b")
+        assert success is False
+
+    @pytest.mark.asyncio
+    async def test_unload_does_not_falsely_confirm_when_ps_unreachable(self, vram_config):
+        """Regression: when /api/ps is down during the post-unload poll, the
+        previous code (returning [] on failure) saw an empty loaded list and
+        falsely reported the unload as confirmed. With None-as-unknown, the
+        poll continues until the timeout and returns False.
+        """
+        # Shrink the unload poll window so the test runs fast.
+        cfg = vram_config.model_copy(
+            update={"ollama": vram_config.ollama.model_copy(
+                update={"unload_timeout_seconds": 0.5},
+            )},
+        )
+        tracker = VRAMTracker(cfg)
+        post_resp = httpx.Response(
+            200, json={},
+            request=httpx.Request("POST", "http://mock"),
+        )
+        with patch.object(tracker._http, "post", new_callable=AsyncMock, return_value=post_resp), \
+             patch.object(
+                 tracker._http, "get",
+                 new_callable=AsyncMock,
+                 side_effect=httpx.ConnectError("refused"),
+             ):
             success = await tracker.unload_model("qwen3:14b")
         assert success is False
 

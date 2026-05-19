@@ -22,18 +22,7 @@ remainder can be folded into v0.5 work.
 
 ## Critical
 
-### `VRAMTracker.get_loaded_models()` returns `[]` indistinguishable from "no models loaded"
-
-- **Location:** `src/bastion/vram.py:133-135`
-- **Problem:** Every downstream consumer (`can_load_model`, `reconcile`,
-  scheduler's `_evict_for_model`, VRAM budget check) treats `[]` as "VRAM
-  is free." If `/api/ps` is transiently unreachable, the broker silently
-  thinks all models are unloaded and may approve a load that exceeds the
-  24 GB budget — the exact crash failure mode BASTION is built to prevent.
-- **Fix path:** either propagate the exception or return a sentinel
-  `None` and have callers skip budget enforcement when the state is
-  unknown. The latter is less invasive but every caller needs auditing.
-- **Surfaced by:** silent-failure-hunter audit, v0.4 campaign.
+_(none open — see "Resolved in v0.4.1" below)_
 
 ---
 
@@ -50,30 +39,6 @@ remainder can be folded into v0.5 work.
   intended to run.
 - **Fix path:** introduce a `swept` flag or separate "rejected" event
   type so the proxy handler returns 503/504 instead of forwarding.
-- **Surfaced by:** silent-failure-hunter, v0.4 campaign.
-
-### Scheduler ignores `unload_model()` return value
-
-- **Location:** `src/bastion/vram.py:285-287` + `src/bastion/scheduler.py::_unload_model`
-- **Problem:** The 901c910 fix made `unload_model()` *honest* about
-  whether VRAM converged. But the scheduler's `_unload_model` only logs
-  the return value — it doesn't gate the subsequent load path. Eviction
-  can silently fail and the scheduler may then attempt to load a new
-  model into full VRAM.
-- **Fix path:** check the return value in `_unload_model` and abort the
-  swap when unload reports `False`.
-- **Surfaced by:** silent-failure-hunter, v0.4 campaign.
-
-### `_cleanup_inflight` background task has no exception handler
-
-- **Location:** `src/bastion/server.py:365`
-- **Problem:** The task is responsible for decrementing `_inflight_models`
-  and calling `_scheduler.notify()`. If `_inflight_lock` is None
-  unexpectedly or any context manager raises, the task dies silently. The
-  inflight counter stays incremented forever, blocking the scheduler
-  from evicting that model.
-- **Fix path:** wrap the task body in `try/except Exception` and ensure
-  `_inflight_models` decrement happens in a `finally` block.
 - **Surfaced by:** silent-failure-hunter, v0.4 campaign.
 
 ### A2A `create_lease` has TOCTOU window with `has_active_lease`
@@ -120,18 +85,6 @@ remainder can be folded into v0.5 work.
   partition — with no indication that data is absent vs. truly empty.
 - **Fix path:** log at DEBUG level with endpoint name and exception type
   so the dashboard log captures the failure even if the UI doesn't.
-- **Surfaced by:** silent-failure-hunter, v0.4 campaign.
-
-### Proxy enqueue bare `except Exception` reports any failure as "queue full"
-
-- **Location:** `src/bastion/proxy.py:284-290`
-- **Problem:** Any unexpected exception from `_enqueue_fn` (programming
-  error, attribute error, ...) is silently reported to the client as
-  "Broker queue full." The log message says "Queue full" regardless of
-  cause, with no traceback.
-- **Fix path:** narrow the exception handler to `RuntimeError` (the
-  queue-full signal), log non-RuntimeError cases at ERROR with
-  `exc_info=True`.
 - **Surfaced by:** silent-failure-hunter, v0.4 campaign.
 
 ### A2A `_handle_status` swallows handler exceptions without logging
@@ -214,6 +167,93 @@ remainder can be folded into v0.5 work.
 
 - **Status:** Resolved. `pyproject.toml` dev now reads
   `httpx>=0.27,<1.0` matching the dashboard extra.
+
+---
+
+## Resolved in v0.4.1
+
+### `VRAMTracker.get_loaded_models()` returns `[]` indistinguishable from "no models loaded"
+
+- **Was:** `src/bastion/vram.py:133-135` returned `[]` on any HTTP exception,
+  so every downstream consumer treated transient `/api/ps` failures as "VRAM
+  is free" — exactly the misclassification that approved a second 31B load on
+  top of an unflushed one during the S122-merge restart burst and crashed the
+  5090 (KATAMARAN dossier 2026-05-19).
+- **Fix:** `get_loaded_models()` now returns `list[LoadedModel] | None`;
+  `None` is the "state unknown" sentinel. Callers propagated:
+  - `can_load_model()` — fail-closed: returns `(False, "VRAM state unknown…")`
+  - `unload_model()` — poll continues until timeout instead of falsely
+    confirming convergence on an empty `/api/ps` response
+  - `ResidencyCache` — preserves the prior cache across a transient outage
+    (stale-OK semantics); first cold-cache failure surfaces as `None`
+  - `VRAMManager.reconcile(None)` — no-op (ledger preserved instead of wiped)
+  - `Scheduler._process_tick` — bails out with `tracker_state_unknown` stall
+    reason; next 100ms tick retries
+  - `Scheduler._evict_for_model` — refuses to pick eviction candidates
+    without ground truth; returns `False` so the caller retries
+- **Regression tests:** `tests/test_vram.py::test_connection_failure_returns_none`,
+  `::test_fail_closed_when_tracker_state_unknown`,
+  `::test_unload_does_not_falsely_confirm_when_ps_unreachable`, and
+  `tests/test_vram_state_unknown_extra.py::{TestResidencyCacheStateUnknown,
+  TestVRAMManagerReconcileStateUnknown}`.
+
+### Scheduler ignores `unload_model()` return value
+
+- **Was:** `scheduler._unload_model()` returned `None` and ignored the bool
+  from `vram.unload_model()`. The 901c910 fix made `unload_model()` honest
+  about convergence, but the eviction loop kept paying for
+  `wait_for_vram_convergence()` + `can_load_model()` on iterations where no
+  VRAM was actually freed, and logged misleading "Cannot load X after evicting
+  N models" lines where N counted *attempts* not successes.
+- **Fix:** `_unload_model() -> bool` propagates the result. `_evict_for_model`
+  now `continue`s on a False return (skips the convergence wait and
+  can_load_model retry) so failed unloads don't masquerade as eviction
+  progress. Defer-branches (active reservation, in-flight request) also
+  return False — caller treats as "no VRAM freed."
+- **Test:** `tests/test_scheduler_unload_gate.py::TestUnloadReturnGate`.
+
+### `_cleanup_inflight` background task has no exception handler
+
+- **Was:** `server.py::_cleanup_inflight` (the closure inside
+  `_dispatch_request`) had no outer `try/except`. If `done_event.wait()`
+  raised something other than `TimeoutError` (CancelledError, network
+  error, attribute error), the task died and the `_inflight_models` counter
+  stayed pinned above its true value forever — blocking the scheduler from
+  ever evicting that model.
+- **Fix:** body wrapped in `try/except Exception` with the decrement +
+  scheduler `notify()` in `finally`. Inner `try/except` around the lock
+  acquisition itself guards the decrement against unexpected lock state.
+  Each block logs with `logger.exception(...)` so the real failure surfaces
+  in logs instead of being swallowed.
+- **Test:** `tests/test_cleanup_inflight_resilient.py::TestCleanupInflightResilience`
+  (covers `done_event.wait()` raising `RuntimeError` and the happy path).
+
+### Proxy enqueue bare `except Exception` reports any failure as "queue full"
+
+- **Was:** `proxy.py` had a bare `except Exception` after the `except
+  RuntimeError` handler that returned the same `503 "Broker queue full"`
+  body and logged `"Queue full"` without `exc_info`. Programming bugs
+  (AttributeError, TypeError) and infra failures all looked identical to
+  clients (and identical in logs) — burned client backoff budgets on
+  conditions retry can't fix.
+- **Fix:** unexpected exceptions now log at `ERROR` with `exc_info=True`
+  (real type + traceback) and return `500 "Internal broker error"`. Clients
+  retain 503 for legitimate queue-full / drain conditions only.
+- **Test:** `tests/test_proxy_enqueue_narrow_except.py::TestProxyEnqueueNarrowExcept`.
+
+### `GET /broker/version` (new endpoint, paired with the fix above)
+
+- **Was:** clients (KATAMARAN, other A2A consumers) had no way to detect
+  that BASTION was redeployed mid-batch. Three S122 merges restarted the
+  broker mid-batch and surfaced as four distinct error shapes downstream,
+  each needing independent retry tuning.
+- **Fix:** `GET /broker/version` returns `{version, git_sha, boot_time_unix,
+  boot_time_iso}`. `git_sha` is captured at module load (env-var
+  `BASTION_GIT_SHA` overrides; falls back to `git rev-parse HEAD`; final
+  fallback `"unknown"`). Clients pin SHA at batch start and treat a change
+  on retry as "infra in transition, longer backoff" rather than a normal
+  5xx blip.
+- **Test:** `tests/test_broker_version.py::TestBrokerVersion`.
 
 ---
 
