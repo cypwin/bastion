@@ -146,16 +146,25 @@ class ModelSelectModal(ModalScreen[str]):
     def compose(self) -> ComposeResult:
         with Vertical(id="select-dialog"):
             yield Label(self.title_text)
-            for model in self.model_list:
-                yield Button(model, id=f"model-{model}")
+            for idx, model in enumerate(self.model_list):
+                # Index-based id — model names contain ':' and '.' which
+                # Textual rejects as widget ids.
+                yield Button(model, id=f"model-{idx}")
             yield Button("Cancel", variant="primary", id="cancel")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "cancel":
+        btn_id = event.button.id
+        if btn_id == "cancel" or btn_id is None:
             self.dismiss("")
-        else:
-            model_name = event.button.id.replace("model-", "", 1) if event.button.id else ""
-            self.dismiss(model_name)
+            return
+        if btn_id.startswith("model-"):
+            try:
+                idx = int(btn_id[len("model-"):])
+                self.dismiss(self.model_list[idx])
+                return
+            except (ValueError, IndexError):
+                pass
+        self.dismiss("")
 
     def action_dismiss_cancel(self) -> None:
         self.dismiss("")
