@@ -5,6 +5,18 @@ All notable changes to BASTION are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `GET /broker/latency` — per-model latency percentiles (p50/p95/p99 for end-to-end duration and queue-wait) over a rolling window. Query param `window_s` (default 300, clamped `[10, 3600]`). Aggregation logic factored into `bastion.latency_aggregator.aggregate_latency` and unit-tested independently. Models with fewer than 3 samples in the window are omitted from `per_model`; the `overall` bucket aggregates all in-window samples.
+- `GET /broker/catalog` — registered models from `broker.yaml` enriched with VRAMTracker residency state and a computed `is_evictable` flag (loaded AND not the scheduler's `current_model` AND not `always_allowed`). Stays queryable during `/api/ps` outages — `loaded_count` collapses to 0 rather than 500ing.
+- `BastionClient.get_latency(window_s)` / `BastionClient.get_catalog()` async wrappers in the dashboard client.
+- `BrokerConfig._loaded_from` (`PrivateAttr`) + public `loaded_from` property recording the resolved path of the loaded `broker.yaml`; surfaced as `registry_source` in `/broker/catalog`.
+
+### Changed
+- `_recent_requests` ring buffer maxlen bumped from 50 → 500. Prereq for stable per-model p95 in `/broker/latency`. Memory overhead ≈ 50 KB.
+- `/broker/recent` documentation updated to reflect the 500-sample buffer and its new role feeding the latency aggregator.
+
 ## [0.4.0] - 2026-04-23
 
 ### Added
