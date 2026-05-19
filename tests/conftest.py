@@ -331,6 +331,23 @@ def _isolate_telemetry():
     telem._enabled = orig_enabled
 
 
+@pytest.fixture(autouse=True)
+def _isolate_server_intent_state():
+    """Reset server-side intent dicts so tests don't leak state across each other."""
+    try:
+        import bastion.server as server_mod
+    except Exception:
+        yield
+        return
+    orig_active = dict(server_mod._active_intents)
+    orig_resolved = dict(server_mod._resolved_intents)
+    yield
+    server_mod._active_intents.clear()
+    server_mod._active_intents.update(orig_active)
+    server_mod._resolved_intents.clear()
+    server_mod._resolved_intents.update(orig_resolved)
+
+
 # ---------------------------------------------------------------------------
 # VRAMManager fixture (D5)
 # ---------------------------------------------------------------------------
@@ -343,3 +360,144 @@ def vram_manager(vram_tracker: VRAMTracker) -> VRAMManager:
     """VRAMManager with 32GB total, 10% safety margin."""
     total_bytes = 32 * 1024 * 1024 * 1024
     return VRAMManager(vram_tracker, total_bytes, safety_margin_pct=10.0)
+
+
+# ---------------------------------------------------------------------------
+# Server app fixture with stub scheduler (Phase 1 — admin/health route tests)
+# ---------------------------------------------------------------------------
+#
+# The fixture below builds a real FastAPI app via ``server.create_app(...)``
+# and runs its lifespan via TestClient, then swaps the module-level
+# collaborators (``_scheduler``, ``_vram_tracker``, ``_proxy``,
+# ``_thrashing_detector``, ``_process_monitor``) on ``bastion.server`` with
+# AsyncMock/MagicMock stubs so admin endpoints exercise their full branch
+# tree without depending on a live Ollama/Scheduler.  Tests access the stubs
+# via ``client.app.state.stubs`` (a SimpleNamespace).
+#
+# Designed to be reused by Phase 2 (A2A routes) and Phase 3 — keep the API
+# stable: ``stubs.scheduler``, ``stubs.vram_tracker``, ``stubs.proxy``,
+# ``stubs.thrashing_detector``, ``stubs.process_monitor``.
+
+import types  # noqa: E402
+from collections.abc import Generator  # noqa: E402
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+
+def _build_scheduler_stub() -> AsyncMock:
+    """Build a Scheduler stub mirroring the attributes server.py reads."""
+    sched = AsyncMock(name="StubScheduler")
+    # Plain attributes that admin routes inspect directly.
+    sched.current_model = None
+    sched.total_swaps = 0
+    sched.total_dispatched = 0
+    sched.is_running = True
+    sched.is_draining = False
+    sched._swap_rate_level = "normal"
+    sched.stall_reason = ""
+    sched.stall_time = 0.0
+    sched._last_swap_time = time.time()
+    # Cooldown lookup is sync, not async.
+    sched._get_swap_cooldown = lambda: 0.1
+    # Async methods used by /broker/unload, /drain, /resume.
+    sched.unload_model_admin = AsyncMock(return_value=("unloaded", {"model": "test"}))
+    sched.drain = AsyncMock(return_value=None)
+    sched.resume = AsyncMock(return_value=None)
+    sched.stop = AsyncMock(return_value=None)
+    return sched
+
+
+def _build_vram_tracker_stub() -> AsyncMock:
+    """Build a VRAMTracker stub for /broker/status and /broker/preload."""
+    vram = AsyncMock(name="StubVRAMTracker")
+    vram.get_loaded_models = AsyncMock(return_value=[])
+    vram.can_load_model = AsyncMock(return_value=(True, "ok"))
+    vram.close = AsyncMock(return_value=None)
+    return vram
+
+
+def _build_proxy_stub() -> Any:
+    """Build a Proxy stub exposing the attributes status routes inspect."""
+    from unittest.mock import MagicMock
+
+    proxy = MagicMock(name="StubProxy")
+    proxy._requests_served = 0
+    proxy.circuit_breaker = None
+    proxy.close = AsyncMock(return_value=None)
+    return proxy
+
+
+def _build_process_monitor_stub() -> Any:
+    """Build a ProcessMonitor stub with a ``status.model_dump()`` chain."""
+    from unittest.mock import MagicMock
+
+    monitor = MagicMock(name="StubProcessMonitor")
+    monitor.status = MagicMock()
+    monitor.status.model_dump.return_value = {
+        "ollama_healthy": True,
+        "gpu_responsive": True,
+        "consecutive_failures": 0,
+    }
+    monitor.stop = AsyncMock(return_value=None)
+    return monitor
+
+
+@pytest.fixture
+def app_with_stub_scheduler(
+    test_config: BrokerConfig,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Generator[TestClient, None, None]:
+    """FastAPI TestClient backed by stub collaborators.
+
+    The lifespan runs (so audit/etc. initialize), then the module-level
+    collaborators on ``bastion.server`` are swapped with stubs so admin
+    routes exercise their branches deterministically.
+
+    Stubs are exposed on ``client.app.state.stubs`` (a SimpleNamespace)::
+
+        stubs.scheduler          -- AsyncMock with sync attributes
+        stubs.vram_tracker       -- AsyncMock
+        stubs.proxy              -- MagicMock with _requests_served attr
+        stubs.process_monitor    -- MagicMock with .status.model_dump
+        stubs.thrashing_detector -- real ThrashingDetector (no agents tracked)
+    """
+    import bastion.server as server_mod
+    from bastion.server import create_app
+
+    # Redirect audit log to a writable tmpdir.
+    monkeypatch.setenv("BASTION_DATA_DIR", str(tmp_path))
+
+    app = create_app(test_config)
+    with TestClient(app) as client:
+        # After TestClient enters the lifespan, swap globals with stubs.
+        scheduler_stub = _build_scheduler_stub()
+        vram_stub = _build_vram_tracker_stub()
+        proxy_stub = _build_proxy_stub()
+        monitor_stub = _build_process_monitor_stub()
+
+        # Save originals so we can restore on teardown.
+        orig_scheduler = server_mod._scheduler
+        orig_vram = server_mod._vram_tracker
+        orig_proxy = server_mod._proxy
+        orig_monitor = server_mod._process_monitor
+
+        server_mod._scheduler = scheduler_stub
+        server_mod._vram_tracker = vram_stub
+        server_mod._proxy = proxy_stub
+        server_mod._process_monitor = monitor_stub
+
+        client.app.state.stubs = types.SimpleNamespace(
+            scheduler=scheduler_stub,
+            vram_tracker=vram_stub,
+            proxy=proxy_stub,
+            process_monitor=monitor_stub,
+            thrashing_detector=server_mod._thrashing_detector,
+        )
+        try:
+            yield client
+        finally:
+            server_mod._scheduler = orig_scheduler
+            server_mod._vram_tracker = orig_vram
+            server_mod._proxy = orig_proxy
+            server_mod._process_monitor = orig_monitor
