@@ -83,6 +83,53 @@ class TestPriorityOrdering:
         # Old background should have aged to >= interactive
         assert result.id == old.id
 
+    def test_fifo_at_identical_submitted_at(self, queue):
+        """Regression: when two requests share `submitted_at` exactly,
+        dequeue must respect enqueue order (FIFO tie-break).
+
+        Pre-fix, `effective_priority` called `time.time()` once per
+        invocation inside the dequeue comparison loop, so the
+        second-checked request got a fractional edge and won the tie.
+        Fix snapshots `now` once per dequeue pass and passes it to every
+        comparison — this test would have failed against the unfixed
+        code and pins the regression directly.
+        """
+        ts = time.time()
+        first = make_request(
+            model="qwen3:14b", tier=PriorityTier.AGENT,
+            base_priority=50.0, submitted_at=ts,
+        )
+        second = make_request(
+            model="qwen3:14b", tier=PriorityTier.AGENT,
+            base_priority=50.0, submitted_at=ts,
+        )
+        assert first.submitted_at == second.submitted_at  # identical floats
+        queue.enqueue(first)
+        queue.enqueue(second)
+        result = queue.dequeue_for_model("qwen3:14b")
+        assert result.id == first.id, (
+            "FIFO at identical submitted_at violated — see queue.py "
+            "dequeue_for_model's `now` snapshot."
+        )
+
+    def test_pick_next_fifo_at_identical_submitted_at(self, queue):
+        """Same regression as above, exercised via pick_next() which has
+        its own `now` snapshot site in queue.py.
+        """
+        ts = time.time()
+        first = make_request(
+            model="qwen3:14b", tier=PriorityTier.AGENT,
+            base_priority=50.0, submitted_at=ts,
+        )
+        second = make_request(
+            model="qwen3:14b", tier=PriorityTier.AGENT,
+            base_priority=50.0, submitted_at=ts,
+        )
+        queue.enqueue(first)
+        queue.enqueue(second)
+        result = queue.pick_next(current_model=None)
+        assert result.id == first.id
+
 
 # ---------------------------------------------------------------------------
 # Model affinity (pick_next)

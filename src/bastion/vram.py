@@ -426,9 +426,17 @@ class VRAMManager:
         ValueError
             If insufficient VRAM available.
         """
-        self._reclaim_expired_sync()  # No awaits!
-
         async with self._lock:
+            # Reclaim runs INSIDE the lock so reclaim+check+deduct
+            # is atomic against concurrent reservers. Outside the
+            # lock, two coroutines could both observe and free the
+            # same expired reservation, double-decrementing
+            # self._reserved and inflating available_vram beyond
+            # the budget — potentially approving an over-budget
+            # load (the exact crash failure mode BASTION exists to
+            # prevent).
+            self._reclaim_expired_sync()  # No awaits inside this method.
+
             if vram_bytes > self.available_vram:
                 raise ValueError(
                     f"Insufficient VRAM: need {vram_bytes // (1024*1024)}MB, "
