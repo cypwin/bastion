@@ -235,7 +235,7 @@ Install with: `pip install bastion[metrics]`
 
 #### `GET /broker/recent`
 
-Last 50 completed requests for the dashboard trace viewer.
+Last 500 completed requests for the dashboard trace viewer and rolling-window latency aggregation. Each entry feeds `/broker/latency`.
 
 ```bash
 curl http://localhost:11434/broker/recent
@@ -255,6 +255,106 @@ curl http://localhost:11434/broker/recent
   }
 ]
 ```
+
+#### `GET /broker/latency`
+
+Per-model latency percentiles over a rolling window, aggregated from the `_recent_requests` ring buffer.
+
+**Query parameters:**
+
+| name | type | default | description |
+|---|---|---|---|
+| `window_s` | float | `300.0` | Rolling window in seconds. Clamped server-side to `[10.0, 3600.0]`. |
+
+Models with fewer than 3 samples in the window are omitted from `per_model` (single-call noise), but the `overall` bucket aggregates all in-window samples regardless of the floor.
+
+```bash
+curl 'http://localhost:11434/broker/latency?window_s=300'
+```
+
+**Response:**
+```json
+{
+  "window_s": 287.4,
+  "requested_window_s": 300.0,
+  "sample_total": 42,
+  "per_model": [
+    {
+      "model": "qwen3:30b",
+      "sample_count": 27,
+      "p50_s": 1.42,
+      "p95_s": 4.81,
+      "p99_s": 7.10,
+      "queue_wait_p50_s": 0.02,
+      "queue_wait_p95_s": 0.31,
+      "error_count": 1,
+      "error_rate": 0.037
+    }
+  ],
+  "overall": {
+    "model": "__overall__",
+    "sample_count": 42,
+    "p50_s": 1.51,
+    "p95_s": 5.20,
+    "p99_s": 7.40,
+    "queue_wait_p50_s": 0.02,
+    "queue_wait_p95_s": 0.38,
+    "error_count": 2,
+    "error_rate": 0.048
+  }
+}
+```
+
+**Notes:**
+- `window_s` (top-level) reflects the *actual* age of the oldest in-window sample, not the requested window. Lets consumers detect a young broker (`window_s << requested_window_s`).
+- Percentile fields are `null` only when `sample_count == 0` for that bucket — treat as "no signal", not "zero latency".
+- `error_rate = error_count / sample_count` over `status_code >= 400`.
+
+#### `GET /broker/catalog`
+
+Registered models from `broker.yaml`, enriched with runtime VRAM-tracker residency state.
+
+```bash
+curl http://localhost:11434/broker/catalog
+```
+
+**Response:**
+```json
+{
+  "models": [
+    {
+      "name": "qwen3:30b",
+      "vram_gb": 18.5,
+      "default_num_ctx": 4096,
+      "tags": ["reasoning"],
+      "always_allowed": false,
+      "currently_loaded": true,
+      "actual_vram_gb": 18.7,
+      "is_evictable": false
+    },
+    {
+      "name": "nomic-embed-text",
+      "vram_gb": 0.4,
+      "default_num_ctx": 4096,
+      "tags": ["embedding"],
+      "always_allowed": true,
+      "currently_loaded": true,
+      "actual_vram_gb": 0.4,
+      "is_evictable": false
+    }
+  ],
+  "total": 2,
+  "loaded_count": 2,
+  "evictable_count": 0,
+  "registry_source": "/etc/bastion/broker.yaml",
+  "snapshot_age_s": 0.004
+}
+```
+
+**Notes:**
+- `is_evictable` is `true` iff the model is currently loaded AND is not the scheduler's `current_model` AND is not marked `always_allowed` in `broker.yaml`. The flag is computed at response time and can flip between calls if a swap is in flight.
+- `registry_source` is the resolved path of the loaded `broker.yaml`, or `"<unknown>"` for default/no-file configs.
+- When `/api/ps` is unreachable, the response stays valid: `loaded_count` collapses to `0` and `currently_loaded` is `false` for every entry. The registry shape itself is always queryable.
 
 ### Model Management
 
