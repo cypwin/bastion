@@ -21,6 +21,9 @@ pytest-of-*/
 htmlcov/
 coverage.xml
 
+# Hypothesis example database
+.hypothesis/
+
 # IDE
 .idea
 .vscode

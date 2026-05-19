@@ -246,11 +246,20 @@ class CircuitBreakerTransport(httpx.AsyncBaseTransport):
         if not self._breaker._config.enabled:
             return await self._transport.handle_async_request(request)
 
-        # Check circuit state before sending
-        effective = self._breaker._effective_state()
-        if effective is _State.OPEN:
-            remaining = self._breaker._recovery_remaining()
-            raise CircuitOpenError(remaining)
+        # Check circuit state before sending. If logically half-open
+        # (recovery elapsed), promote the persistent state too — otherwise
+        # record_failure() below sees _state==OPEN and skips the
+        # HALF_OPEN→OPEN-with-reset-timer branch, leaving a failed probe
+        # with the original _opened_at in the past and the next request
+        # still allowed through. That breaks the "single probe per
+        # recovery window" guarantee.
+        async with self._breaker._lock:
+            effective = self._breaker._effective_state()
+            if effective is _State.OPEN:
+                remaining = self._breaker._recovery_remaining()
+                raise CircuitOpenError(remaining)
+            if effective is _State.HALF_OPEN:
+                self._breaker._state = _State.HALF_OPEN
 
         try:
             response = await self._transport.handle_async_request(request)

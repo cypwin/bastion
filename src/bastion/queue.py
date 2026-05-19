@@ -87,11 +87,15 @@ class AffinityQueue:
             if not queue:
                 return None
 
-            # Sort by effective priority (descending) and pick the best
+            # Sort by effective priority (descending) and pick the best.
+            # Snapshot the clock once so all comparisons rank against the
+            # same reference — preserves FIFO tie-break when requests
+            # share submitted_at (see QueuedRequest.effective_priority).
+            now = time.time()
             best_idx = 0
-            best_priority = queue[0].effective_priority(self.config.aging_rate)
+            best_priority = queue[0].effective_priority(self.config.aging_rate, now=now)
             for i, req in enumerate(queue[1:], 1):
-                p = req.effective_priority(self.config.aging_rate)
+                p = req.effective_priority(self.config.aging_rate, now=now)
                 if p > best_priority:
                     best_priority = p
                     best_idx = i
@@ -121,6 +125,9 @@ class AffinityQueue:
             if self._total_size == 0:
                 return None
 
+            # Snapshot the clock once so cross-model comparisons rank
+            # against the same reference — see dequeue_for_model().
+            now = time.time()
             best: QueuedRequest | None = None
             best_priority = -1.0
 
@@ -132,7 +139,7 @@ class AffinityQueue:
                 bonus = self.config.model_affinity_bonus if model == current_model else 0.0
 
                 for req in queue:
-                    p = req.effective_priority(self.config.aging_rate, bonus)
+                    p = req.effective_priority(self.config.aging_rate, bonus, now=now)
                     if p > best_priority:
                         best_priority = p
                         best = req

@@ -325,9 +325,24 @@ class QueuedRequest(BaseModel):
     def age_seconds(self) -> float:
         return time.time() - self.submitted_at
 
-    def effective_priority(self, aging_rate: float, affinity_bonus: float = 0.0) -> float:
-        """Compute current priority with aging and optional affinity bonus."""
-        return self.base_priority + (self.age_seconds * aging_rate) + affinity_bonus
+    def effective_priority(
+        self,
+        aging_rate: float,
+        affinity_bonus: float = 0.0,
+        now: float | None = None,
+    ) -> float:
+        """Compute current priority with aging and optional affinity bonus.
+
+        ``now`` lets callers snapshot the clock once and rank a batch of
+        requests against the same reference — required to preserve the
+        FIFO tie-break when several requests share an identical
+        ``submitted_at`` (otherwise two ``time.time()`` reads inside the
+        comparison loop give the second-checked request a fractional
+        edge and silently violate the "equal priority -> first-in-first-
+        out" contract).
+        """
+        age = (now if now is not None else time.time()) - self.submitted_at
+        return self.base_priority + (age * aging_rate) + affinity_bonus
 
 
 # ---------------------------------------------------------------------------
