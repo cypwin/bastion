@@ -1245,6 +1245,61 @@ def create_app(config: BrokerConfig) -> FastAPI:
         window_s = max(10.0, min(3600.0, window_s))
         return aggregate_latency(list(_recent_requests), window_s)
 
+    @broker_router.get("/catalog")
+    async def broker_catalog() -> BrokerCatalog:
+        """Registered models from broker.yaml enriched with residency state.
+
+        Returns the full ``models:`` dict from broker.yaml, augmented with:
+        - ``currently_loaded`` — whether VRAMTracker reports the model in
+          Ollama right now
+        - ``actual_vram_gb`` — measured VRAM at the snapshot, or null
+        - ``is_evictable`` — loaded AND not the scheduler's current model
+          AND not always_allowed
+
+        ``snapshot_age_s`` reflects the age of the residency snapshot used
+        to build this response (close to zero — a fresh ``/api/ps`` query
+        is issued per request). ``is_evictable`` is computed at response
+        time and can flip between calls if a swap is in flight.
+
+        When ``/api/ps`` is unreachable, residency information collapses
+        to "nothing loaded" rather than raising — the catalog itself
+        remains queryable so operators can still see the registry shape
+        during an Ollama outage.
+        """
+        snapshot_ts = time.time()
+        loaded_raw = await _vram_tracker.get_loaded_models() if _vram_tracker else []
+        loaded = loaded_raw if loaded_raw is not None else []
+        loaded_by_name = {m.name: m for m in loaded}
+        snapshot_age_s = max(0.0, time.time() - snapshot_ts)
+        current = _scheduler.current_model if _scheduler else None
+
+        entries: list[CatalogEntry] = []
+        for name, info in config.models.items():
+            is_loaded = name in loaded_by_name
+            entries.append(CatalogEntry(
+                name=name,
+                vram_gb=info.vram_gb,
+                default_num_ctx=info.default_num_ctx,
+                tags=list(info.tags),
+                always_allowed=info.always_allowed,
+                currently_loaded=is_loaded,
+                actual_vram_gb=loaded_by_name[name].vram_gb if is_loaded else None,
+                is_evictable=(
+                    is_loaded
+                    and name != current
+                    and not info.always_allowed
+                ),
+            ))
+
+        return BrokerCatalog(
+            models=entries,
+            total=len(entries),
+            loaded_count=sum(1 for e in entries if e.currently_loaded),
+            evictable_count=sum(1 for e in entries if e.is_evictable),
+            registry_source=str(config.loaded_from) if config.loaded_from else "<unknown>",
+            snapshot_age_s=snapshot_age_s,
+        )
+
     # ── A2A Interface Routes ────────────────────────────────────────
 
     async def _sse_wrapper(generator: AsyncGenerator[dict, None]) -> AsyncGenerator[bytes, None]:
@@ -1988,6 +2043,61 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
         """
         window_s = max(10.0, min(3600.0, window_s))
         return aggregate_latency(list(_recent_requests), window_s)
+
+    @broker_router.get("/catalog")
+    async def broker_catalog() -> BrokerCatalog:
+        """Registered models from broker.yaml enriched with residency state.
+
+        Returns the full ``models:`` dict from broker.yaml, augmented with:
+        - ``currently_loaded`` — whether VRAMTracker reports the model in
+          Ollama right now
+        - ``actual_vram_gb`` — measured VRAM at the snapshot, or null
+        - ``is_evictable`` — loaded AND not the scheduler's current model
+          AND not always_allowed
+
+        ``snapshot_age_s`` reflects the age of the residency snapshot used
+        to build this response (close to zero — a fresh ``/api/ps`` query
+        is issued per request). ``is_evictable`` is computed at response
+        time and can flip between calls if a swap is in flight.
+
+        When ``/api/ps`` is unreachable, residency information collapses
+        to "nothing loaded" rather than raising — the catalog itself
+        remains queryable so operators can still see the registry shape
+        during an Ollama outage.
+        """
+        snapshot_ts = time.time()
+        loaded_raw = await _vram_tracker.get_loaded_models() if _vram_tracker else []
+        loaded = loaded_raw if loaded_raw is not None else []
+        loaded_by_name = {m.name: m for m in loaded}
+        snapshot_age_s = max(0.0, time.time() - snapshot_ts)
+        current = _scheduler.current_model if _scheduler else None
+
+        entries: list[CatalogEntry] = []
+        for name, info in config.models.items():
+            is_loaded = name in loaded_by_name
+            entries.append(CatalogEntry(
+                name=name,
+                vram_gb=info.vram_gb,
+                default_num_ctx=info.default_num_ctx,
+                tags=list(info.tags),
+                always_allowed=info.always_allowed,
+                currently_loaded=is_loaded,
+                actual_vram_gb=loaded_by_name[name].vram_gb if is_loaded else None,
+                is_evictable=(
+                    is_loaded
+                    and name != current
+                    and not info.always_allowed
+                ),
+            ))
+
+        return BrokerCatalog(
+            models=entries,
+            total=len(entries),
+            loaded_count=sum(1 for e in entries if e.currently_loaded),
+            evictable_count=sum(1 for e in entries if e.is_evictable),
+            registry_source=str(config.loaded_from) if config.loaded_from else "<unknown>",
+            snapshot_age_s=snapshot_age_s,
+        )
 
     # ── A2A Interface Routes ────────────────────────────────────────
 
