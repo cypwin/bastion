@@ -164,7 +164,7 @@ def _lookup_intent(intent_id: str):
     return _resolved_intents.get(intent_id)
 
 # ── Recent requests ring buffer (S5: Dashboard Evolution) ────────────
-_recent_requests: deque[dict] = deque(maxlen=50)
+_recent_requests: deque[dict] = deque(maxlen=500)
 
 
 def record_recent_request(
