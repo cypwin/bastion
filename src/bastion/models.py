@@ -570,6 +570,112 @@ class BrokerThrashing(BaseModel):
     agents: list[BrokerThrashingAgent]
 
 
+# ---------------------------------------------------------------------------
+# WT-C-A-06: Latency endpoint
+# ---------------------------------------------------------------------------
+
+
+class LatencyBucket(BaseModel):
+    """Latency percentiles for one model over the rolling window.
+
+    ``sample_count`` is the number of in-window requests counted toward this
+    bucket. Percentile fields are ``None`` only when ``sample_count == 0``;
+    callers should treat ``None`` as "no signal" rather than "zero latency".
+    """
+
+    model: str
+    sample_count: int = Field(
+        ge=0,
+        description="Number of samples in the window for this model",
+    )
+    p50_s: float | None = Field(
+        default=None,
+        description="50th percentile end-to-end duration in seconds; null if sample_count == 0",
+    )
+    p95_s: float | None = None
+    p99_s: float | None = None
+    queue_wait_p50_s: float | None = Field(
+        default=None,
+        description="Queue-wait p50 (time from request arrival to dispatch)",
+    )
+    queue_wait_p95_s: float | None = None
+    error_count: int = 0
+    error_rate: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="error_count / sample_count, 0.0 when sample_count == 0",
+    )
+
+
+class BrokerLatency(BaseModel):
+    """Response body for GET /broker/latency.
+
+    ``window_s`` reflects the actual age of the oldest sample considered,
+    NOT the requested window. If fewer than ``min_samples_per_model`` are
+    present for a model, that model's bucket is omitted from ``per_model``.
+    """
+
+    window_s: float = Field(
+        ge=0.0,
+        description="Actual time span of samples in the window, in seconds",
+    )
+    requested_window_s: float = Field(
+        description="The ?window_s query param that was applied (default 300)",
+    )
+    sample_total: int = Field(ge=0)
+    per_model: list[LatencyBucket] = Field(default_factory=list)
+    overall: LatencyBucket | None = Field(
+        default=None,
+        description="Aggregate bucket across all models (model='__overall__')",
+    )
+
+
+# ---------------------------------------------------------------------------
+# WT-C-A-07: Catalog endpoint
+# ---------------------------------------------------------------------------
+
+
+class CatalogEntry(BaseModel):
+    """One model from broker.yaml's models registry, enriched with runtime state."""
+
+    name: str
+    vram_gb: float = Field(
+        description="Declared VRAM footprint in GB from broker.yaml",
+    )
+    default_num_ctx: int = 4096
+    tags: list[str] = Field(default_factory=list)
+    always_allowed: bool = False
+    currently_loaded: bool = Field(
+        description="True if VRAMTracker reports this model in Ollama right now",
+    )
+    actual_vram_gb: float | None = Field(
+        default=None,
+        description="Measured VRAM at last residency snapshot; null if not loaded",
+    )
+    is_evictable: bool = Field(
+        description=(
+            "True if model is loaded AND not currently the scheduler's "
+            "current_model AND not always_allowed"
+        ),
+    )
+
+
+class BrokerCatalog(BaseModel):
+    """Response body for GET /broker/catalog."""
+
+    models: list[CatalogEntry] = Field(default_factory=list)
+    total: int = Field(ge=0)
+    loaded_count: int = Field(ge=0)
+    evictable_count: int = Field(ge=0)
+    registry_source: str = Field(
+        description="Path to the broker.yaml that sourced this registry",
+    )
+    snapshot_age_s: float = Field(
+        ge=0.0,
+        description="Seconds since the VRAM tracker's last residency snapshot",
+    )
+
+
 class BatchInferRequest(BaseModel):
     """Parameters for the batch_infer skill."""
     model: str
