@@ -23,21 +23,10 @@ from enum import StrEnum
 from typing import Any
 
 import httpx
-from pydantic import BaseModel
+
+from bastion.models import CircuitBreakerConfig
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-class CircuitBreakerConfig(BaseModel):
-    """Circuit breaker configuration."""
-
-    enabled: bool = True
-    failure_threshold: int = 5       # consecutive failures to trip open
-    recovery_timeout: float = 30.0   # seconds before allowing a half-open probe
 
 
 # ---------------------------------------------------------------------------

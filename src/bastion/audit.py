@@ -308,7 +308,7 @@ class AuditLogger:
 
 
 # Global audit logger instance
-_audit_logger: AuditLogger | None = None
+_audit_logger: Any = None  # AuditLogger | PersistentAuditLog | None at runtime
 
 
 def init_audit_logger(

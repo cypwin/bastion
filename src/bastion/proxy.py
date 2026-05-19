@@ -318,6 +318,7 @@ class OllamaProxy:
         target_url = f"{self._backend_url}{path}"
         dispatch_start = time.time()
 
+        result: StreamingResponse | JSONResponse
         try:
             if is_streaming:
                 # Pass done_fn into generator so it signals completion after last byte

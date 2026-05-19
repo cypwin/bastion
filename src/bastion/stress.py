@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
-import yaml
+import yaml  # type: ignore[import-untyped]  # types-PyYAML not installed; stub in dev deps
 
 from bastion.health import query_gpu_status
 from bastion.paths import config_dir

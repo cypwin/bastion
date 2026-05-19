@@ -86,12 +86,12 @@ except ImportError:
         def set(self, value: float) -> None:
             pass
 
-    class Counter(_NoOpMetric):
+    class Counter(_NoOpMetric):  # type: ignore[no-redef]  # conditional stub for optional prometheus_client
         """No-op Counter stub."""
         def __init__(self, name: str, documentation: str, labelnames: list[str] | None = None):
             pass
 
-    class Histogram(_NoOpMetric):
+    class Histogram(_NoOpMetric):  # type: ignore[no-redef]  # conditional stub for optional prometheus_client
         """No-op Histogram stub."""
         def __init__(
             self,
@@ -102,12 +102,12 @@ except ImportError:
         ):
             pass
 
-    class Gauge(_NoOpMetric):
+    class Gauge(_NoOpMetric):  # type: ignore[no-redef]  # conditional stub for optional prometheus_client
         """No-op Gauge stub."""
         def __init__(self, name: str, documentation: str, labelnames: list[str] | None = None):
             pass
 
-    def generate_latest() -> bytes:
+    def generate_latest() -> bytes:  # type: ignore[misc]  # conditional stub for optional prometheus_client
         """No-op exposition generator."""
         return b""
 

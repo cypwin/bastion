@@ -943,9 +943,12 @@ class TestEvictForModel:
             return (True, "OK") if can_load_calls[0] >= 1 else (False, "no space")
 
         with patch.object(
-                 tracker, "get_loaded_models",
-                 side_effect=get_loaded_mock,
-             ),              patch.object(tracker, "can_load_model", side_effect=mock_can_load),              patch.object(tracker, "unload_model", new_callable=AsyncMock, return_value=True):
+            tracker, "get_loaded_models", side_effect=get_loaded_mock,
+        ), patch.object(
+            tracker, "can_load_model", side_effect=mock_can_load,
+        ), patch.object(
+            tracker, "unload_model", new_callable=AsyncMock, return_value=True,
+        ):
             sched = Scheduler(evict_config, queue, tracker, dispatch_fn)
             candidate = make_request(model="llama3.1:8b")
 

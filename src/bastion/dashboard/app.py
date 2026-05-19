@@ -8,7 +8,7 @@ import signal
 import time
 from collections import deque
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -365,6 +365,15 @@ class BastionDashboard(App):
             counters = {}
         if isinstance(thrashing, BaseException):
             thrashing = {}
+
+        # Cast to concrete types after exception normalization above
+        health_data = cast(dict[str, Any], health_data)
+        vram_ledger = cast(dict[str, Any], vram_ledger)
+        watchdog_data = cast(dict[str, Any], watchdog_data)
+        queue_diag = cast(dict[str, Any], queue_diag)
+        recent = cast(list[dict[Any, Any]], recent)
+        counters = cast(dict[str, Any], counters)
+        thrashing = cast(dict[str, Any], thrashing)
 
         # Compute latency percentiles from recent requests
         if isinstance(recent, list) and recent:

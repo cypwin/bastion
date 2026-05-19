@@ -15,6 +15,12 @@ build/
 # Pytest temp directories
 pytest-of-*/
 
+# Coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
 # IDE
 .idea
 .vscode

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import pytest
 
-
 # The five frozen names — DO NOT EDIT without following the migration steps above.
 SCHEMA_FROZEN_METRIC_NAMES: tuple[str, ...] = (
     "bastion_model_swap_total",
