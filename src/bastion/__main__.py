@@ -22,6 +22,7 @@ import uvicorn
 
 if TYPE_CHECKING:
     from bastion.models import BrokerConfig
+    from bastion.stress import StressConfig
 
 logger = logging.getLogger(__name__)
 
@@ -392,7 +393,7 @@ async def _run_two_port(
     )
 
 
-async def _run_stress_test(config: StressConfig) -> None:  # noqa: F821
+async def _run_stress_test(config: StressConfig) -> None:
     """Run the full stress test sequence with phase-by-phase confirmation."""
     from bastion.gpu_profiles import lookup_profile
     from bastion.stress import (

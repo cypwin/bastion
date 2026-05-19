@@ -13,7 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-import yaml
+import yaml  # type: ignore[import-untyped]  # types-PyYAML not installed; stub in dev deps
 
 from bastion.models import BrokerConfig, ModelInfo
 
@@ -219,51 +219,51 @@ def _apply_env_overrides(config: BrokerConfig) -> None:
         return None
 
     # Ollama
-    if (v := _env_str("BASTION_OLLAMA_HOST")) is not None:
-        config.ollama.host = v
+    if (sv := _env_str("BASTION_OLLAMA_HOST")) is not None:
+        config.ollama.host = sv
         overrides_applied.append("BASTION_OLLAMA_HOST")
-    if (v := _env_int("BASTION_OLLAMA_PORT")) is not None:
-        config.ollama.port = v
+    if (iv := _env_int("BASTION_OLLAMA_PORT")) is not None:
+        config.ollama.port = iv
         overrides_applied.append("BASTION_OLLAMA_PORT")
 
     # Server
-    if (v := _env_int("BASTION_PORT")) is not None:
-        config.server.port = v
+    if (iv := _env_int("BASTION_PORT")) is not None:
+        config.server.port = iv
         overrides_applied.append("BASTION_PORT")
-    if (v := _env_int("BASTION_ADMIN_PORT")) is not None:
-        config.server.admin_port = v
+    if (iv := _env_int("BASTION_ADMIN_PORT")) is not None:
+        config.server.admin_port = iv
         overrides_applied.append("BASTION_ADMIN_PORT")
 
     # GPU
-    if (v := _env_float("BASTION_GPU_TOTAL_VRAM_GB")) is not None:
-        config.gpu.total_vram_gb = v
+    if (fv := _env_float("BASTION_GPU_TOTAL_VRAM_GB")) is not None:
+        config.gpu.total_vram_gb = fv
         overrides_applied.append("BASTION_GPU_TOTAL_VRAM_GB")
-    if (v := _env_int("BASTION_GPU_MAX_TEMP_C")) is not None:
-        config.gpu.max_temperature_c = v
+    if (iv := _env_int("BASTION_GPU_MAX_TEMP_C")) is not None:
+        config.gpu.max_temperature_c = iv
         overrides_applied.append("BASTION_GPU_MAX_TEMP_C")
-    if (v := _env_float("BASTION_GPU_MAX_POWER_W")) is not None:
-        config.gpu.max_power_watts = v
+    if (fv := _env_float("BASTION_GPU_MAX_POWER_W")) is not None:
+        config.gpu.max_power_watts = fv
         overrides_applied.append("BASTION_GPU_MAX_POWER_W")
 
     # Auth
-    if (v := _env_bool("BASTION_AUTH_ENABLED")) is not None:
-        config.auth.enabled = v
+    if (bv := _env_bool("BASTION_AUTH_ENABLED")) is not None:
+        config.auth.enabled = bv
         overrides_applied.append("BASTION_AUTH_ENABLED")
-    if (v := _env_str("BASTION_API_KEYS")) is not None:
-        config.auth.api_keys = [k.strip() for k in v.split(",") if k.strip()]
+    if (sv := _env_str("BASTION_API_KEYS")) is not None:
+        config.auth.api_keys = [k.strip() for k in sv.split(",") if k.strip()]
         overrides_applied.append("BASTION_API_KEYS")
 
     # Audit
-    if (v := _env_int("BASTION_AUDIT_TIER")) is not None:
-        config.audit.tier = v
+    if (iv := _env_int("BASTION_AUDIT_TIER")) is not None:
+        config.audit.tier = iv
         overrides_applied.append("BASTION_AUDIT_TIER")
 
     # Persistence
-    if (v := _env_bool("BASTION_PERSISTENCE_ENABLED")) is not None:
-        config.persistence.enabled = v
+    if (bv := _env_bool("BASTION_PERSISTENCE_ENABLED")) is not None:
+        config.persistence.enabled = bv
         overrides_applied.append("BASTION_PERSISTENCE_ENABLED")
-    if (v := _env_str("BASTION_PERSISTENCE_DB_PATH")) is not None:
-        config.persistence.database_path = v
+    if (sv := _env_str("BASTION_PERSISTENCE_DB_PATH")) is not None:
+        config.persistence.database_path = sv
         overrides_applied.append("BASTION_PERSISTENCE_DB_PATH")
 
     if overrides_applied:

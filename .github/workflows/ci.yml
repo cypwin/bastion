@@ -28,11 +28,15 @@ jobs:
         run: ruff check src/ tests/
 
       - name: Type check
-        # TODO: fix existing type errors then remove `|| true`
-        run: mypy src/bastion --ignore-missing-imports --no-strict-optional || true
+        run: mypy src/bastion --ignore-missing-imports --no-strict-optional
 
       - name: Test
-        run: pytest tests/ -v --ignore=tests/test_e2e_stress.py
+        # Coverage gate ratchets up across the test campaign:
+        #   Phase 0  (now)    : 58  — honest current floor, prevents regression
+        #   Phase 1  (after P1 fills): 70
+        #   Phase 2  (after dashboard): 75
+        #   Phase 3+ (after behavioral depth): 80
+        run: pytest tests/ -v --ignore=tests/test_e2e_stress.py --cov=src/bastion --cov-report=term-missing --cov-fail-under=58
 
       - name: Test bastion-client package
         working-directory: clients/bastion-client

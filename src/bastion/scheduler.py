@@ -21,6 +21,7 @@ import logging
 import time
 from collections import deque
 from collections.abc import Callable
+from typing import Any
 
 from bastion import audit
 from bastion.health import check_gpu_safe, query_gpu_status  # noqa: F401
@@ -63,7 +64,7 @@ class Scheduler:
     def __init__(
         self,
         config: BrokerConfig,
-        queue: AffinityQueue,
+        queue: AffinityQueue | Any,  # accepts PersistentQueue wrapper at runtime
         vram_tracker: VRAMTracker,
         dispatch_fn,
         reservation_check_fn=None,

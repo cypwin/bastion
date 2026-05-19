@@ -24,7 +24,7 @@ import time
 from collections import deque
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -41,13 +41,14 @@ from bastion.middleware import MetricsMiddleware
 from bastion.models import (
     BrokerConfig,
     BrokerCounters,
+    BrokerStatus,
     BrokerThrashing,
     BrokerThrashingAgent,
-    BrokerStatus,
     IntentDeclaration,
     IntentResponse,
     PriorityTier,
     QueuedRequest,
+    ThrashingVerdictLabel,
 )
 from bastion.proxy import OllamaProxy
 from bastion.queue import AffinityQueue
@@ -69,7 +70,7 @@ logger = logging.getLogger(__name__)
 _proxy: OllamaProxy | None = None
 _vram_tracker: VRAMTracker | None = None
 _vram_manager: VRAMManager | None = None
-_queue: AffinityQueue | None = None
+_queue: AffinityQueue | Any = None  # AffinityQueue or PersistentQueue at runtime
 _scheduler: Scheduler | None = None
 _a2a_handler: Any | None = None  # A2AHandler (avoid circular import at module level)
 _a2a_http_client: httpx.AsyncClient | None = None  # Shared httpx client for A2A (CB transport)
@@ -82,7 +83,7 @@ _thrashing_detector: ThrashingDetector | None = None
 
 # Verdict label and ordering maps used by /broker/thrashing in both create_app
 # and create_admin_app.  Defined at module level to avoid duplication.
-_THRASHING_VERDICT_LABEL: dict[ThrashingVerdict, str] = {
+_THRASHING_VERDICT_LABEL: dict[ThrashingVerdict, ThrashingVerdictLabel] = {
     ThrashingVerdict.OK: "OK",
     ThrashingVerdict.WARN: "WARNED",
     ThrashingVerdict.HALT: "HALTED",
@@ -554,7 +555,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     if _proxy is not None:
         _proxy._is_draining_fn = lambda: _scheduler is not None and _scheduler.is_draining
     _start_time = time.time()
-    _reset_epoch = datetime.now(timezone.utc).isoformat()
+    _reset_epoch = datetime.now(UTC).isoformat()
 
     # Initialize A2A handler if enabled
     if config.a2a.enabled:
@@ -586,7 +587,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         # Build task store, optionally wrapping with persistence
         from bastion.taskstore import TaskStore as _TaskStore
 
-        _a2a_task_store = _TaskStore(
+        _a2a_task_store: _TaskStore | Any = _TaskStore(
             maxsize=10_000,
             task_ttl_seconds=config.a2a.task_ttl_seconds,
             completed_ttl_seconds=config.a2a.task_ttl_seconds,
@@ -1027,7 +1028,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
         ]
         if agent_entries:
             worst = max(snapshots, key=lambda s: _THRASHING_VERDICT_ORDER[s.verdict])
-            global_verdict: str = _THRASHING_VERDICT_LABEL[worst.verdict]
+            global_verdict: ThrashingVerdictLabel = _THRASHING_VERDICT_LABEL[worst.verdict]
         else:
             global_verdict = "OK"
         return BrokerThrashing(detector_state=global_verdict, agents=agent_entries)
@@ -1753,7 +1754,7 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
         ]
         if agent_entries:
             worst = max(snapshots, key=lambda s: _THRASHING_VERDICT_ORDER[s.verdict])
-            global_verdict: str = _THRASHING_VERDICT_LABEL[worst.verdict]
+            global_verdict: ThrashingVerdictLabel = _THRASHING_VERDICT_LABEL[worst.verdict]
         else:
             global_verdict = "OK"
         return BrokerThrashing(detector_state=global_verdict, agents=agent_entries)

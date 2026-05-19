@@ -43,10 +43,13 @@ persistence = ["aiosqlite>=0.20,<1.0"]
 dev = [
     "pytest>=8.0,<9.0",
     "pytest-asyncio>=0.24,<1.0",
+    "pytest-cov>=5.0,<8.0",
+    "hypothesis>=6.0,<7.0",
     "httpx",  # test client
     "respx>=0.21,<1.0",  # httpx mock (optional, conftest uses unittest.mock)
     "ruff>=0.5,<1.0",
     "mypy>=1.10,<2.0",
+    "types-PyYAML>=6.0,<7.0",
 ]
 
 [project.scripts]

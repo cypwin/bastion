@@ -25,7 +25,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -115,7 +115,10 @@ class A2AHandler:
     def __init__(
         self,
         config: BrokerConfig,
-        enqueue_fn: Callable[[QueuedRequest], asyncio.Event],
+        enqueue_fn: Callable[
+            [QueuedRequest],
+            Awaitable[tuple[asyncio.Event, Callable[[], None], Callable[[], None]]],
+        ],
         vram_tracker: VRAMTracker,
         scheduler: Any,  # Avoid circular import
         circuit_breaker: CircuitBreaker | None = None,

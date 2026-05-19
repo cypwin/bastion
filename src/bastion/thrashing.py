@@ -51,7 +51,8 @@ class _AgentWindow:
     """Sliding window of recent model requests for one agent."""
     models: deque[str] = field(default_factory=deque)
     cooloff_until: float = 0.0  # monotonic time when cooloff expires
-    last_seen: float = field(default_factory=time.monotonic)  # monotonic time of last record_request call
+    # monotonic time of last record_request call
+    last_seen: float = field(default_factory=time.monotonic)
 
 
 class ThrashingDetector:

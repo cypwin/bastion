@@ -127,6 +127,7 @@ def init_telemetry(config: Any) -> None:
     exporter_name = config.exporter.lower().strip()
 
     if exporter_name == "console":
+        processor: SimpleSpanProcessor | BatchSpanProcessor
         processor = SimpleSpanProcessor(ConsoleSpanExporter())
         provider.add_span_processor(processor)
         logger.info("Telemetry exporter: console")

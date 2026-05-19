@@ -13,7 +13,6 @@ from textual.app import App
 
 from bastion.dashboard.modals import ModelSelectModal
 
-
 REAL_MODEL_NAMES = [
     "granite4.1:8b",
     "llama3.2:3b",

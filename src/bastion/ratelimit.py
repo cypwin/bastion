@@ -18,22 +18,15 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable
+from typing import Any
 
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from bastion.models import RateLimitConfig
+
 logger = logging.getLogger(__name__)
-
-
-class RateLimitConfig(BaseModel):
-    """Rate limiting configuration."""
-
-    enabled: bool = False
-    requests_per_minute: int = 60
-    burst: int = 10
-    trusted_proxies: list[str] = Field(default_factory=list)
 
 
 class _TokenBucket:
@@ -92,7 +85,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         Rate limiting settings.
     """
 
-    def __init__(self, app: object, config: RateLimitConfig | None = None) -> None:
+    def __init__(self, app: Any, config: RateLimitConfig | None = None) -> None:
         super().__init__(app)
         self._config = config or RateLimitConfig()
         self._rate: float = self._config.requests_per_minute / 60.0
