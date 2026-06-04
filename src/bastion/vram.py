@@ -25,6 +25,24 @@ from bastion.models import BrokerConfig, LoadedModel
 
 logger = logging.getLogger(__name__)
 
+HARDWARE_MARGIN_GB = 2.0  # nvidia-smi free-VRAM safety margin (KV/compute/fragmentation)
+
+
+async def _hardware_admits(
+    vram_bytes: int, margin_gb: float = HARDWARE_MARGIN_GB
+) -> tuple[bool, float | None]:
+    """Cross-check a prospective allocation against nvidia-smi free VRAM.
+
+    Returns ``(admits, free_gb)``. Fails OPEN: when nvidia-smi gives no reading
+    (``free_gb is None``) returns ``(True, None)`` so a transient nvidia-smi
+    outage does not block loads — the logical ledger remains the gate.
+    """
+    free_gb = await get_vram_free_gb()
+    if free_gb is None:
+        return True, None
+    required_gb = vram_bytes / (1024 ** 3) + margin_gb
+    return free_gb >= required_gb, free_gb
+
 
 class ResidencyCache:
     """TTL cache for loaded model queries to avoid hammering /api/ps.
@@ -92,6 +110,20 @@ class ResidencyCache:
             if not known:
                 return None
             return {m.name for m in (self._cache or [])}
+
+    async def get_resident_loaded_models(self) -> list[LoadedModel] | None:
+        """Return the cached :class:`LoadedModel` list (fresh or stale-OK).
+
+        Reuses the same TTL cache as :meth:`get_resident_models`, so no extra
+        ``/api/ps`` query is issued. Returns ``None`` when tracker state is
+        unknown (Ollama unreachable and no prior cache) — callers must treat
+        that as "no size information available".
+        """
+        async with self._lock:
+            known = await self._refresh_if_needed()
+            if not known:
+                return None
+            return list(self._cache or [])
 
     async def is_model_resident(self, model_name: str) -> bool:
         """Check if a specific model is currently loaded in VRAM.
@@ -274,20 +306,20 @@ class VRAMTracker:
                 f"{self.config.gpu.max_vram_gb:.1f}GB limit"
             )
 
-        # nvidia-smi hard gate: cross-check actual free VRAM
-        free_gb = await get_vram_free_gb()
-        if free_gb is not None:
-            required_free = model_vram + 2.0  # 2 GB safety margin for KV/compute/fragmentation
-            if free_gb < required_free:
-                await self.log_vram_snapshot("hard_gate_blocked", {
-                    "model": model_name,
-                    "free_gb": round(free_gb, 2),
-                    "required_free_gb": round(required_free, 2),
-                })
-                return False, (
-                    f"nvidia-smi: only {free_gb:.1f}GB free, "
-                    f"need {required_free:.1f}GB ({model_vram:.1f}GB model + 2.0GB margin)"
-                )
+        # nvidia-smi hard gate: cross-check actual free VRAM (shared helper)
+        hw_ok, free_gb = await _hardware_admits(int(model_vram * (1024 ** 3)))
+        if not hw_ok:
+            required_free = model_vram + HARDWARE_MARGIN_GB
+            await self.log_vram_snapshot("hard_gate_blocked", {
+                "model": model_name,
+                "free_gb": round(free_gb, 2),
+                "required_free_gb": round(required_free, 2),
+            })
+            return False, (
+                f"nvidia-smi: only {free_gb:.1f}GB free, "
+                f"need {required_free:.1f}GB ({model_vram:.1f}GB model "
+                f"+ {HARDWARE_MARGIN_GB:.1f}GB margin)"
+            )
 
         await self.log_vram_snapshot("model_load_approved", {
             "model": model_name,
@@ -492,11 +524,17 @@ class VRAMManager:
         The Lock is defense-in-depth (asyncio cooperative scheduling already makes
         synchronous code between await points atomic).
 
+        The nvidia-smi hardware backstop is queried BEFORE the lock so the await
+        never enters the atomic critical section; its verdict is evaluated inside
+        the lock. It fails open (a missing reading trusts the logical ledger).
+
         Raises
         ------
         ValueError
-            If insufficient VRAM available.
+            If insufficient VRAM (logical ledger) or nvidia-smi reports
+            insufficient free VRAM (hardware backstop).
         """
+        hw_ok, free_gb = await _hardware_admits(vram_bytes)
         async with self._lock:
             # Reclaim runs INSIDE the lock so reclaim+check+deduct
             # is atomic against concurrent reservers. Outside the
@@ -514,6 +552,13 @@ class VRAMManager:
                     f"available {self.available_vram // (1024*1024)}MB "
                     f"(allocated={self._allocated // (1024*1024)}MB, "
                     f"reserved={self._reserved // (1024*1024)}MB)"
+                )
+
+            if not hw_ok:
+                raise ValueError(
+                    f"nvidia-smi backstop: only {free_gb:.1f}GB free, need "
+                    f"{vram_bytes / (1024 ** 3):.1f}GB + {HARDWARE_MARGIN_GB:.1f}GB "
+                    f"margin for model '{model}'"
                 )
 
             reservation = VRAMReservation(
@@ -617,11 +662,14 @@ class VRAMManager:
             return freed
 
     async def reconcile(self, loaded_model_names: set[str] | None) -> int:
-        """Reconcile ledger with actual Ollama state.
+        """Reconcile ledger with actual Ollama state (bidirectional).
 
-        Removes allocations for models that Ollama no longer reports as loaded
-        (e.g., auto-unloaded via keep_alive timeout). Also reclaims expired
-        reservations.
+        Removes allocations for models Ollama no longer reports (auto-unload,
+        failed load) AND imports resident models that entered VRAM without a
+        BASTION swap (loaded before startup, or by a direct Ollama client), so
+        the ledger stops under-counting actual residency. Per-model sizes for
+        import are read from the residency cache (no extra ``/api/ps`` query);
+        ``loaded_model_names`` remains the authoritative residency set.
 
         Parameters
         ----------
@@ -634,13 +682,24 @@ class VRAMManager:
         Returns
         -------
         int
-            Total bytes freed by reconciliation. ``0`` when state is unknown.
+            Total bytes freed by stale-removal (``0`` when state is unknown).
+            Imports are logged and audited but not included in this count.
         """
         if loaded_model_names is None:
             return 0
         self._reclaim_expired_sync()
 
+        # Sizes for import — only fetched when there could be something to
+        # import (an empty residency set can never import, so skip the lookup).
+        sizes: dict[str, float] = {}
+        if loaded_model_names:
+            loaded_list = await self._tracker.residency_cache.get_resident_loaded_models()
+            sizes = {m.name: m.vram_gb for m in (loaded_list or [])}
+
         async with self._lock:
+            reserved_models = {r.model for r in self._reservations.values()}
+
+            # Removal: drop allocations for models Ollama no longer reports.
             stale = [m for m in self._model_allocations if m not in loaded_model_names]
             freed_total = 0
             for model in stale:
@@ -652,10 +711,45 @@ class VRAMManager:
                     "(%dMB) — model no longer in Ollama /api/ps",
                     model, freed // (1024 * 1024),
                 )
+
+            # Import: account for resident models not tracked via a BASTION swap.
+            imported: list[str] = []
+            imported_total = 0
+            for name in loaded_model_names:
+                if name in self._model_allocations:
+                    continue  # already tracked
+                if name in reserved_models:
+                    continue  # mid-reservation — commit() will account for it
+                known = self._tracker.config.models.get(name)
+                if known and known.always_allowed:
+                    continue  # excluded from budget accounting (design D2)
+                vram_gb = sizes.get(name)
+                if vram_gb is None:
+                    continue  # no size info — cannot import responsibly
+                import_bytes = int(vram_gb * (1024 ** 3))
+                if import_bytes <= 0:
+                    continue
+                self._model_allocations[name] = import_bytes
+                self._allocated += import_bytes
+                imported.append(name)
+                imported_total += import_bytes
+                logger.warning(
+                    "VRAM reconciliation: imported untracked resident '%s' "
+                    "(%dMB) — present in Ollama /api/ps but not in ledger",
+                    name, import_bytes // (1024 * 1024),
+                )
+
             if freed_total:
                 audit.emit("vram_reconciliation", {
                     "stale_models": stale,
                     "freed_bytes": freed_total,
+                    "allocated_after": self._allocated,
+                    "loaded_models": list(loaded_model_names),
+                })
+            if imported_total:
+                audit.emit("vram_import", {
+                    "imported_models": imported,
+                    "imported_bytes": imported_total,
                     "allocated_after": self._allocated,
                     "loaded_models": list(loaded_model_names),
                 })
