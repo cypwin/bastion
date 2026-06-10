@@ -24,6 +24,11 @@ class TestComplexityRoutingConfig:
         assert c.enabled is True
         assert c.routes == {}
         assert c.complex_action == "reject"
+        assert c.override_explicit is False
+
+    def test_override_explicit_opt_in(self):
+        c = ComplexityRoutingConfig(override_explicit=True)
+        assert c.override_explicit is True
 
     def test_custom_routes(self):
         c = ComplexityRoutingConfig(
@@ -87,11 +92,12 @@ def _make_request(
 
 
 class TestComplexityRouting:
-    def _make_config(self) -> BrokerConfig:
+    def _make_config(self, override_explicit: bool = False) -> BrokerConfig:
         return BrokerConfig(
             complexity_routing=ComplexityRoutingConfig(
                 enabled=True,
                 routes={"simple": "qwen3.5:9b", "moderate": "qwen3.5:35b-a3b"},
+                override_explicit=override_explicit,
             ),
             models={
                 "qwen3.5:9b": ModelInfo(vram_gb=8.1),
@@ -102,8 +108,8 @@ class TestComplexityRouting:
 
     @pytest.mark.asyncio
     async def test_simple_overrides_model(self):
-        """X-Task-Complexity: simple should override model to configured simple model."""
-        config = self._make_config()
+        """With override_explicit=True, simple hint force-routes over explicit model."""
+        config = self._make_config(override_explicit=True)
         captured = {}
 
         async def mock_enqueue(req):
@@ -131,7 +137,8 @@ class TestComplexityRouting:
 
     @pytest.mark.asyncio
     async def test_moderate_overrides_model(self):
-        config = self._make_config()
+        """With override_explicit=True, moderate hint force-routes over explicit model."""
+        config = self._make_config(override_explicit=True)
         captured = {}
 
         async def mock_enqueue(req):
@@ -233,6 +240,103 @@ class TestComplexityRouting:
         await proxy._handle_scheduled(req, "/api/generate", await req.body())
         assert captured["model"] == "qwen3:14b"
 
+    @pytest.mark.asyncio
+    async def test_explicit_model_kept_by_default(self, monkeypatch):
+        """Default (override_explicit=False): explicit client model wins over the
+        complexity route, and the skipped route is recorded in the audit event."""
+        config = self._make_config()  # override_explicit defaults to False
+        captured = {}
+        audit_events = []
+        monkeypatch.setattr(
+            "bastion.audit.emit",
+            lambda event, details: audit_events.append((event, details)),
+        )
+
+        async def mock_enqueue(req):
+            captured["model"] = req.model
+            captured["body"] = json.loads(req.body)
+            event = asyncio.Event()
+            event.set()
+            return event, lambda: None, lambda: None
+
+        proxy = OllamaProxy(config, enqueue_fn=mock_enqueue)
+        proxy._forward_response = AsyncMock(return_value=MagicMock())
+        proxy._stream_response = AsyncMock(return_value=MagicMock())
+
+        req = _make_request(
+            body={"model": "qwen3:14b", "prompt": "classify this", "stream": False},
+            headers={"user-agent": "test", "x-task-complexity": "simple"},
+        )
+        await proxy._handle_scheduled(req, "/api/generate", await req.body())
+        assert captured["model"] == "qwen3:14b"
+        assert captured["body"]["model"] == "qwen3:14b"
+
+        complete = [d for e, d in audit_events if e == "request_complete"]
+        assert len(complete) == 1
+        assert complete[0]["routing_reason"] == "complexity-simple-skipped-explicit-model"
+        assert complete[0]["routing_applied"] is False
+        assert complete[0]["model_requested"] == "qwen3:14b"
+        assert complete[0]["model_routed"] == "qwen3:14b"
+
+    @pytest.mark.asyncio
+    async def test_missing_model_uses_route_fallback(self, monkeypatch):
+        """Default (override_explicit=False): requests without a model field
+        still route per the complexity hint (fallback path)."""
+        config = self._make_config()
+        captured = {}
+        audit_events = []
+        monkeypatch.setattr(
+            "bastion.audit.emit",
+            lambda event, details: audit_events.append((event, details)),
+        )
+
+        async def mock_enqueue(req):
+            captured["model"] = req.model
+            captured["body"] = json.loads(req.body)
+            event = asyncio.Event()
+            event.set()
+            return event, lambda: None, lambda: None
+
+        proxy = OllamaProxy(config, enqueue_fn=mock_enqueue)
+        proxy._forward_response = AsyncMock(return_value=MagicMock())
+        proxy._stream_response = AsyncMock(return_value=MagicMock())
+
+        req = _make_request(
+            body={"prompt": "classify this", "stream": False},  # no model field
+            headers={"user-agent": "test", "x-task-complexity": "simple"},
+        )
+        await proxy._handle_scheduled(req, "/api/generate", await req.body())
+        assert captured["model"] == "qwen3.5:9b"
+        assert captured["body"]["model"] == "qwen3.5:9b"
+
+        complete = [d for e, d in audit_events if e == "request_complete"]
+        assert len(complete) == 1
+        assert complete[0]["routing_reason"] == "complexity-simple"
+        assert complete[0]["routing_applied"] is True
+
+    @pytest.mark.asyncio
+    async def test_empty_model_uses_route_fallback(self):
+        """An explicit empty-string model counts as 'no model' for routing."""
+        config = self._make_config()
+        captured = {}
+
+        async def mock_enqueue(req):
+            captured["model"] = req.model
+            event = asyncio.Event()
+            event.set()
+            return event, lambda: None, lambda: None
+
+        proxy = OllamaProxy(config, enqueue_fn=mock_enqueue)
+        proxy._forward_response = AsyncMock(return_value=MagicMock())
+        proxy._stream_response = AsyncMock(return_value=MagicMock())
+
+        req = _make_request(
+            body={"model": "", "prompt": "classify", "stream": False},
+            headers={"user-agent": "test", "x-task-complexity": "moderate"},
+        )
+        await proxy._handle_scheduled(req, "/api/generate", await req.body())
+        assert captured["model"] == "qwen3.5:35b-a3b"
+
 
 class TestStreamingTokenCapture:
     @pytest.mark.asyncio
@@ -302,6 +406,37 @@ class TestResponseHeaders:
         assert result.headers.get("X-Prompt-Tokens") == "150"
         assert result.headers.get("X-Completion-Tokens") == "25"
 
+    @pytest.mark.asyncio
+    async def test_thrashing_warn_only_meta_does_not_error(self):
+        """routing_meta carrying only _thrashing_warn (warn without complexity
+        routing) must not break response-header construction."""
+        config = BrokerConfig()
+        proxy = OllamaProxy(config)
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "model": "qwen3:14b",
+            "response": "ok",
+            "done": True,
+        }
+        mock_response.status_code = 200
+        proxy._http = MagicMock()
+        proxy._http.post = AsyncMock(return_value=mock_response)
+
+        req = _make_request(
+            body={"model": "qwen3:14b", "prompt": "test", "stream": False},
+            headers={"user-agent": "test", "x-agent-id": "warn_agent"},
+        )
+        result = await proxy._forward_response(
+            req, "http://localhost:11435/api/generate",
+            json.dumps({"model": "qwen3:14b", "prompt": "test"}).encode(),
+            model="qwen3:14b", path="/api/generate", tier=PriorityTier.AGENT,
+            routing_meta={"_thrashing_warn": "swap_ratio=0.83"},
+        )
+        assert result.headers.get("X-Swap-Penalty-Warning") == "swap_ratio=0.83"
+        assert "X-Model-Requested" not in result.headers
+        assert "X-Routing-Reason" not in result.headers
+
 
 class TestThrashingIntegration:
     @pytest.mark.asyncio
@@ -334,3 +469,48 @@ class TestThrashingIntegration:
         assert result.status_code == 429
         body = json.loads(result.body)
         assert "thrashing" in body["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_warn_without_routing_does_not_error(self, monkeypatch):
+        """A thrashing warn with no complexity routing must not break the
+        request-complete audit event (routing_meta has only _thrashing_warn)."""
+        from bastion.thrashing import ThrashingDetector
+
+        config = BrokerConfig(
+            thrashing_detection=ThrashingDetectionConfig(
+                enabled=True, mode="warn",
+                window_size=6, min_requests_before_eval=3,
+                warn_swap_ratio=0.3, halt_swap_ratio=0.99,
+            ),
+        )
+        detector = ThrashingDetector(config.thrashing_detection)
+        audit_events = []
+        monkeypatch.setattr(
+            "bastion.audit.emit",
+            lambda event, details: audit_events.append((event, details)),
+        )
+
+        async def mock_enqueue(req):
+            event = asyncio.Event()
+            event.set()
+            return event, lambda: None, lambda: None
+
+        proxy = OllamaProxy(config, enqueue_fn=mock_enqueue, thrashing_detector=detector)
+        proxy._forward_response = AsyncMock(return_value=MagicMock())
+        proxy._stream_response = AsyncMock(return_value=MagicMock())
+
+        # Pre-fill detector with a warn-level (not halt) swap pattern
+        for i in range(6):
+            detector.record_request("warn_agent", "modelA" if i % 2 == 0 else "modelB")
+
+        req = _make_request(
+            body={"model": "modelA", "prompt": "test", "stream": False},
+            headers={"user-agent": "test", "x-agent-id": "warn_agent"},
+        )
+        # Must not raise KeyError when building the audit event
+        await proxy._handle_scheduled(req, "/api/generate", await req.body())
+
+        complete = [d for e, d in audit_events if e == "request_complete"]
+        assert len(complete) == 1
+        assert complete[0]["routing_applied"] is False
+        assert "model_requested" not in complete[0]

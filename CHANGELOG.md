@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - `_recent_requests` ring buffer maxlen bumped from 50 → 500. Prereq for stable per-model p95 in `/broker/latency`. Memory overhead ≈ 50 KB.
 - `/broker/recent` documentation updated to reflect the 500-sample buffer and its new role feeding the latency aggregator.
+- **M58 complexity routing no longer force-routes over an explicit client model.** New `complexity_routing.override_explicit` flag (default `false`): the route model only fills in for requests that omit `model`; an explicit `model` in the request body wins. Skipped routes are recorded with reason `complexity-<level>-skipped-explicit-model` in response headers and the audit log. Set `override_explicit: true` to restore the original force-route behavior. Root cause of the 2026-06-10 the-batch-client overnight-run incident (explicit instruct model silently replaced by a thinking-capable route target).
+- `request_complete` audit events now include `routing_reason`, and `routing_applied` is `true` only when the model was actually changed.
+
+### Fixed
+- Thrashing **warn** verdict on a request without complexity routing no longer breaks the request: `routing_meta` carrying only `_thrashing_warn` raised `KeyError` in response-header construction and audit emission (surfaced as a proxy error instead of the advisory `X-Swap-Penalty-Warning` header).
 
 ## [0.4.0] - 2026-04-23
 

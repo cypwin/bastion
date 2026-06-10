@@ -191,11 +191,17 @@ class RequestOverrides(BaseModel):
 class ComplexityRoutingConfig(BaseModel):
     """Complexity-based model routing configuration (M58).
 
-    When enabled, reads X-Task-Complexity header and overrides the
-    client-requested model with the configured route model.
+    When enabled, reads X-Task-Complexity header and routes the request
+    to the configured route model.
+
+    When ``override_explicit`` is False (default), an explicit ``model``
+    in the request body wins and the route only fills in for requests
+    that omit the model. Set True to restore the original M58
+    force-route behavior (route model replaces the client's choice).
     """
     enabled: bool = True
     routes: dict[str, str] = Field(default_factory=dict)  # "simple" -> model name
+    override_explicit: bool = False  # honor explicit client model by default
     complex_action: str = "reject"  # always "reject" -> HTTP 422
 
 
