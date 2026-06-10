@@ -173,7 +173,9 @@ class OllamaProxy:
                 )
 
             route_model = self.config.complexity_routing.routes.get(task_complexity)
-            if route_model:
+            if route_model and (
+                not model or self.config.complexity_routing.override_explicit
+            ):
                 original_model = model
                 model = route_model
                 payload["model"] = model
@@ -185,6 +187,18 @@ class OllamaProxy:
                 logger.info(
                     "M58 routing: %s -> %s (complexity=%s, agent=%s)",
                     original_model, model, task_complexity,
+                    request.headers.get("x-agent-id", "unknown"),
+                )
+            elif route_model:
+                # Explicit client model wins; record the skipped route for audit.
+                routing_meta = {
+                    "requested": model,
+                    "routed": model,
+                    "reason": f"complexity-{task_complexity}-skipped-explicit-model",
+                }
+                logger.info(
+                    "M58 routing skipped: explicit model %s kept (complexity=%s, agent=%s)",
+                    model, task_complexity,
                     request.headers.get("x-agent-id", "unknown"),
                 )
 
@@ -362,11 +376,15 @@ class OllamaProxy:
             audit_details["agent_id"] = agent_id
         if task_complexity:
             audit_details["task_complexity"] = task_complexity
-        if routing_meta:
+        if routing_meta and "reason" in routing_meta:
             audit_details["model_requested"] = routing_meta["requested"]
             audit_details["model_routed"] = routing_meta["routed"]
-            audit_details["routing_applied"] = True
+            audit_details["routing_reason"] = routing_meta["reason"]
+            audit_details["routing_applied"] = (
+                routing_meta["requested"] != routing_meta["routed"]
+            )
         else:
+            # routing_meta may exist with only _thrashing_warn (no routing)
             audit_details["routing_applied"] = False
         audit.emit(audit.EVENT_REQUEST_COMPLETE, audit_details)
 
@@ -528,9 +546,11 @@ class OllamaProxy:
 
         response_headers: dict[str, str] = {}
         if routing_meta:
-            response_headers["X-Model-Requested"] = routing_meta["requested"]
-            response_headers["X-Model-Routed"] = routing_meta["routed"]
-            response_headers["X-Routing-Reason"] = routing_meta["reason"]
+            # routing_meta may carry only _thrashing_warn (warn without routing)
+            if "reason" in routing_meta:
+                response_headers["X-Model-Requested"] = routing_meta["requested"]
+                response_headers["X-Model-Routed"] = routing_meta["routed"]
+                response_headers["X-Routing-Reason"] = routing_meta["reason"]
             if "_thrashing_warn" in routing_meta:
                 response_headers["X-Swap-Penalty-Warning"] = routing_meta["_thrashing_warn"]
 
@@ -558,9 +578,11 @@ class OllamaProxy:
             response_headers: dict[str, str] = {}
 
             if routing_meta:
-                response_headers["X-Model-Requested"] = routing_meta["requested"]
-                response_headers["X-Model-Routed"] = routing_meta["routed"]
-                response_headers["X-Routing-Reason"] = routing_meta["reason"]
+                # routing_meta may carry only _thrashing_warn (warn without routing)
+                if "reason" in routing_meta:
+                    response_headers["X-Model-Requested"] = routing_meta["requested"]
+                    response_headers["X-Model-Routed"] = routing_meta["routed"]
+                    response_headers["X-Routing-Reason"] = routing_meta["reason"]
                 if "_thrashing_warn" in routing_meta:
                     response_headers["X-Swap-Penalty-Warning"] = routing_meta["_thrashing_warn"]
 
