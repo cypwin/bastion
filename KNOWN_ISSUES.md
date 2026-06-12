@@ -74,29 +74,6 @@ _(none open — see "Resolved in v0.4.1" below)_
 - **Surfaced by:** S131 swept-vs-granted fix (deliberately not folded in to
   keep that change minimal).
 
-### A2A `create_lease` has TOCTOU window with `has_active_lease`
-
-- **Location:** `src/bastion/a2a.py:1479-1517`
-- **Problem:** "Single grant per model" semantics are enforced by the
-  caller pattern `if not has_active_lease: create_lease(...)`. Two
-  concurrent callers can both pass `has_active_lease` False before
-  either calls `create_lease`.
-- **Fix path:** introduce `try_create_lease(model, ...)` that atomically
-  checks + creates under an internal lock.
-- **Surfaced by:** concurrency-test agent, v0.4 campaign.
-
-### Dashboard `BastionClient` swallows all errors silently
-
-- **Location:** `src/bastion/dashboard/client.py:34-89`
-- **Problem:** Six methods (`get_recent`, `get_queue`, `get_health`,
-  `get_vram_ledger`, `get_watchdog`, `get_counters`, `get_thrashing`)
-  have `except Exception: return []` / `return {}` with no logging. The
-  dashboard renders empty panels on any error — auth failure, 404, network
-  partition — with no indication that data is absent vs. truly empty.
-- **Fix path:** log at DEBUG level with endpoint name and exception type
-  so the dashboard log captures the failure even if the UI doesn't.
-- **Surfaced by:** silent-failure-hunter, v0.4 campaign.
-
 ### A2A `_handle_status` swallows handler exceptions without logging (FIXED in v0.4.1)
 
 - **Status:** Resolved (S130). The `except` block now calls
@@ -105,18 +82,6 @@ _(none open — see "Resolved in v0.4.1" below)_
   state-unknown sentinel in the first place (answers with
   `vram_state: "unknown"`).
 - **Surfaced by:** silent-failure-hunter, v0.4 campaign.
-
-### `TaskStore.create` is not lock-protected
-
-- **Location:** `src/bastion/taskstore.py:147`
-- **Problem:** Safe under asyncio's single-loop because the writes don't
-  cross an `await` boundary, but the safety is undocumented and fragile.
-  Any threaded caller (anyio thread pool, executor offload) races on
-  `self._active[task_id]` and `_active_timestamps`.
-- **Fix path:** either document the asyncio-only contract explicitly or
-  add a `threading.Lock`. Concurrency tests added in v0.4 only exercise
-  the asyncio path.
-- **Surfaced by:** concurrency-test agent, v0.4 campaign.
 
 ---
 
@@ -134,56 +99,6 @@ _(none open — see "Resolved in v0.4.1" below)_
 - **Status:** Accepted risk until ADR-006 bearer-token auth lands in v0.5,
   which gates the entire `/broker/*` surface by default. Enable
   `auth.api_keys` today if the port is reachable beyond localhost.
-
-### `VRAMManager._reclaim_expired_sync()` called outside lock in `reconcile()` and `status()`
-
-- **Location:** `src/bastion/vram.py:557, 608`
-- **Problem:** Same pattern as the C2 fix landed in v0.4 (`reserve()`
-  moved reclaim inside the lock), but `reconcile()` and `status()` still
-  call it outside. Lower risk than `reserve()` because these are diagnostic
-  paths not on the budget hot-path, but still incorrect under concurrent
-  callers.
-- **Fix path:** wrap each call in `async with self._lock`.
-
-### `audit.emit()` is a global no-op before `init_audit_logger()` is called
-
-- **Location:** `src/bastion/audit.py:342-346`
-- **Problem:** Any audit event during startup before `init_audit_logger`
-  completes is silently discarded. Startup window is short so this is
-  minor, but startup-ordering bugs become invisible.
-- **Fix path:** buffer pre-init events in a small ring buffer and flush
-  on init; OR log at WARNING when emit fires pre-init.
-
-### `_safe_transition` debug-logs invalid transitions
-
-- **Location:** `src/bastion/a2a.py:447-458`
-- **Problem:** `KeyError` (task not in active store) or invalid
-  `ValueError` transition logs at DEBUG. If the task state machine enters
-  an inconsistent state due to a race, no one notices unless DEBUG logging
-  is enabled.
-- **Fix path:** raise log level to WARNING for the ValueError branch
-  (the KeyError branch — already-compacted — is fine at DEBUG).
-
-### `ResidencyCache.invalidate()` is not lock-protected
-
-- **Location:** `src/bastion/vram.py:92-95`
-- **Problem:** Writes `self._cache_timestamp = 0.0` without holding
-  `self._lock`. Safe for asyncio (CPython attribute writes are atomic)
-  but the assumption is undocumented and would break under any future
-  threading.
-- **Fix path:** add a one-line comment documenting the asyncio-only
-  contract, OR take the lock for symmetry with other mutations.
-
-### DELETE `/a2a/tasks/{id}` returns 404 for already-terminal tasks
-
-- **Location:** `src/bastion/server.py` (A2A delete route)
-- **Problem:** 409 Conflict is arguably more semantically correct than
-  404 Not Found for a task that *exists* but is in a terminal state. The
-  current 404 also confuses retry logic in clients that expect 404 to
-  mean "this never existed."
-- **Fix path:** distinguish "never existed" (404) from "already terminal"
-  (409 or 200 idempotent). Low priority unless an A2A client surfaces
-  the confusion in practice.
 
 ### Dev `httpx` dep was unpinned (FIXED in v0.4 Phase 4)
 
@@ -230,6 +145,52 @@ _(none open — see "Resolved in v0.4.1" below)_
   before swap dispatch; an abort releases the VRAM reservation. Pinned by
   `TestGPUGatingMidSwap`.
 - **Surfaced by:** Agent 2 (failure GPU + Ollama), v0.4 campaign.
+
+### A2A `create_lease` has TOCTOU window with `has_active_lease`
+
+- **Was:** single-grant-per-model required the racy caller pattern
+  `if not has_active_lease: create_lease(...)` — two concurrent acquirers
+  could both pass the check.
+- **Status:** Resolved (S132, be7cbe9). New atomic `try_create_lease()`
+  does check+create under an internal `threading.RLock`; `create_lease`
+  and `has_active_lease` take the same lock. Pinned by `TestTryCreateLease`
+  and a 16-thread contention test (exactly one winner).
+- **Surfaced by:** concurrency-test agent, v0.4 campaign.
+
+### `TaskStore.create` is not lock-protected
+
+- **Was:** asyncio-only safety was undocumented and fragile — a threaded
+  caller would race on `_active`/`_active_timestamps` silently.
+- **Status:** Resolved (S132, bb374bc). The asyncio-single-loop contract is
+  documented at class level and enforced: `create` binds the owner thread on
+  first use and raises `RuntimeError` from any other thread (fail-loud
+  instead of silent corruption). Pinned by `TestThreadAffinityContract`.
+- **Surfaced by:** concurrency-test agent, v0.4 campaign.
+
+### Dashboard `BastionClient` swallows all errors silently
+
+- **Was:** nine GET methods had `except Exception: return []/{}` with no
+  logging — empty panels were indistinguishable from outages.
+- **Status:** Resolved (S132, b10a81c). All safe GETs route through one
+  `_get_safe` helper that logs endpoint + exception type at DEBUG. Pinned
+  by parametrized logging tests across all nine endpoints.
+- **Surfaced by:** silent-failure-hunter, v0.4 campaign.
+
+### Minor batch (all resolved S132)
+
+- **`_reclaim_expired_sync` outside lock in `reconcile()`/`status()`**
+  (926ed8b): reclaim moved inside the ledger lock; `status()` is now async.
+  Pinned by `TestLockDiscipline`.
+- **`audit.emit()` silent pre-init no-op** (b3b7aa9): pre-init events go to
+  a bounded ring buffer (256) with a WARNING, flushed on init.
+- **`_safe_transition` debug-logs invalid transitions** (164fbf9):
+  ValueError branch (live task, illegal transition — state-machine race
+  signal) raised to WARNING; KeyError branch (already compacted) stays DEBUG.
+- **`ResidencyCache.invalidate()` lock contract** (1e23c76): documented
+  asyncio-single-loop contract (sync method, asyncio lock — can't take it).
+- **DELETE `/a2a/tasks/{id}` 404 for already-terminal** (1e23c76): now 409
+  via `A2AHandler.is_task_terminal()`; 404 reserved for never-existed /
+  tombstoned. Both app factories updated.
 
 ---
 
