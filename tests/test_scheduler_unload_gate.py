@@ -18,7 +18,6 @@ The contract these tests pin:
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest

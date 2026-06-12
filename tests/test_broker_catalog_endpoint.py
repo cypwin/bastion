@@ -15,7 +15,6 @@ from unittest.mock import AsyncMock
 import bastion.server as server_mod
 from bastion.models import LoadedModel
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Empty residency (no models loaded)
 # ─────────────────────────────────────────────────────────────────────────────

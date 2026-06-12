@@ -20,7 +20,6 @@ in test_server_admin.py.
 
 from __future__ import annotations
 
-import pytest
 from fastapi.testclient import TestClient
 
 
