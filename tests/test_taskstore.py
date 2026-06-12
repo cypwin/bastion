@@ -74,6 +74,48 @@ class TestTaskStoreBasics:
         assert store.active_count() == 2
 
 
+class TestThreadAffinityContract:
+    """TaskStore is asyncio-single-loop only — that contract must fail loud.
+
+    `create` writes `_active`/`_active_timestamps` without a lock, which is
+    safe only because all callers share one event-loop thread. A threaded
+    caller (anyio thread pool, executor offload) would race silently; the
+    affinity guard turns that into an immediate RuntimeError.
+    """
+
+    def test_create_from_foreign_thread_raises(self) -> None:
+        import threading
+
+        store = TaskStore(maxsize=100)
+        store.create(_make_record("t1"))  # binds owner thread
+
+        result: list[BaseException | str] = []
+
+        def create_from_thread() -> None:
+            try:
+                store.create(_make_record("t2"))
+                result.append("no error")
+            except RuntimeError as e:
+                result.append(e)
+
+        t = threading.Thread(target=create_from_thread)
+        t.start()
+        t.join()
+
+        assert isinstance(result[0], RuntimeError), (
+            "create() from a foreign thread must raise RuntimeError, "
+            f"got: {result[0]!r}"
+        )
+        assert "thread" in str(result[0]).lower()
+        assert not store.has_task("t2")
+
+    def test_create_from_owner_thread_repeatedly_ok(self) -> None:
+        store = TaskStore(maxsize=100)
+        store.create(_make_record("t1"))
+        store.create(_make_record("t2"))
+        assert store.active_count() == 2
+
+
 class TestStateTransitions:
     """State machine enforcement."""
 
