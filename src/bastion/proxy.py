@@ -325,6 +325,19 @@ class OllamaProxy:
                     status_code=504,
                 )
 
+            # A grant set by the queue sweeper is a rejection, not a grant:
+            # the scheduler never intended this request to run. Forwarding
+            # here would dispatch to Ollama (incrementing in-flight
+            # counters) for a request that was swept as stale.
+            if getattr(grant_event, "swept", False):
+                logger.warning(
+                    "Request %s was swept from the queue — rejecting", queued.id,
+                )
+                return JSONResponse(
+                    {"error": "Request swept from scheduler queue after staleness TTL"},
+                    status_code=504,
+                )
+
             logger.debug("Request %s granted by scheduler", queued.id)
             queue_wait_seconds = queued.age_seconds
 

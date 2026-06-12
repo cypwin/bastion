@@ -350,3 +350,51 @@ class TestUpstream5xxBreakerAccounting:
             await _drain(resp)
 
         assert done_calls == [1]
+
+
+class TestSweptRequests:
+    """A grant event set by the queue sweeper is a rejection, not a grant.
+
+    Before this, sweeping a stale request set the same event a real grant
+    uses, so the proxy forwarded to Ollama (incrementing in-flight
+    counters) for a request the scheduler never intended to run.
+    """
+
+    @pytest.mark.asyncio
+    async def test_swept_grant_returns_504_and_does_not_forward(self):
+        async def sweeping_enqueue(queued: QueuedRequest):
+            event = asyncio.Event()
+            event.swept = True  # type: ignore[attr-defined]
+            event.set()
+            return event, lambda: None, lambda: None
+
+        proxy = OllamaProxy(BrokerConfig(), enqueue_fn=sweeping_enqueue)
+
+        post_mock = AsyncMock()
+        with patch.object(proxy._http, "post", post_mock), \
+             patch.object(proxy._http, "stream", MagicMock()) as stream_mock:
+            req = _make_request(body=b'{"model": "qwen3:14b", "prompt": "hi", "stream": false}')
+            resp = await proxy.handle_request(req)
+
+        assert resp.status_code == 504
+        assert "swept" in json.loads(bytes(resp.body)).get("error", "")
+        post_mock.assert_not_called()
+        stream_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_genuine_grant_still_forwards(self):
+        """An event without the swept marker behaves exactly as before."""
+        async def granting_enqueue(queued: QueuedRequest):
+            event = asyncio.Event()
+            event.set()
+            return event, lambda: None, lambda: None
+
+        proxy = OllamaProxy(BrokerConfig(), enqueue_fn=granting_enqueue)
+
+        mock_resp = httpx.Response(200, json={"response": "ok", "done": True},
+                                   request=httpx.Request("POST", "http://mock"))
+        with patch.object(proxy._http, "post", new_callable=AsyncMock, return_value=mock_resp):
+            req = _make_request(body=b'{"model": "qwen3:14b", "prompt": "hi", "stream": false}')
+            resp = await proxy.handle_request(req)
+
+        assert resp.status_code == 200
