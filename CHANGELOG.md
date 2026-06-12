@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Scheduler re-checks the GPU-hot gate immediately before swap dispatch (releasing the VRAM reservation on abort) — a GPU transitioning hot during the swap window is no longer unprotected.
+- Upstream Ollama 5xx is forwarded with its real status in both streaming and non-streaming proxy paths (a streamed 500 was previously masked as 200), connect failures map to 502 without leaking scheduler slots, and upstream ≥500 now counts toward the circuit breaker instead of recording success.
+- `CircuitBreakerTransport` counts all `httpx.TransportError` subclasses toward the breaker (previously only `ConnectError`/`ConnectTimeout`/`ReadTimeout`; `RemoteProtocolError`, `PoolTimeout`, `WriteError` etc. bypassed it).
+- Queue sweeps are rejections, not grants: a request swept as stale now gets 504 from the proxy instead of being forwarded to Ollama as if the scheduler had granted it.
+
 ## [0.4.1] - 2026-06-12
 
 ### Added
