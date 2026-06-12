@@ -6,11 +6,15 @@ concurrent load, verifying VRAM budget enforcement, queue ordering, model swap
 coordination, and streaming correctness.
 
 Not run in CI — intended for manual pre-release validation on a GPU machine.
-Skips automatically if BASTION is not reachable.
+
+Gated behind ``BASTION_E2E=1``: these tests evict every loaded model from the
+broker they target, so an accidental run against a production instance is
+destructive. Without the opt-in the whole module skips at collection time.
+Also skips automatically if BASTION is not reachable.
 
 Usage:
-    python -m pytest tests/test_e2e_stress.py -v -s
-    python -m pytest -m e2e -v -s
+    BASTION_E2E=1 python -m pytest tests/test_e2e_stress.py -v -s
+    BASTION_E2E=1 python -m pytest -m e2e -v -s
 
 Forensic log written to /tmp/bastion-stress-test.jsonl (JSONL, one event per line).
 """
@@ -20,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import sys
 import time
 import traceback
@@ -28,6 +33,14 @@ from pathlib import Path
 
 import httpx
 import pytest
+
+# Destructive against the broker it targets (evicts all loaded models) —
+# require an explicit opt-in so a plain `pytest tests/` can never hit a
+# production instance.
+pytestmark = pytest.mark.skipif(
+    os.environ.get("BASTION_E2E") != "1",
+    reason="e2e stress suite is opt-in: set BASTION_E2E=1 to run",
+)
 
 # ---------------------------------------------------------------------------
 # Constants
