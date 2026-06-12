@@ -87,14 +87,13 @@ _(none open — see "Resolved in v0.4.1" below)_
   so the dashboard log captures the failure even if the UI doesn't.
 - **Surfaced by:** silent-failure-hunter, v0.4 campaign.
 
-### A2A `_handle_status` swallows handler exceptions without logging
+### A2A `_handle_status` swallows handler exceptions without logging (FIXED in v0.4.1)
 
-- **Location:** `src/bastion/a2a.py:918-923`
-- **Problem:** `except Exception` block sets `record.error = str(e)` and
-  transitions to FAILED, but no `logger.error` / `logger.exception`. A
-  bug in the status handler fails tasks silently.
-- **Fix path:** add `logger.exception("A2A status handler error
-  (task=%s)", record.task_id)` before the state transition.
+- **Status:** Resolved (S130). The `except` block now calls
+  `logger.exception("A2A status handler error (task=%s)", ...)` before the
+  FAILED transition, and the handler no longer crashes on the VRAM
+  state-unknown sentinel in the first place (answers with
+  `vram_state: "unknown"`).
 - **Surfaced by:** silent-failure-hunter, v0.4 campaign.
 
 ### `TaskStore.create` is not lock-protected
@@ -194,7 +193,7 @@ _(none open — see "Resolved in v0.4.1" below)_
   so every downstream consumer treated transient `/api/ps` failures as "VRAM
   is free" — exactly the misclassification that approved a second 31B load on
   top of an unflushed one during the S122-merge restart burst and crashed the
-  5090 (KATAMARAN dossier 2026-05-19).
+  5090 (downstream batch-client crash dossier, 2026-05-19).
 - **Fix:** `get_loaded_models()` now returns `list[LoadedModel] | None`;
   `None` is the "state unknown" sentinel. Callers propagated:
   - `can_load_model()` — fail-closed: returns `(False, "VRAM state unknown…")`
@@ -259,7 +258,7 @@ _(none open — see "Resolved in v0.4.1" below)_
 
 ### `GET /broker/version` (new endpoint, paired with the fix above)
 
-- **Was:** clients (KATAMARAN, other A2A consumers) had no way to detect
+- **Was:** A2A batch clients had no way to detect
   that BASTION was redeployed mid-batch. Three S122 merges restarted the
   broker mid-batch and surfaced as four distinct error shapes downstream,
   each needing independent retry tuning.

@@ -1,6 +1,6 @@
 """HTTP-contract tests for GET /broker/version.
 
-Motivation: KATAMARAN (and other A2A clients) cannot currently detect that
+Motivation: long-batch A2A clients cannot currently detect that
 BASTION was redeployed mid-batch. Three S122 merges restarted the broker
 mid-batch during a 31B embedding run and surfaced as four distinct error
 shapes downstream (502, 500 CUDA, ECONNREFUSED, server-disconnected) that
@@ -35,7 +35,7 @@ class TestBrokerVersion:
     def test_response_has_required_keys(
         self, app_with_stub_scheduler: TestClient,
     ) -> None:
-        """KATAMARAN-side pin logic depends on exactly these keys being present."""
+        """Client-side pin logic depends on exactly these keys being present."""
         client = app_with_stub_scheduler
         body = client.get("/broker/version").json()
         for key in ("version", "git_sha", "boot_time_unix", "boot_time_iso"):

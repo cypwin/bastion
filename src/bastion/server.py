@@ -96,7 +96,7 @@ def _detect_git_sha() -> str:
       3. ``unknown`` (no git, no env var — e.g., wheel install without deploy SHA).
 
     Captured once at module load by ``_GIT_SHA``; the /broker/version route
-    returns this value so A2A clients (KATAMARAN) can pin SHA across a
+    returns this value so A2A clients can pin SHA across a
     long batch and detect mid-run redeploys.
     """
     sha = os.environ.get("BASTION_GIT_SHA", "").strip()
@@ -1159,7 +1159,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
         """Build identity for client SHA-pinning during long batches.
 
         Returns the BASTION version, git SHA, and process boot timestamp.
-        A2A clients (KATAMARAN) can pin ``git_sha`` at the start of a long
+        A2A clients can pin ``git_sha`` at the start of a long
         batch and refuse to retry against a different SHA — the signal that
         a mid-run redeploy (not a transient infra blip) caused the errors.
         ``boot_time_unix`` distinguishes process restarts at unchanged SHA.
@@ -1988,7 +1988,7 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
         """Build identity for client SHA-pinning during long batches.
 
         Returns the BASTION version, git SHA, and process boot timestamp.
-        A2A clients (KATAMARAN) can pin ``git_sha`` at the start of a long
+        A2A clients can pin ``git_sha`` at the start of a long
         batch and refuse to retry against a different SHA — the signal that
         a mid-run redeploy (not a transient infra blip) caused the errors.
         ``boot_time_unix`` distinguishes process restarts at unchanged SHA.
