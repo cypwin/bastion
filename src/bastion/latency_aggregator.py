@@ -62,7 +62,10 @@ def aggregate_latency(
             overall=None,
         )
 
-    actual_window_s = now - min(s["timestamp"] for s in in_window)
+    # Clamp at 0: a sample stamped ahead of `now` (backwards wall-clock
+    # step, NTP correction) must not produce a negative window and fail
+    # BrokerLatency validation mid-request.
+    actual_window_s = max(0.0, now - min(s["timestamp"] for s in in_window))
 
     by_model: dict[str, list[dict]] = {}
     for s in in_window:
