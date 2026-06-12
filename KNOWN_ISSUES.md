@@ -28,6 +28,33 @@ _(none open — see "Resolved in v0.4.1" below)_
 
 ## Important
 
+### Broker dies after upstream Ollama 500 (under VRAM contention)
+
+- **Observed:** 2026-06-11 ~22:02, during the the-batch-client atlas bulk-extract
+  sweep (~600 trees of `/api/chat` calls through the proxy). Under
+  concurrent-session VRAM contention Ollama returned a 500; shortly after, the
+  broker stopped serving entirely. Ollama itself never crashed
+  (journalctl-verified). Repro evidence: journalctl around 2026-06-11 22:02;
+  client-side symptoms recorded in the-batch-client
+  (`the batch client` header comment + S129/S130 session notes).
+- **Problem:** an upstream 5xx is a *response*, not an httpx exception — so
+  `CircuitBreakerTransport` never counts it (see the existing
+  `RemoteProtocolError`/`PoolTimeout` item) and no handler path treats
+  upstream-500 specially. Whatever killed the broker was therefore not the
+  breaker opening; the actual death path needs the journal traceback to pin
+  down.
+- **Consequence worth flagging:** the failure pushed the batch client to ship
+  a proxy-bypass (`OLLAMA_HOST_OVERRIDE` → direct :11434) — i.e. this bug's
+  practical effect is clients routing AROUND the crash-prevention layer,
+  re-exposing exactly the load class BASTION exists to absorb.
+- **Fix path:** (1) pull the traceback from journalctl for 2026-06-11 ~22:02;
+  (2) harden the dispatch/stream path so an upstream 5xx is forwarded (or
+  mapped to 502) without killing the broker; (3) consider counting upstream
+  5xx storms toward the circuit breaker. Regression test: upstream returns 500
+  mid-batch → broker stays up and serves subsequent requests.
+- **Surfaced by:** the-batch-client S129 data/sessions sweep (2026-06-11); filed
+  S131 (2026-06-12).
+
 ### `_queue_sweep_loop` grants events for swept requests without distinguishing them
 
 - **Location:** `src/bastion/server.py:237-239`
