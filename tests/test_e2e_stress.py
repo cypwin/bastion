@@ -1730,6 +1730,9 @@ class TestCouncilConcurrentDispatch:
     ]
     _REQUESTS_PER_MODEL: int = 3
     _SHORT_PROMPT: str = "Reply with exactly one word: yes"
+    # Reload canary: a one-word warm answer takes 0.1-4s on these models; a
+    # cold reload of a 4-8 GB model takes well over 10s on this hardware.
+    _COLD_LOAD_LATENCY_S: float = 10.0
 
     async def test_council_parallel_no_swaps(
         self,
@@ -1765,6 +1768,12 @@ class TestCouncilConcurrentDispatch:
                     assert model in loaded, f"{model} not loaded after preload: {loaded}"
                 stress_log.log("all_council_resident", {"loaded": loaded})
 
+                # Baseline for the no-swap assertion: the broker's own swap
+                # counter (authoritative — incremented on every swap the
+                # scheduler performs, unlike sampled /api/ps views).
+                status_resp = await admin.get(f"{bastion_url}/broker/status")
+                swaps_before = status_resp.json().get("total_model_swaps", 0)
+
             # Phase 2: Fire concurrent requests to all 3 models
             async with VRAMMonitor(bastion_url, stress_log, poll_interval=0.5) as monitor:
                 client = StressClient(bastion_url, stress_log, client_id="council")
@@ -1791,33 +1800,41 @@ class TestCouncilConcurrentDispatch:
                 client.assert_all_succeeded()
                 client.assert_no_timeouts()
 
-                # No swaps should have occurred — all models were co-resident
-                [
-                    s for s in monitor.samples
-                    if set(council).issubset({n for n in s.get("loaded_models", [])})
-                ]
-                # If VRAMMonitor detected a model swap (loaded_models changed),
-                # it logged a "model_swap_detected" event. Check that council
-                # models were never removed. Debounced: under concurrent
-                # inference Ollama's /api/ps transiently omits a busy model
-                # for a single poll (observed 2026-06-12: granite missing from
-                # one 0.5s sample while its requests completed warm at 0.08s),
-                # so only TWO consecutive missing samples count as a real
-                # eviction — an actual unload+reload stays absent for many
-                # seconds at this polling interval.
-                for model in council:
-                    missing_run = max_missing_run = 0
-                    for sample in monitor.samples:
-                        if model in set(sample.get("loaded_models", [])):
-                            missing_run = 0
-                        else:
-                            missing_run += 1
-                            max_missing_run = max(max_missing_run, missing_run)
-                    assert max_missing_run < 2, (
-                        f"Council model {model} missing from {max_missing_run} "
-                        f"consecutive residency samples — real eviction during "
-                        f"inference detected."
+                # No swaps should have occurred — all models were co-resident.
+                #
+                # NOTE on the signal: /api/ps polling is NOT used as the
+                # eviction detector. Under concurrent inference it returns
+                # partial views — observed 2026-06-12: models missing from
+                # 1-2 consecutive 0.5s polls (and vram_used_gb oscillating
+                # 12-26 GB) while every request to the "missing" model
+                # completed warm (0.08-2.6s). The VRAMMonitor samples remain
+                # as diagnostics only. Two authoritative signals instead:
+                #
+                # 1. The broker's own swap counter — incremented on every
+                #    swap the scheduler performs. Delta must be zero.
+                # 2. A cold-reload latency canary — a real eviction forces a
+                #    multi-second model reload on the next request; warm
+                #    answers to one-word prompts stay far under this.
+                async with httpx.AsyncClient(timeout=10.0) as admin_after:
+                    status_resp = await admin_after.get(
+                        f"{bastion_url}/broker/status"
                     )
+                swaps_after = status_resp.json().get("total_model_swaps", 0)
+                assert swaps_after == swaps_before, (
+                    f"Broker performed {swaps_after - swaps_before} model "
+                    f"swap(s) during the council burst — all three models "
+                    f"should have stayed co-resident."
+                )
+
+                latencies_all = [
+                    r["latency_s"] for r in results if r.get("latency_s")
+                ]
+                worst_latency = max(latencies_all, default=0.0)
+                assert worst_latency < self._COLD_LOAD_LATENCY_S, (
+                    f"Slowest council request took {worst_latency:.1f}s — "
+                    f"reload-scale latency indicates a model was evicted and "
+                    f"reloaded mid-burst."
+                )
 
                 # Wall time should indicate concurrency.
                 # With 3 models × 3 requests each = 9 requests.
