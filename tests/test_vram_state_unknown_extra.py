@@ -139,3 +139,23 @@ class TestVRAMManagerReconcileStateUnknown:
         freed = await manager.reconcile(set())
         assert freed == 9_000_000_000
         assert manager.allocated_bytes == 0
+
+
+class TestGetLoadedVramGbStateUnknown:
+    @pytest.mark.asyncio
+    async def test_returns_zero_and_skips_metric_on_unknown_state(
+        self, tracker: VRAMTracker,
+    ) -> None:
+        """/api/ps unreachable → 0.0, and the bastion_vram_used_mb gauge must
+        NOT be published (a '0 MB used' reading during an outage would
+        mislead operators into thinking VRAM is free)."""
+        async def fail_get_loaded():
+            return None
+
+        with patch.object(
+            tracker, "get_loaded_models", side_effect=fail_get_loaded,
+        ), patch("bastion.vram.update_vram_used_mb") as gauge:
+            result = await tracker.get_loaded_vram_gb()
+
+        assert result == 0.0
+        gauge.assert_not_called()
