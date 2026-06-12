@@ -923,6 +923,9 @@ class A2AHandler:
 
         except Exception as e:
             record.error = str(e)
+            logger.exception(
+                "A2A status handler error (task=%s)", record.task_id
+            )
             if self._safe_transition(record.task_id, A2ATaskState.FAILED):
                 await self._notify_subscribers(
                     record.task_id,
