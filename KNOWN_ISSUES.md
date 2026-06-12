@@ -52,21 +52,27 @@ _(none open — see "Resolved in v0.4.1" below)_
   mapped to 502) without killing the broker; (3) consider counting upstream
   5xx storms toward the circuit breaker. Regression test: upstream returns 500
   mid-batch → broker stays up and serves subsequent requests.
+- **Status:** Defensive half landed S131 (75727bb): upstream 5xx is forwarded
+  with its real status in both streaming and non-streaming paths, connect
+  failures map to 502 without leaking scheduler slots, and upstream ≥500
+  counts toward the circuit breaker. Regression tests pin the contract
+  (`TestUpstream500Survival`). **Root cause still open** — needs the
+  journalctl traceback from 2026-06-11 ~22:02 to pin the actual death path.
 - **Surfaced by:** SWARM_BRAIN S129 data/sessions sweep (2026-06-11); filed
   S131 (2026-06-12).
 
-### `_queue_sweep_loop` grants events for swept requests without distinguishing them
+### `_dispatch_error_cleanup` sets grant events without distinguishing failure from grant
 
-- **Location:** `src/bastion/server.py:237-239`
-- **Problem:** When a stale request is swept, `grant_evt.set()` unblocks
-  the waiting proxy handler, which then proceeds to forward to Ollama as
-  if it had been legitimately granted. The proxy has no signal that the
-  request was *swept* rather than *granted*, so it dispatches to Ollama
-  (incrementing in-flight counters) for a request the scheduler never
-  intended to run.
-- **Fix path:** introduce a `swept` flag or separate "rejected" event
-  type so the proxy handler returns 503/504 instead of forwarding.
-- **Surfaced by:** silent-failure-hunter, v0.4 campaign.
+- **Location:** `src/bastion/server.py:351-363`
+- **Problem:** Same bug class as the swept-request issue resolved in v0.5
+  (see below): when dispatch fails, `_dispatch_error_cleanup` pops and sets
+  the grant event with no marker, so the waiting proxy handler treats the
+  failure as a grant and forwards to Ollama anyway.
+- **Fix path:** reuse the `swept`-style attribute marker (perhaps renamed
+  to a generic `rejected`) so the proxy returns an error instead of
+  forwarding; one unit test mirroring `TestReleaseSweptRequest`.
+- **Surfaced by:** S131 swept-vs-granted fix (deliberately not folded in to
+  keep that change minimal).
 
 ### A2A `create_lease` has TOCTOU window with `has_active_lease`
 
@@ -78,29 +84,6 @@ _(none open — see "Resolved in v0.4.1" below)_
 - **Fix path:** introduce `try_create_lease(model, ...)` that atomically
   checks + creates under an internal lock.
 - **Surfaced by:** concurrency-test agent, v0.4 campaign.
-
-### `CircuitBreakerTransport` ignores `RemoteProtocolError` and `PoolTimeout`
-
-- **Location:** `src/bastion/circuitbreaker.py:267-269`
-- **Problem:** The `except` clause explicitly catches `ConnectError`,
-  `ConnectTimeout`, `ReadTimeout`. Other httpx exceptions
-  (`RemoteProtocolError`, `PoolTimeout`, etc.) propagate without
-  affecting the breaker counter — connection-pool pressure and protocol-
-  level corruption never trigger the breaker.
-- **Fix path:** broaden the except clause OR wrap with a general handler
-  that classifies non-transient httpx errors as failures.
-- **Surfaced by:** Agent 2 (failure GPU + Ollama), v0.4 campaign.
-
-### Scheduler's GPU-hot gate doesn't guard mid-swap
-
-- **Location:** `src/bastion/scheduler.py::_process_tick` (gate at top of tick)
-- **Problem:** `check_gpu_safe` is called at the top of `_process_tick`
-  but not re-checked inside `_handle_swap_dispatch` before the actual
-  `_dispatch_for_model` call. A GPU that transitions hot during the swap
-  is unprotected — exactly the load-cycle the system exists to prevent.
-- **Fix path:** re-check `check_gpu_safe` immediately before the dispatch
-  call inside the swap path.
-- **Surfaced by:** Agent 2 (failure GPU + Ollama), v0.4 campaign.
 
 ### Dashboard `BastionClient` swallows all errors silently
 
@@ -206,6 +189,47 @@ _(none open — see "Resolved in v0.4.1" below)_
 
 - **Status:** Resolved. `pyproject.toml` dev now reads
   `httpx>=0.27,<1.0` matching the dashboard extra.
+
+---
+
+## Resolved in v0.5 (unreleased)
+
+> Fixed on main after the v0.4.1 tag; these items live under `[Unreleased]`
+> in `CHANGELOG.md` until v0.5 is cut.
+
+### `_queue_sweep_loop` grants events for swept requests without distinguishing them
+
+- **Was:** when a stale request was swept, `grant_evt.set()` unblocked the
+  waiting proxy handler with no signal that the request was *swept* rather
+  than *granted*, so the proxy forwarded to Ollama (incrementing in-flight
+  counters) for a request the scheduler never intended to run.
+- **Status:** Resolved (S131, 08e8bad). The sweep loop marks the grant event
+  `swept = True` before setting it; the proxy handler returns 504 instead of
+  forwarding. Pinned by `TestSweptRequests` (proxy side) and
+  `TestReleaseSweptRequest` (server side). The sibling
+  `_dispatch_error_cleanup` path has the same bug class — filed separately
+  under Important.
+- **Surfaced by:** silent-failure-hunter, v0.4 campaign.
+
+### `CircuitBreakerTransport` ignores `RemoteProtocolError` and `PoolTimeout`
+
+- **Was:** the `except` clause caught only `ConnectError`, `ConnectTimeout`,
+  `ReadTimeout`, so connection-pool pressure and protocol-level corruption
+  never affected the breaker counter.
+- **Status:** Resolved (S131, d39915c). Except clause broadened to
+  `httpx.TransportError`, covering `RemoteProtocolError`, `PoolTimeout`,
+  `WriteError`, and friends. Mixed-exception-type trip-to-open is tested.
+- **Surfaced by:** Agent 2 (failure GPU + Ollama), v0.4 campaign.
+
+### Scheduler's GPU-hot gate doesn't guard mid-swap
+
+- **Was:** `check_gpu_safe` ran at the top of `_process_tick` but was not
+  re-checked inside `_handle_swap_dispatch`, so a GPU transitioning hot
+  during the swap window was unprotected.
+- **Status:** Resolved (S131, 35d177c). The gate is re-checked immediately
+  before swap dispatch; an abort releases the VRAM reservation. Pinned by
+  `TestGPUGatingMidSwap`.
+- **Surfaced by:** Agent 2 (failure GPU + Ollama), v0.4 campaign.
 
 ---
 
