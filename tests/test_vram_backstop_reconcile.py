@@ -20,6 +20,7 @@ from bastion.vram import (
     VRAMManager,
     VRAMTracker,
     _hardware_admits,
+    registry_lookup,
 )
 
 GB = 1024 ** 3
@@ -203,3 +204,93 @@ class TestReconcileImport:
         freed = await manager.reconcile(set())
         assert freed == 5 * GB
         assert manager.allocated_bytes == 0
+
+
+# ---------------------------------------------------------------------------
+# registry_lookup — tag-aware /api/ps name → registry resolution (S130)
+# ---------------------------------------------------------------------------
+
+class TestRegistryLookup:
+    _MODELS = {
+        "embedder": ModelInfo(vram_gb=0.4, always_allowed=True),
+        "chat:latest": ModelInfo(vram_gb=9.0),
+        "tagged:7b": ModelInfo(vram_gb=5.0),
+    }
+
+    def test_exact_match_wins(self):
+        assert registry_lookup(self._MODELS, "tagged:7b").vram_gb == 5.0
+
+    def test_ps_latest_tag_matches_untagged_registry_key(self):
+        found = registry_lookup(self._MODELS, "embedder:latest")
+        assert found is not None and found.always_allowed is True
+
+    def test_untagged_ps_name_matches_latest_registry_key(self):
+        found = registry_lookup(self._MODELS, "chat")
+        assert found is not None and found.vram_gb == 9.0
+
+    def test_no_match_returns_none(self):
+        assert registry_lookup(self._MODELS, "unknown:13b") is None
+
+    def test_distinct_tags_do_not_cross_match(self):
+        # Only the implicit :latest tag is normalized — :7b must not match
+        # an untagged key for a different model.
+        assert registry_lookup(self._MODELS, "embedder:7b") is None
+
+
+class TestReconcileTagAwareExclusion:
+    @pytest.mark.asyncio
+    async def test_always_allowed_excluded_under_latest_tag(self, tracker):
+        """The shipped-config case: registry says 'embedder' (always_allowed),
+        /api/ps reports 'embedder:latest' — the model must NOT be imported
+        into the budget (and then never removable, since the name stays in
+        the loaded set)."""
+        tracker.config.models["embedder"] = ModelInfo(
+            vram_gb=0.4, always_allowed=True
+        )
+        manager = VRAMManager(tracker, 32 * GB, safety_margin_pct=10.0)
+        manager._tracker.residency_cache.get_resident_loaded_models = AsyncMock(
+            return_value=[_lm("embedder:latest", 0.4)]
+        )
+        await manager.reconcile({"embedder:latest"})
+        assert "embedder:latest" not in manager._model_allocations
+        assert manager.allocated_bytes == 0
+
+
+# ---------------------------------------------------------------------------
+# ResidencyCache bounded stale-OK (S130)
+# ---------------------------------------------------------------------------
+
+class TestResidencyStaleness:
+    @pytest.mark.asyncio
+    async def test_stale_within_grace_serves_last_known_good(self, tracker):
+        cache = ResidencyCache(tracker, ttl_seconds=0.0, max_stale_seconds=30.0)
+        tracker.get_loaded_models = AsyncMock(return_value=[_lm("tracked:7b", 5.0)])
+        assert await cache.get_resident_models() == {"tracked:7b"}
+
+        tracker.get_loaded_models = AsyncMock(return_value=None)  # outage
+        assert await cache.get_resident_models() == {"tracked:7b"}  # stale-OK
+
+    @pytest.mark.asyncio
+    async def test_stale_beyond_grace_reports_unknown(self, tracker):
+        """Bounded stale-OK: after max_stale_seconds of consecutive failures
+        the cache must surface None (fail-closed), not a 30-minute-old
+        picture of residency."""
+        import asyncio as _asyncio
+
+        cache = ResidencyCache(tracker, ttl_seconds=0.0, max_stale_seconds=0.05)
+        tracker.get_loaded_models = AsyncMock(return_value=[_lm("tracked:7b", 5.0)])
+        assert await cache.get_resident_models() == {"tracked:7b"}
+
+        tracker.get_loaded_models = AsyncMock(return_value=None)
+        await _asyncio.sleep(0.06)
+        assert await cache.get_resident_models() is None
+
+
+class TestBackstopFailOpenObservability:
+    @pytest.mark.asyncio
+    async def test_fail_open_logs_warning(self, caplog):
+        with patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=None)):
+            with caplog.at_level("WARNING", logger="bastion.vram"):
+                admits, free = await _hardware_admits(9 * GB)
+        assert admits is True and free is None
+        assert any("failing open" in r.message for r in caplog.records)

@@ -21,7 +21,7 @@ import httpx
 from bastion import audit
 from bastion.health import get_vram_free_gb, query_gpu_status
 from bastion.metrics import update_vram_used_mb
-from bastion.models import BrokerConfig, LoadedModel
+from bastion.models import BrokerConfig, LoadedModel, ModelInfo
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +39,34 @@ async def _hardware_admits(
     """
     free_gb = await get_vram_free_gb()
     if free_gb is None:
+        # Operationally significant: the hardware gate is offline and only
+        # the logical ledger protects the budget. Warn so an extended
+        # nvidia-smi outage is visible in logs, not silent.
+        logger.warning(
+            "nvidia-smi backstop unavailable (no free-VRAM reading) — "
+            "failing open, logical ledger is the only admission gate"
+        )
         return True, None
     required_gb = vram_bytes / (1024 ** 3) + margin_gb
     return free_gb >= required_gb, free_gb
+
+
+def registry_lookup(models: dict[str, ModelInfo], name: str) -> ModelInfo | None:
+    """Resolve an Ollama ``/api/ps`` model name against the broker registry.
+
+    ``/api/ps`` reports normalized names (``nomic-embed-text:latest``)
+    while ``broker.yaml`` keys are often untagged (``nomic-embed-text``).
+    Exact match wins; otherwise compare with the implicit ``:latest`` tag
+    stripped from both sides. Returns the registry value or ``None``.
+    """
+    found = models.get(name)
+    if found is not None:
+        return found
+    norm = name.removesuffix(":latest")
+    for key, info in models.items():
+        if key.removesuffix(":latest") == norm:
+            return info
+    return None
 
 
 class ResidencyCache:
@@ -59,9 +84,15 @@ class ResidencyCache:
         Time-to-live for cached data (default: 1.0).
     """
 
-    def __init__(self, vram_tracker: VRAMTracker, ttl_seconds: float = 1.0) -> None:
+    def __init__(
+        self,
+        vram_tracker: VRAMTracker,
+        ttl_seconds: float = 1.0,
+        max_stale_seconds: float = 30.0,
+    ) -> None:
         self._vram_tracker = vram_tracker
         self._ttl_seconds = ttl_seconds
+        self._max_stale_seconds = max_stale_seconds
         self._cache: list[LoadedModel] | None = None
         self._cache_timestamp: float = 0.0
         self._lock = asyncio.Lock()
@@ -87,6 +118,19 @@ class ResidencyCache:
             if fresh is None:
                 # Preserve prior cache; do not advance timestamp so the next
                 # call retries instead of serving stale-and-stale forever.
+                # Stale-OK is BOUNDED: past max_stale_seconds of consecutive
+                # failures the cached picture is too old to gate VRAM
+                # decisions and we surface "unknown" (fail-closed) instead.
+                if (
+                    self._cache is not None
+                    and (now - self._cache_timestamp) > self._max_stale_seconds
+                ):
+                    logger.warning(
+                        "Residency cache stale beyond %.0fs grace (tracker "
+                        "unreachable) — reporting state unknown",
+                        self._max_stale_seconds,
+                    )
+                    return False
                 logger.debug("Residency cache refresh skipped: tracker state unknown")
                 return self._cache is not None
             self._cache = fresh
@@ -720,7 +764,11 @@ class VRAMManager:
                     continue  # already tracked
                 if name in reserved_models:
                     continue  # mid-reservation — commit() will account for it
-                known = self._tracker.config.models.get(name)
+                # Tag-aware: /api/ps says 'nomic-embed-text:latest' while the
+                # registry key is untagged — an exact .get() would miss the
+                # always_allowed exclusion and import the model into the
+                # budget permanently (removal can't fire: the name IS loaded).
+                known = registry_lookup(self._tracker.config.models, name)
                 if known and known.always_allowed:
                     continue  # excluded from budget accounting (design D2)
                 vram_gb = sizes.get(name)
