@@ -12,6 +12,7 @@ API:
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -256,6 +257,60 @@ async def test_get_methods_return_default_on_timeout() -> None:
         new=AsyncMock(side_effect=httpx.TimeoutException("slow")),
     ):
         assert await client.get_queue() == {}
+
+
+# ---------------------------------------------------------------------------
+# GET error handling — failures must be logged at DEBUG, never silently
+# dropped. The dashboard renders an empty panel either way; the log is the
+# only place auth failures / 404s / network partitions become visible.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "method_name,endpoint",
+    [
+        ("get_recent", "/broker/recent"),
+        ("get_queue", "/broker/queue"),
+        ("get_health", "/broker/health"),
+        ("get_vram_ledger", "/broker/vram"),
+        ("get_watchdog", "/broker/watchdog"),
+        ("get_counters", "/broker/counters"),
+        ("get_thrashing", "/broker/thrashing"),
+        ("get_latency", "/broker/latency"),
+        ("get_catalog", "/broker/catalog"),
+    ],
+)
+async def test_get_methods_log_network_error_at_debug(
+    method_name: str, endpoint: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = BastionClient("http://localhost:11434")
+    with patch.object(
+        client._client,
+        "get",
+        new=AsyncMock(side_effect=httpx.ConnectError("boom")),
+    ), caplog.at_level(logging.DEBUG, logger="bastion.dashboard.client"):
+        await getattr(client, method_name)()
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(endpoint in m and "ConnectError" in m for m in messages), (
+        f"{method_name} swallowed ConnectError without logging "
+        f"endpoint + exception type; got: {messages}"
+    )
+
+
+async def test_get_methods_log_http_status_error_at_debug(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = BastionClient("http://localhost:11434")
+    with patch.object(
+        client._client, "get", new=AsyncMock(return_value=_resp(500))
+    ), caplog.at_level(logging.DEBUG, logger="bastion.dashboard.client"):
+        await client.get_health()
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(
+        "/broker/health" in m and "HTTPStatusError" in m for m in messages
+    )
 
 
 # ``poll`` does NOT swallow errors — it propagates via raise_for_status.
