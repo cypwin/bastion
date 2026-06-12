@@ -445,7 +445,7 @@ class TestBrokerStatusObservabilityFields:
         mock_vram_tracker.get_loaded_models = AsyncMock(return_value=mock_models)
 
         mock_vram_manager = MagicMock()
-        mock_vram_manager.status = MagicMock(return_value={"total_bytes": 32000000000})
+        mock_vram_manager.status = AsyncMock(return_value={"total_bytes": 32000000000})
 
         with (
             patch("bastion.server._scheduler", mock_scheduler),
