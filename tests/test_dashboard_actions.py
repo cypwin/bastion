@@ -769,6 +769,88 @@ async def test_check_auto_fan_returns_to_bios_auto_when_cool() -> None:
             assert app._auto_fan_state == "idle"
 
 
+async def test_check_auto_fan_gpu_floor_raises_engagement_speed() -> None:
+    """CPU triggers at 62C (30% band) but GPU sits at 84C -> engage at 90%,
+    never below what the GPU's own band demands (its firmware curve is
+    suspended while we override)."""
+    with patch(
+        "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
+    ) as set_fan, patch(
+        "bastion.dashboard.app.fan_control_available", return_value=True
+    ):
+        async with _mounted_dashboard() as (app, _pilot, _runner):
+            app._auto_fan_enabled = True
+            app._collector.read_cpu_temp = MagicMock(return_value=62.0)
+            app._check_auto_fan({"gpu": {"temperature_c": 84.0}})
+            set_fan.assert_called_once_with("90")
+
+
+async def test_check_auto_fan_gpu_floor_escalates_active_override() -> None:
+    """Override active at 30% (CPU band), GPU climbs over 85C -> 100%."""
+    with patch(
+        "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
+    ) as set_fan, patch(
+        "bastion.dashboard.app.fan_control_available", return_value=True
+    ):
+        async with _mounted_dashboard() as (app, _pilot, _runner):
+            app._auto_fan_enabled = True
+            app._auto_fan_speed = "30"
+            app._auto_fan_state = "cooling"
+            app._collector.read_cpu_temp = MagicMock(return_value=62.0)
+            app._check_auto_fan({"gpu": {"temperature_c": 86.0}})
+            set_fan.assert_called_once_with("100")
+
+
+async def test_check_auto_fan_gpu_floor_holds_within_hysteresis() -> None:
+    """At 90% on the GPU floor, GPU 76C is within hysteresis -> no change."""
+    with patch(
+        "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
+    ) as set_fan, patch(
+        "bastion.dashboard.app.fan_control_available", return_value=True
+    ):
+        async with _mounted_dashboard() as (app, _pilot, _runner):
+            app._auto_fan_enabled = True
+            app._auto_fan_speed = "90"
+            app._auto_fan_state = "cooling"
+            app._collector.read_cpu_temp = MagicMock(return_value=62.0)
+            app._check_auto_fan({"gpu": {"temperature_c": 76.0}})
+            set_fan.assert_not_called()
+
+
+async def test_check_auto_fan_cpu_release_wins_over_hot_gpu() -> None:
+    """CPU fully below the curve -> release to BIOS auto even with a hot
+    GPU: GPUFanControlState=0 resumes the firmware's own (finer) curve."""
+    with patch(
+        "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
+    ) as set_fan, patch(
+        "bastion.dashboard.app.fan_control_available", return_value=True
+    ):
+        async with _mounted_dashboard() as (app, _pilot, _runner):
+            app._auto_fan_enabled = True
+            app._auto_fan_speed = "90"
+            app._auto_fan_state = "cooling"
+            app._collector.read_cpu_temp = MagicMock(return_value=50.0)
+            app._check_auto_fan({"gpu": {"temperature_c": 84.0}})
+            set_fan.assert_called_once_with("auto")
+            assert app._auto_fan_speed is None
+            assert app._auto_fan_state == "idle"
+
+
+async def test_check_auto_fan_hot_gpu_alone_does_not_engage() -> None:
+    """GPU hot but CPU below the curve and no override active -> do nothing;
+    the GPU firmware curve is in control."""
+    with patch(
+        "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
+    ) as set_fan, patch(
+        "bastion.dashboard.app.fan_control_available", return_value=True
+    ):
+        async with _mounted_dashboard() as (app, _pilot, _runner):
+            app._auto_fan_enabled = True
+            app._collector.read_cpu_temp = MagicMock(return_value=45.0)
+            app._check_auto_fan({"gpu": {"temperature_c": 88.0}})
+            set_fan.assert_not_called()
+
+
 async def test_check_auto_fan_failed_set_keeps_state() -> None:
     """A failed set_fan_speed must not update the tracked speed/state."""
     with patch(
