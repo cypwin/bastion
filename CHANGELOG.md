@@ -5,15 +5,26 @@ All notable changes to BASTION are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] — targeting v0.4.1
 
 ### Added
 - `GET /broker/latency` — per-model latency percentiles (p50/p95/p99 for end-to-end duration and queue-wait) over a rolling window. Query param `window_s` (default 300, clamped `[10, 3600]`). Aggregation logic factored into `bastion.latency_aggregator.aggregate_latency` and unit-tested independently. Models with fewer than 3 samples in the window are omitted from `per_model`; the `overall` bucket aggregates all in-window samples.
-- `GET /broker/catalog` — registered models from `broker.yaml` enriched with VRAMTracker residency state and a computed `is_evictable` flag (loaded AND not the scheduler's `current_model` AND not `always_allowed`). Stays queryable during `/api/ps` outages — `loaded_count` collapses to 0 rather than 500ing.
+- `GET /broker/catalog` — registered models from `broker.yaml` enriched with VRAMTracker residency state and a computed `is_evictable` flag (loaded AND not the scheduler's `current_model` AND not `always_allowed`). Stays queryable during `/api/ps` outages — `residency_state` flips to `"unknown"` and `loaded_count` collapses to 0 rather than 500ing.
+- `GET /broker/version` — stable build identity (`version`, `git_sha`, `boot_time_unix`, `boot_time_iso`) so A2A clients can pin the SHA at batch start and detect mid-batch redeploys/restarts.
 - `BastionClient.get_latency(window_s)` / `BastionClient.get_catalog()` async wrappers in the dashboard client.
-- `BrokerConfig._loaded_from` (`PrivateAttr`) + public `loaded_from` property recording the resolved path of the loaded `broker.yaml`; surfaced as `registry_source` in `/broker/catalog`.
+- `BrokerConfig._loaded_from` (`PrivateAttr`) + public `loaded_from` property recording the resolved path of the loaded `broker.yaml`; surfaced as `registry_source` in `/broker/catalog` (home directory redacted to `~`).
+- State-unknown indicators: `vram_state` on `/broker/status` and the A2A `status` skill, `residency_state` on `/broker/catalog` — `"unknown"` marks loaded-model lists as placeholders during Ollama outages, distinguishable from verified-empty.
+- `streaming` flag on `/broker/recent` samples.
 
 ### Changed
+- **VRAM state-unknown sentinel (fail-closed admission).** `VRAMTracker.get_loaded_models()` now returns `None` when `/api/ps` is unreachable instead of an empty list. `can_load_model()` and `POST /broker/preload` refuse loads during the outage ("Cannot determine VRAM state…"), the scheduler tick bails out instead of dispatching on missing residency data, and eviction refuses to unload on unknown state — including stopping mid-loop if state becomes unknown between unloads.
+- **Proxy enqueue error contract:** unexpected enqueue exceptions now return `500 "Internal broker error"` instead of `503 "Broker queue full"`; 503 is reserved for genuine queue-full backpressure. Client retry logic should branch on the status code.
+- Scheduler unload gate: failed/deferred unloads no longer count as eviction progress (`_unload_model` → bool).
+- **Latency samples are recorded at true completion with real status codes.** Streaming requests record after the last byte (durations now reflect full stream time instead of ~0), and `status_code` carries the actual outcome (upstream errors, 502 backend failures) — `error_rate` in `/broker/latency` is meaningful instead of structurally zero.
+- Registry name matching is tag-aware (`name` ≡ `name:latest`) in reconcile import exclusion, `can_load_model` accounting, eviction filters, and catalog residency — prevents an `always_allowed` model resident under a tagged name from being imported into the budget or evicted.
+- `ResidencyCache` stale-OK preservation is bounded (default 30 s grace): after that, consecutive `/api/ps` failures surface state-unknown instead of serving an arbitrarily old residency picture.
+- nvidia-smi reserve() backstop logs a warning when it fails open (no reading) instead of being silent.
+- `_detect_git_sha` only trusts `git rev-parse` when the package root itself is a checkout (prevents reporting an unrelated enclosing repo's SHA) and debug-logs failures instead of swallowing them.
 - `_recent_requests` ring buffer maxlen bumped from 50 → 500. Prereq for stable per-model p95 in `/broker/latency`. Memory overhead ≈ 50 KB.
 - `/broker/recent` documentation updated to reflect the 500-sample buffer and its new role feeding the latency aggregator.
 - **M58 complexity routing no longer force-routes over an explicit client model.** New `complexity_routing.override_explicit` flag (default `false`): the route model only fills in for requests that omit `model`; an explicit `model` in the request body wins. Skipped routes are recorded with reason `complexity-<level>-skipped-explicit-model` in response headers and the audit log. Set `override_explicit: true` to restore the original force-route behavior. Root cause of a 2026-06-10 overnight-run incident (explicit instruct model silently replaced by a thinking-capable route target).
@@ -21,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Thrashing **warn** verdict on a request without complexity routing no longer breaks the request: `routing_meta` carrying only `_thrashing_warn` raised `KeyError` in response-header construction and audit emission (surfaced as a proxy error instead of the advisory `X-Swap-Penalty-Warning` header).
+- A2A `status` skill no longer fails with a swallowed `TypeError` when VRAM state is unknown (Ollama outage) — it now answers with an empty list and `vram_state: "unknown"`.
+- `/broker/latency` clamps the reported window at 0 when a sample carries a future timestamp (backwards wall-clock step) instead of failing response validation.
 
 ## [0.4.0] - 2026-04-23
 
