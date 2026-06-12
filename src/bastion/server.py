@@ -862,7 +862,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
             total_requests_served=_proxy._requests_served if _proxy else 0,
             total_model_swaps=_scheduler.total_swaps if _scheduler else 0,
             state="draining" if (_scheduler and _scheduler.is_draining) else "running",
-            vram_ledger=_vram_manager.status() if _vram_manager else None,
+            vram_ledger=(await _vram_manager.status()) if _vram_manager else None,
         )
         result = status.model_dump()
 
@@ -973,7 +973,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
         """
         if not _vram_manager:
             return JSONResponse({"error": "VRAMManager not initialized"}, status_code=503)
-        return _vram_manager.status()
+        return await _vram_manager.status()
 
     # ── Kubernetes-compatible health probes ──────────────────────────
 
@@ -1728,7 +1728,7 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
             total_requests_served=_proxy._requests_served if _proxy else 0,
             total_model_swaps=_scheduler.total_swaps if _scheduler else 0,
             state="draining" if (_scheduler and _scheduler.is_draining) else "running",
-            vram_ledger=_vram_manager.status() if _vram_manager else None,
+            vram_ledger=(await _vram_manager.status()) if _vram_manager else None,
         )
         result = status.model_dump()
 
@@ -1828,7 +1828,7 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
         """VRAM ledger status from VRAMManager."""
         if not _vram_manager:
             return JSONResponse({"error": "VRAMManager not initialized"}, status_code=503)
-        return _vram_manager.status()
+        return await _vram_manager.status()
 
     @broker_router.get("/livez")
     async def broker_livez():
