@@ -256,6 +256,12 @@ class ResidencyCache:
         the scheduler sees the updated state immediately. The next refresh is
         taken verbatim — the flicker-hold debounce is bypassed so a genuine
         unload declassifies without waiting out the miss streak.
+
+        Concurrency contract: asyncio-single-loop only. The writes below are
+        deliberately outside ``self._lock`` (sync method, asyncio lock):
+        safe because CPython attribute writes are atomic and all callers
+        share the event-loop thread — a threaded caller would race the
+        locked refresh path.
         """
         self._cache_timestamp = 0.0
         self._accept_next_verbatim = True
