@@ -1,9 +1,12 @@
 """Async HTTP client for BASTION's admin API."""
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 class BastionClient:
@@ -25,68 +28,54 @@ class BastionClient:
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def get_recent(self) -> list[dict]:
-        """Fetch /broker/recent and return parsed JSON."""
+    async def _get_safe(
+        self,
+        path: str,
+        default: list | dict,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        """GET an admin endpoint, returning ``default`` on any failure.
+
+        The dashboard renders an empty panel either way, so failures are
+        logged at DEBUG (endpoint + exception type) — the dashboard log is
+        the only place an auth failure, 404, or network partition becomes
+        distinguishable from genuinely empty data.
+        """
         try:
-            resp = await self._client.get(f"{self.base_url}/broker/recent")
+            resp = await self._client.get(f"{self.base_url}{path}", params=params)
             resp.raise_for_status()
             return resp.json()
-        except Exception:
-            return []
+        except Exception as e:
+            logger.debug("GET %s failed: %s: %s", path, type(e).__name__, e)
+            return default
+
+    async def get_recent(self) -> list[dict]:
+        """Fetch /broker/recent and return parsed JSON."""
+        return await self._get_safe("/broker/recent", [])
 
     async def get_queue(self) -> dict:
         """Fetch /broker/queue for stall diagnostics."""
-        try:
-            resp = await self._client.get(f"{self.base_url}/broker/queue")
-            resp.raise_for_status()
-            return resp.json()
-        except Exception:
-            return {}
+        return await self._get_safe("/broker/queue", {})
 
     async def get_health(self) -> dict:
         """Fetch /broker/health for circuit breaker state."""
-        try:
-            resp = await self._client.get(f"{self.base_url}/broker/health")
-            resp.raise_for_status()
-            return resp.json()
-        except Exception:
-            return {}
+        return await self._get_safe("/broker/health", {})
 
     async def get_vram_ledger(self) -> dict:
         """Fetch /broker/vram for VRAM ledger status."""
-        try:
-            resp = await self._client.get(f"{self.base_url}/broker/vram")
-            resp.raise_for_status()
-            return resp.json()
-        except Exception:
-            return {}
+        return await self._get_safe("/broker/vram", {})
 
     async def get_watchdog(self) -> dict:
         """Fetch /broker/watchdog for process monitor status."""
-        try:
-            resp = await self._client.get(f"{self.base_url}/broker/watchdog")
-            resp.raise_for_status()
-            return resp.json()
-        except Exception:
-            return {}
+        return await self._get_safe("/broker/watchdog", {})
 
     async def get_counters(self) -> dict:
         """Fetch /broker/counters for cumulative counters + reset_epoch."""
-        try:
-            resp = await self._client.get(f"{self.base_url}/broker/counters")
-            resp.raise_for_status()
-            return resp.json()
-        except Exception:
-            return {}
+        return await self._get_safe("/broker/counters", {})
 
     async def get_thrashing(self) -> dict:
         """Fetch /broker/thrashing for per-agent verdicts."""
-        try:
-            resp = await self._client.get(f"{self.base_url}/broker/thrashing")
-            resp.raise_for_status()
-            return resp.json()
-        except Exception:
-            return {}
+        return await self._get_safe("/broker/thrashing", {})
 
     async def get_latency(self, window_s: float = 300.0) -> dict:
         """Fetch /broker/latency for per-model latency percentiles.
@@ -96,24 +85,13 @@ class BastionClient:
         window_s
             Rolling window in seconds. Server clamps to [10, 3600].
         """
-        try:
-            resp = await self._client.get(
-                f"{self.base_url}/broker/latency",
-                params={"window_s": window_s},
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except Exception:
-            return {}
+        return await self._get_safe(
+            "/broker/latency", {}, params={"window_s": window_s}
+        )
 
     async def get_catalog(self) -> dict:
         """Fetch /broker/catalog for the registered-models + residency view."""
-        try:
-            resp = await self._client.get(f"{self.base_url}/broker/catalog")
-            resp.raise_for_status()
-            return resp.json()
-        except Exception:
-            return {}
+        return await self._get_safe("/broker/catalog", {})
 
     async def post_preload(self, model: str) -> dict:
         """Preload a model via /broker/preload."""
