@@ -296,6 +296,31 @@ def inflight_count() -> int:
     return sum(_inflight_models.values())
 
 
+def _release_swept_request(req: QueuedRequest) -> None:
+    """Release tracking state for a request swept as stale.
+
+    The grant event is marked ``swept`` before being set so the waiting
+    proxy handler returns 504 instead of forwarding to Ollama — a sweep
+    is a rejection, not a grant (see KNOWN_ISSUES, resolved in v0.5).
+    """
+    grant_evt = _pending_grants.pop(req.id, None)
+    if grant_evt:
+        grant_evt.swept = True  # type: ignore[attr-defined]
+        grant_evt.set()  # Unblock proxy handler waiting for grant
+    completion_evt = _pending_completions.pop(req.id, None)
+    if completion_evt:
+        completion_evt.set()
+    logger.warning(
+        "Swept stale request %s (model=%s, age=%.0fs)",
+        req.id, req.model, req.age_seconds,
+    )
+    audit.emit("queue_sweep", {
+        "request_id": req.id,
+        "model": req.model,
+        "age_seconds": round(req.age_seconds, 1),
+    })
+
+
 async def _queue_sweep_loop(ttl_seconds: float) -> None:
     """Background task that sweeps stale requests every 60 seconds.
 
@@ -314,21 +339,7 @@ async def _queue_sweep_loop(ttl_seconds: float) -> None:
                 continue
             swept = _queue.sweep_stale(ttl_seconds)
             for req in swept:
-                grant_evt = _pending_grants.pop(req.id, None)
-                if grant_evt:
-                    grant_evt.set()  # Unblock proxy handler waiting for grant
-                completion_evt = _pending_completions.pop(req.id, None)
-                if completion_evt:
-                    completion_evt.set()
-                logger.warning(
-                    "Swept stale request %s (model=%s, age=%.0fs)",
-                    req.id, req.model, req.age_seconds,
-                )
-                audit.emit("queue_sweep", {
-                    "request_id": req.id,
-                    "model": req.model,
-                    "age_seconds": round(req.age_seconds, 1),
-                })
+                _release_swept_request(req)
         except asyncio.CancelledError:
             raise
         except Exception:
