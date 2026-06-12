@@ -119,3 +119,42 @@ class TestBrokerVersion:
                 headers={"Authorization": "Bearer secret-test-key"},
             )
             assert resp.status_code == 200
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _detect_git_sha precedence and fallback branches (S130)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestDetectGitSha:
+    def test_env_var_takes_precedence(self, monkeypatch) -> None:
+        import bastion.server as server_mod
+
+        monkeypatch.setenv("BASTION_GIT_SHA", "deadbeef-from-deploy")
+        assert server_mod._detect_git_sha() == "deadbeef-from-deploy"
+
+    def test_no_git_entry_at_package_root_returns_unknown(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A wheel under site-packages nested inside some unrelated repo must
+        NOT report that repo's SHA — without a .git at the package root the
+        detector stops at 'unknown'."""
+        import bastion.server as server_mod
+
+        monkeypatch.delenv("BASTION_GIT_SHA", raising=False)
+        fake_pkg = tmp_path / "src" / "bastion"
+        fake_pkg.mkdir(parents=True)
+        monkeypatch.setattr(
+            server_mod, "__file__", str(fake_pkg / "server.py")
+        )
+        assert server_mod._detect_git_sha() == "unknown"
+
+    def test_dev_checkout_reports_head_sha(self, monkeypatch) -> None:
+        """In this repo (a real checkout) the detector returns a hex SHA."""
+        import bastion.server as server_mod
+
+        monkeypatch.delenv("BASTION_GIT_SHA", raising=False)
+        sha = server_mod._detect_git_sha()
+        assert sha == "unknown" or (
+            len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)
+        )

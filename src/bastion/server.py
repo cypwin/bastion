@@ -105,6 +105,12 @@ def _detect_git_sha() -> str:
     try:
         # __file__ -> .../src/bastion/server.py; package repo root is two up.
         repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        # Only trust git when the package root itself is the checkout (.git
+        # entry present — a dir, or a file for worktrees). Without this, a
+        # wheel under site-packages nested inside some unrelated repo would
+        # report THAT repo's SHA.
+        if not os.path.exists(os.path.join(repo_root, ".git")):
+            return "unknown"
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             cwd=repo_root,
@@ -115,9 +121,26 @@ def _detect_git_sha() -> str:
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        pass
+        logger.debug(
+            "git SHA detection: rev-parse rc=%s stderr=%s",
+            result.returncode, result.stderr.strip(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("git SHA detection failed: %s", exc)
     return "unknown"
+
+
+def _redact_home(path: str) -> str:
+    """Replace the home-directory prefix with ``~`` in operator-facing paths.
+
+    The admin surface is unauthenticated by default (ADR-006 bearer auth
+    pending); absolute paths would disclose the username and filesystem
+    layout to anything that can reach the port.
+    """
+    home = os.path.expanduser("~")
+    if home and path.startswith(home):
+        return "~" + path[len(home):]
+    return path
 
 
 _GIT_SHA: str = _detect_git_sha()
@@ -818,6 +841,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
             queue_depth=_queue.total_size if _queue else 0,
             queue_by_model=_queue.queue_depth_by_model() if _queue else {},
             loaded_models=loaded,
+            vram_state="unknown" if loaded_raw is None else "ok",
             gpu=gpu,
             current_model=_scheduler.current_model if _scheduler else None,
             total_requests_served=_proxy._requests_served if _proxy else 0,
@@ -1276,13 +1300,17 @@ def create_app(config: BrokerConfig) -> FastAPI:
         snapshot_ts = time.time()
         loaded_raw = await _vram_tracker.get_loaded_models() if _vram_tracker else []
         loaded = loaded_raw if loaded_raw is not None else []
-        loaded_by_name = {m.name: m for m in loaded}
+        # Tag-aware residency: /api/ps reports 'name:latest' for untagged
+        # registry keys — normalize the implicit tag on both sides so a
+        # resident model isn't shown as not-loaded under a tag mismatch.
+        loaded_norm = {m.name.removesuffix(":latest"): m for m in loaded}
         snapshot_age_s = max(0.0, time.time() - snapshot_ts)
         current = _scheduler.current_model if _scheduler else None
 
         entries: list[CatalogEntry] = []
         for name, info in config.models.items():
-            is_loaded = name in loaded_by_name
+            resident = loaded_norm.get(name.removesuffix(":latest"))
+            is_loaded = resident is not None
             entries.append(CatalogEntry(
                 name=name,
                 vram_gb=info.vram_gb,
@@ -1290,7 +1318,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
                 tags=list(info.tags),
                 always_allowed=info.always_allowed,
                 currently_loaded=is_loaded,
-                actual_vram_gb=loaded_by_name[name].vram_gb if is_loaded else None,
+                actual_vram_gb=resident.vram_gb if resident is not None else None,
                 is_evictable=(
                     is_loaded
                     and name != current
@@ -1303,8 +1331,12 @@ def create_app(config: BrokerConfig) -> FastAPI:
             total=len(entries),
             loaded_count=sum(1 for e in entries if e.currently_loaded),
             evictable_count=sum(1 for e in entries if e.is_evictable),
-            registry_source=str(config.loaded_from) if config.loaded_from else "<unknown>",
+            registry_source=(
+                _redact_home(str(config.loaded_from))
+                if config.loaded_from else "<unknown>"
+            ),
             snapshot_age_s=snapshot_age_s,
+            residency_state="unknown" if loaded_raw is None else "ok",
         )
 
     # ── A2A Interface Routes ────────────────────────────────────────
@@ -1675,6 +1707,7 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
             queue_depth=_queue.total_size if _queue else 0,
             queue_by_model=_queue.queue_depth_by_model() if _queue else {},
             loaded_models=loaded,
+            vram_state="unknown" if loaded_raw is None else "ok",
             gpu=gpu,
             current_model=_scheduler.current_model if _scheduler else None,
             total_requests_served=_proxy._requests_served if _proxy else 0,
@@ -2075,13 +2108,17 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
         snapshot_ts = time.time()
         loaded_raw = await _vram_tracker.get_loaded_models() if _vram_tracker else []
         loaded = loaded_raw if loaded_raw is not None else []
-        loaded_by_name = {m.name: m for m in loaded}
+        # Tag-aware residency: /api/ps reports 'name:latest' for untagged
+        # registry keys — normalize the implicit tag on both sides so a
+        # resident model isn't shown as not-loaded under a tag mismatch.
+        loaded_norm = {m.name.removesuffix(":latest"): m for m in loaded}
         snapshot_age_s = max(0.0, time.time() - snapshot_ts)
         current = _scheduler.current_model if _scheduler else None
 
         entries: list[CatalogEntry] = []
         for name, info in config.models.items():
-            is_loaded = name in loaded_by_name
+            resident = loaded_norm.get(name.removesuffix(":latest"))
+            is_loaded = resident is not None
             entries.append(CatalogEntry(
                 name=name,
                 vram_gb=info.vram_gb,
@@ -2089,7 +2126,7 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
                 tags=list(info.tags),
                 always_allowed=info.always_allowed,
                 currently_loaded=is_loaded,
-                actual_vram_gb=loaded_by_name[name].vram_gb if is_loaded else None,
+                actual_vram_gb=resident.vram_gb if resident is not None else None,
                 is_evictable=(
                     is_loaded
                     and name != current
@@ -2102,8 +2139,12 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
             total=len(entries),
             loaded_count=sum(1 for e in entries if e.currently_loaded),
             evictable_count=sum(1 for e in entries if e.is_evictable),
-            registry_source=str(config.loaded_from) if config.loaded_from else "<unknown>",
+            registry_source=(
+                _redact_home(str(config.loaded_from))
+                if config.loaded_from else "<unknown>"
+            ),
             snapshot_age_s=snapshot_age_s,
+            residency_state="unknown" if loaded_raw is None else "ok",
         )
 
     # ── A2A Interface Routes ────────────────────────────────────────
