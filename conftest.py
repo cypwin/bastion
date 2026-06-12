@@ -37,3 +37,18 @@ def _neutralize_vram_backstop(request, monkeypatch):
         return
     monkeypatch.setattr("bastion.vram.get_vram_free_gb", AsyncMock(return_value=None))
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_bastion_data_dir(tmp_path, monkeypatch):
+    """Keep test writes (VRAM journal, audit log) out of the real data dir.
+
+    Unit tests drive the real ``VRAMTracker.log_vram_snapshot()``, which
+    appends to ``paths.vram_journal_path()`` — without this, fixture models
+    (alpha:7b, tracked:7b, …) end up in
+    ``~/.local/share/bastion/bastion-vram-journal.jsonl`` interleaved with
+    production broker records (observed 2026-06-12 during the council-test
+    investigation). ``BASTION_DATA_DIR`` is the documented override in
+    ``bastion.paths.data_dir()`` and is re-read on every call.
+    """
+    monkeypatch.setenv("BASTION_DATA_DIR", str(tmp_path / "bastion-data"))
