@@ -667,8 +667,20 @@ async def test_check_auto_fan_no_temp_no_action() -> None:
             set_fan.assert_not_called()
 
 
-async def test_check_auto_fan_triggers_at_high_temp() -> None:
-    """CPU >= 80C in idle state -> trigger 90% fan speed."""
+@pytest.mark.parametrize(
+    "temp,expected_speed",
+    [
+        (59.9, None),   # below the curve — stays on BIOS auto
+        (60.0, "30"),
+        (69.9, "30"),
+        (70.0, "50"),
+        (80.0, "90"),
+        (85.0, "90"),   # boundary: 100% only OVER 85C (operator spec)
+        (85.1, "100"),
+    ],
+)
+async def test_check_auto_fan_escalation_curve(temp, expected_speed) -> None:
+    """From idle, each curve band applies its speed (60/70/80/85+)."""
     with patch(
         "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
     ) as set_fan, patch(
@@ -676,15 +688,71 @@ async def test_check_auto_fan_triggers_at_high_temp() -> None:
     ):
         async with _mounted_dashboard() as (app, _pilot, _runner):
             app._auto_fan_enabled = True
-            app._auto_fan_state = "idle"
-            app._collector.read_cpu_temp = MagicMock(return_value=85.0)
+            app._collector.read_cpu_temp = MagicMock(return_value=temp)
+            app._check_auto_fan({})
+            if expected_speed is None:
+                set_fan.assert_not_called()
+                assert app._auto_fan_state == "idle"
+            else:
+                set_fan.assert_called_once_with(expected_speed)
+                assert app._auto_fan_speed == expected_speed
+                assert app._auto_fan_state == "cooling"
+
+
+async def test_check_auto_fan_escalates_from_lower_band() -> None:
+    """Already at 30%, temperature jumps into the 80C band -> 90%."""
+    with patch(
+        "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
+    ) as set_fan, patch(
+        "bastion.dashboard.app.fan_control_available", return_value=True
+    ):
+        async with _mounted_dashboard() as (app, _pilot, _runner):
+            app._auto_fan_enabled = True
+            app._auto_fan_speed = "30"
+            app._auto_fan_state = "cooling"
+            app._collector.read_cpu_temp = MagicMock(return_value=81.0)
             app._check_auto_fan({})
             set_fan.assert_called_once_with("90")
+            assert app._auto_fan_speed == "90"
+
+
+async def test_check_auto_fan_holds_band_within_hysteresis() -> None:
+    """At 90% (80C band), 76C is within the 5C hysteresis -> no change."""
+    with patch(
+        "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
+    ) as set_fan, patch(
+        "bastion.dashboard.app.fan_control_available", return_value=True
+    ):
+        async with _mounted_dashboard() as (app, _pilot, _runner):
+            app._auto_fan_enabled = True
+            app._auto_fan_speed = "90"
+            app._auto_fan_state = "cooling"
+            app._collector.read_cpu_temp = MagicMock(return_value=76.0)
+            app._check_auto_fan({})
+            set_fan.assert_not_called()
+            assert app._auto_fan_speed == "90"
+
+
+async def test_check_auto_fan_steps_down_past_hysteresis() -> None:
+    """At 90%, 74C (>5C below the 80C trigger) -> step down to 50%."""
+    with patch(
+        "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
+    ) as set_fan, patch(
+        "bastion.dashboard.app.fan_control_available", return_value=True
+    ):
+        async with _mounted_dashboard() as (app, _pilot, _runner):
+            app._auto_fan_enabled = True
+            app._auto_fan_speed = "90"
+            app._auto_fan_state = "cooling"
+            app._collector.read_cpu_temp = MagicMock(return_value=74.0)
+            app._check_auto_fan({})
+            set_fan.assert_called_once_with("50")
+            assert app._auto_fan_speed == "50"
             assert app._auto_fan_state == "cooling"
 
 
-async def test_check_auto_fan_resets_when_cool() -> None:
-    """CPU < 70C while cooling -> set fan auto and return to idle."""
+async def test_check_auto_fan_returns_to_bios_auto_when_cool() -> None:
+    """At 30% (60C band), 54C (>5C below 60) -> back to BIOS auto + idle."""
     with patch(
         "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
     ) as set_fan, patch(
@@ -692,10 +760,27 @@ async def test_check_auto_fan_resets_when_cool() -> None:
     ):
         async with _mounted_dashboard() as (app, _pilot, _runner):
             app._auto_fan_enabled = True
+            app._auto_fan_speed = "30"
             app._auto_fan_state = "cooling"
-            app._collector.read_cpu_temp = MagicMock(return_value=65.0)
+            app._collector.read_cpu_temp = MagicMock(return_value=54.0)
             app._check_auto_fan({})
             set_fan.assert_called_once_with("auto")
+            assert app._auto_fan_speed is None
+            assert app._auto_fan_state == "idle"
+
+
+async def test_check_auto_fan_failed_set_keeps_state() -> None:
+    """A failed set_fan_speed must not update the tracked speed/state."""
+    with patch(
+        "bastion.dashboard.app.set_fan_speed", return_value=(False, "err")
+    ), patch(
+        "bastion.dashboard.app.fan_control_available", return_value=True
+    ):
+        async with _mounted_dashboard() as (app, _pilot, _runner):
+            app._auto_fan_enabled = True
+            app._collector.read_cpu_temp = MagicMock(return_value=82.0)
+            app._check_auto_fan({})
+            assert app._auto_fan_speed is None  # retried next tick
             assert app._auto_fan_state == "idle"
 
 

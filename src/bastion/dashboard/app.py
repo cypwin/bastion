@@ -59,9 +59,24 @@ LAYOUT_MODES: set[str] = {"compact", "standard", "full"}
 # Auto-fan constants
 # ---------------------------------------------------------------------------
 
-_AUTO_FAN_TRIGGER_C = 80
-_AUTO_FAN_SPEED = "90"
-_AUTO_FAN_RESET_C = 70
+# Escalation curve (operator spec 2026-06-12): the top band is exclusive
+# ("over 85C"), the rest inclusive. Below 60C the fan returns to BIOS auto.
+# De-escalation waits until the temperature sits _AUTO_FAN_HYSTERESIS_C below
+# the hotter band's trigger, so boundary hovering doesn't oscillate the fan.
+_AUTO_FAN_HYSTERESIS_C = 5.0
+
+
+def _fan_band(temp_c: float) -> str | None:
+    """Target fan speed (in %) for ``temp_c``; ``None`` means BIOS auto."""
+    if temp_c > 85.0:
+        return "100"
+    if temp_c >= 80.0:
+        return "90"
+    if temp_c >= 70.0:
+        return "50"
+    if temp_c >= 60.0:
+        return "30"
+    return None
 
 
 class BastionDashboard(App):
@@ -156,7 +171,8 @@ class BastionDashboard(App):
 
         # Auto-fan state
         self._auto_fan_enabled: bool = False
-        self._auto_fan_state: str = "idle"  # idle | triggered | cooling
+        self._auto_fan_state: str = "idle"  # idle | cooling
+        self._auto_fan_speed: str | None = None  # applied curve speed, None = BIOS auto
 
         # Secondary panel toggle
         self._show_secondary: bool = False
@@ -614,7 +630,13 @@ class BastionDashboard(App):
     # ------------------------------------------------------------------
 
     def _check_auto_fan(self, data: dict[str, Any]) -> None:
-        """Check CPU temperature and trigger fan speed escalation if needed."""
+        """Walk the fan along the escalation curve from the CPU temperature.
+
+        Escalates immediately when the temperature enters a hotter band
+        (60→30%, 70→50%, 80→90%, >85→100%); de-escalates — eventually back
+        to BIOS auto — only once the temperature sits
+        ``_AUTO_FAN_HYSTERESIS_C`` below the applied band's trigger.
+        """
         if not self._auto_fan_enabled or not fan_control_available():
             return
 
@@ -622,15 +644,28 @@ class BastionDashboard(App):
         if cpu_temp is None:
             return
 
-        if self._auto_fan_state == "idle" and cpu_temp >= _AUTO_FAN_TRIGGER_C:
-            self._auto_fan_state = "triggered"
-            success, _msg = set_fan_speed(_AUTO_FAN_SPEED)
-            if success:
-                self._auto_fan_state = "cooling"
-        elif self._auto_fan_state == "cooling" and cpu_temp < _AUTO_FAN_RESET_C:
-            success, _msg = set_fan_speed("auto")
-            if success:
-                self._auto_fan_state = "idle"
+        applied = self._auto_fan_speed
+        target_up = _fan_band(cpu_temp)
+        # Evaluated as if the temperature were hotter by the hysteresis
+        # margin: only when even THIS lands in a lower band has the
+        # temperature genuinely left the applied band.
+        target_down = _fan_band(cpu_temp + _AUTO_FAN_HYSTERESIS_C)
+
+        if applied is None:
+            if target_up is not None:
+                self._apply_auto_fan(target_up)
+        elif target_up is not None and int(target_up) > int(applied):
+            self._apply_auto_fan(target_up)
+        elif (0 if target_down is None else int(target_down)) < int(applied):
+            self._apply_auto_fan(target_down)
+
+    def _apply_auto_fan(self, speed: str | None) -> None:
+        """Set the fan to ``speed`` (None = BIOS auto) and track the state."""
+        success, _msg = set_fan_speed(speed if speed is not None else "auto")
+        if not success:
+            return
+        self._auto_fan_speed = speed
+        self._auto_fan_state = "idle" if speed is None else "cooling"
 
     # ------------------------------------------------------------------
     # Action methods
@@ -726,6 +761,7 @@ class BastionDashboard(App):
                 self._auto_fan_enabled = not self._auto_fan_enabled
                 if not self._auto_fan_enabled:
                     self._auto_fan_state = "idle"
+                    self._auto_fan_speed = None
                 return
             success, msg = set_fan_speed(speed)
             if not success:
