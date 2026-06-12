@@ -344,6 +344,43 @@ class TestStateMachineInvalidTransitions:
         assert handler._safe_transition(record.task_id, A2ATaskState.CANCELED) is False
 
     @pytest.mark.asyncio
+    async def test_invalid_transition_logs_warning(
+        self, handler: A2AHandler, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An invalid transition on a LIVE task signals a state-machine race —
+        it must be visible without DEBUG logging enabled (WARNING, not DEBUG)."""
+        import logging
+
+        record = _make_record(task_id="loglevel-001")
+        handler._store.create(record)
+        with caplog.at_level(logging.DEBUG, logger="bastion.a2a"):
+            # SUBMITTED -> COMPLETED is not a legal transition (ValueError)
+            assert (
+                handler._safe_transition(record.task_id, A2ATaskState.COMPLETED)
+                is False
+            )
+        hits = [r for r in caplog.records if "loglevel-001" in r.getMessage()]
+        assert hits, "invalid transition produced no log record"
+        assert hits[0].levelno == logging.WARNING
+
+    @pytest.mark.asyncio
+    async def test_already_compacted_transition_logs_debug(
+        self, handler: A2AHandler, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The KeyError branch (already compacted/unknown) is expected churn
+        and stays at DEBUG."""
+        import logging
+
+        with caplog.at_level(logging.DEBUG, logger="bastion.a2a"):
+            assert (
+                handler._safe_transition("ghost-task", A2ATaskState.WORKING)
+                is False
+            )
+        hits = [r for r in caplog.records if "ghost-task" in r.getMessage()]
+        assert hits, "compacted-task transition produced no log record"
+        assert hits[0].levelno == logging.DEBUG
+
+    @pytest.mark.asyncio
     async def test_canceled_to_anything_rejected(self, handler: A2AHandler) -> None:
         record = _make_record(task_id="inv-003")
         handler._store.create(record)
