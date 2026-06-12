@@ -1798,14 +1798,26 @@ class TestCouncilConcurrentDispatch:
                 ]
                 # If VRAMMonitor detected a model swap (loaded_models changed),
                 # it logged a "model_swap_detected" event. Check that council
-                # models were never removed.
-                for sample in monitor.samples:
-                    sample_models = set(sample.get("loaded_models", []))
-                    for model in council:
-                        assert model in sample_models, (
-                            f"Council model {model} disappeared during inference — "
-                            f"unexpected swap detected. Loaded: {sample_models}"
-                        )
+                # models were never removed. Debounced: under concurrent
+                # inference Ollama's /api/ps transiently omits a busy model
+                # for a single poll (observed 2026-06-12: granite missing from
+                # one 0.5s sample while its requests completed warm at 0.08s),
+                # so only TWO consecutive missing samples count as a real
+                # eviction — an actual unload+reload stays absent for many
+                # seconds at this polling interval.
+                for model in council:
+                    missing_run = max_missing_run = 0
+                    for sample in monitor.samples:
+                        if model in set(sample.get("loaded_models", [])):
+                            missing_run = 0
+                        else:
+                            missing_run += 1
+                            max_missing_run = max(max_missing_run, missing_run)
+                    assert max_missing_run < 2, (
+                        f"Council model {model} missing from {max_missing_run} "
+                        f"consecutive residency samples — real eviction during "
+                        f"inference detected."
+                    )
 
                 # Wall time should indicate concurrency.
                 # With 3 models × 3 requests each = 9 requests.
