@@ -5,7 +5,9 @@ All notable changes to BASTION are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — targeting v0.4.1
+## [Unreleased]
+
+## [0.4.1] - 2026-06-12
 
 ### Added
 - `GET /broker/latency` — per-model latency percentiles (p50/p95/p99 for end-to-end duration and queue-wait) over a rolling window. Query param `window_s` (default 300, clamped `[10, 3600]`). Aggregation logic factored into `bastion.latency_aggregator.aggregate_latency` and unit-tested independently. Models with fewer than 3 samples in the window are omitted from `per_model`; the `overall` bucket aggregates all in-window samples.
@@ -34,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Dashboard auto-fan trigger is now a four-band escalation curve with a GPU-safe floor** (was a single 80 °C → 90 % trigger with 70 °C reset). The CPU temperature engages and releases the override: 60 °C → 30 %, 70 °C → 50 %, 80 °C → 90 %, over 85 °C → 100 %, back to BIOS auto below the curve; escalation is immediate, de-escalation applies 5 °C hysteresis per band. Because a manual override suspends the GPU's own VBIOS fan curve (`GPUFanControlState=1`), the **GPU temperature acts as a floor while the override is active** — the applied duty is never below what the GPU's band demands, so a CPU-derived 30 % can no longer undercool a hot GPU. Releasing to auto hands control straight back to the firmware curve. The fan modal shows the curve and the currently applied band.
 - Dashboard Alerts panel now shows the raise time (HH:MM:SS) per alert.
 - **Request source attribution.** `/broker/recent` samples and the dashboard Request Trace gain a `source` field/column: the client's declared `X-Agent-ID` header when present, else the User-Agent product token (`ollama/0.5.1` → `ollama`), else `-`. Declared identity only — no process-level sniffing.
+- E2e stress suite (`tests/test_e2e_stress.py`) is now opt-in via `BASTION_E2E=1`. The suite evicts every loaded model from the broker it targets; the gate makes a plain `pytest tests/` incapable of hitting a production instance by accident.
 
 ### Fixed
 - Thrashing **warn** verdict on a request without complexity routing no longer breaks the request: `routing_meta` carrying only `_thrashing_warn` raised `KeyError` in response-header construction and audit emission (surfaced as a proxy error instead of the advisory `X-Swap-Penalty-Warning` header).
