@@ -1430,7 +1430,12 @@ def create_app(config: BrokerConfig) -> FastAPI:
 
         success = await _a2a_handler.cancel_task(task_id)
         if not success:
-            return JSONResponse({"error": "Task not found or not cancelable"}, status_code=404)
+            if _a2a_handler.is_task_terminal(task_id):
+                return JSONResponse(
+                    {"error": "Task already in terminal state (not cancelable)"},
+                    status_code=409,
+                )
+            return JSONResponse({"error": "Task not found"}, status_code=404)
         return {"status": "canceled", "task_id": task_id}
 
     # ── Lease Management (Hybrid Lease Model) ───────────────────────
@@ -2228,7 +2233,12 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
             return JSONResponse({"error": "A2A interface not enabled"}, status_code=501)
         success = await _a2a_handler.cancel_task(task_id)
         if not success:
-            return JSONResponse({"error": "Task not found or not cancelable"}, status_code=404)
+            if _a2a_handler.is_task_terminal(task_id):
+                return JSONResponse(
+                    {"error": "Task already in terminal state (not cancelable)"},
+                    status_code=409,
+                )
+            return JSONResponse({"error": "Task not found"}, status_code=404)
         return {"status": "canceled", "task_id": task_id}
 
     @a2a_router.post("/leases/{lease_id}/heartbeat")

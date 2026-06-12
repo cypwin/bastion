@@ -744,17 +744,33 @@ class TestA2AHttpSurface:
         assert resp.status_code == 404
         assert "not found" in resp.json()["error"].lower()
 
-    def test_delete_terminal_task_returns_404(
+    def test_delete_terminal_task_returns_409(
         self, a2a_app_client: tuple[TestClient, A2AHandler],
     ) -> None:
-        """Cancelling an already-completed task surfaces as 404 'not cancelable'."""
+        """Cancelling an already-terminal task is a conflict (409), not 404.
+
+        404 confuses client retry logic that treats it as "never existed";
+        the task *exists*, it just can't be canceled anymore.
+        """
         client, h = a2a_app_client
         rec = _make_record(task_id="http-003")
         h._store.create(rec)
         h._safe_transition(rec.task_id, A2ATaskState.WORKING)
         h._safe_transition(rec.task_id, A2ATaskState.COMPLETED)
         resp = client.delete(f"/a2a/tasks/{rec.task_id}")
-        assert resp.status_code == 404
+        assert resp.status_code == 409
+        assert "terminal" in resp.json()["error"].lower()
+
+    def test_delete_canceled_task_returns_409_idempotent_signal(
+        self, a2a_app_client: tuple[TestClient, A2AHandler],
+    ) -> None:
+        """A second DELETE on a just-canceled task gets 409, not 404."""
+        client, h = a2a_app_client
+        rec = _make_record(task_id="http-004", state=A2ATaskState.WORKING)
+        h._store.create(rec)
+        assert client.delete(f"/a2a/tasks/{rec.task_id}").status_code == 200
+        resp = client.delete(f"/a2a/tasks/{rec.task_id}")
+        assert resp.status_code == 409
 
     def test_a2a_stats_returns_store_summary(
         self, a2a_app_client: tuple[TestClient, A2AHandler],

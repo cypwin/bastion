@@ -362,6 +362,23 @@ class A2AHandler:
         logger.info("A2A task canceled: %s", task_id)
         return True
 
+    def is_task_terminal(self, task_id: str) -> bool:
+        """True if the task exists but is already in a terminal state.
+
+        Lets the DELETE route distinguish "already terminal" (409) from
+        "never existed / evicted" (404) after :meth:`cancel_task` returns
+        False. Tombstoned tasks report False — their state is gone, so
+        404 is the honest answer.
+        """
+        record = self._store.get_active(task_id)
+        if record is not None:
+            return record.state in (
+                A2ATaskState.COMPLETED,
+                A2ATaskState.FAILED,
+                A2ATaskState.CANCELED,
+            )
+        return isinstance(self._store.get(task_id), CompactedResult)
+
     async def subscribe_task(self, task_id: str, request: Any = None) -> AsyncGenerator[dict, None]:
         """SSE event generator for task status/artifact updates.
 
