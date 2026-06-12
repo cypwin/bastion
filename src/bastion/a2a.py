@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -146,6 +147,10 @@ class A2AHandler:
         # Hybrid leases (lease_id -> ModelLease) — upgrade from simple reservations
         self._leases: dict[str, ModelLease] = {}
         self._fencing_counter: int = 0
+        # Guards check-and-create atomicity (try_create_lease) and the
+        # fencing counter against threaded callers. RLock because
+        # try_create_lease calls create_lease while holding it.
+        self._lease_lock = threading.RLock()
 
         # Skill routing table
         self._skill_handlers: dict[str, Callable] = {
@@ -1509,21 +1514,61 @@ class A2AHandler:
         -------
         ModelLease
             The newly created lease with a unique fencing token.
+
+        Notes
+        -----
+        Creates unconditionally — multiple leases per model are allowed.
+        Callers wanting single-grant-per-model semantics must use
+        :meth:`try_create_lease`; checking :meth:`has_active_lease` first
+        is a TOCTOU race.
         """
-        lease = ModelLease(
-            model=model,
-            max_requests=max_requests,
-            remaining_requests=max_requests,
-            expiry=time.monotonic() + ttl_seconds,
-            idle_timeout=idle_timeout,
-            fencing_token=self._next_fencing_token(),
-        )
-        self._leases[lease.lease_id] = lease
+        with self._lease_lock:
+            lease = ModelLease(
+                model=model,
+                max_requests=max_requests,
+                remaining_requests=max_requests,
+                expiry=time.monotonic() + ttl_seconds,
+                idle_timeout=idle_timeout,
+                fencing_token=self._next_fencing_token(),
+            )
+            self._leases[lease.lease_id] = lease
         logger.info(
             "Lease created: %s model=%s requests=%d ttl=%.0fs idle=%.0fs token=%d",
             lease.lease_id, model, max_requests, ttl_seconds, idle_timeout, lease.fencing_token,
         )
         return lease
+
+    def try_create_lease(
+        self,
+        model: str,
+        max_requests: int = 100,
+        ttl_seconds: float = 600.0,
+        idle_timeout: float = 60.0,
+    ) -> ModelLease | None:
+        """Atomically create a lease iff no active lease exists for the model.
+
+        Closes the TOCTOU window in the
+        ``if not has_active_lease(model): create_lease(model)`` pattern:
+        the check and the create happen under the same lock, so two
+        concurrent acquirers can never both be granted.
+
+        Parameters are identical to :meth:`create_lease`.
+
+        Returns
+        -------
+        ModelLease | None
+            The new lease, or ``None`` if an active lease already holds
+            the model (the caller lost the race or arrived late).
+        """
+        with self._lease_lock:
+            if self.has_active_lease(model):
+                return None
+            return self.create_lease(
+                model=model,
+                max_requests=max_requests,
+                ttl_seconds=ttl_seconds,
+                idle_timeout=idle_timeout,
+            )
 
     def validate_lease(self, lease_id: str, fencing_token: int) -> tuple[bool, str]:
         """Validate a lease is active and fencing token matches.
@@ -1593,11 +1638,12 @@ class A2AHandler:
         bool
             True if an active lease exists, False otherwise.
         """
-        for lease in self._leases.values():
-            should_release, _ = lease.should_release()
-            if lease.model == model and not should_release:
-                return True
-        return False
+        with self._lease_lock:
+            for lease in self._leases.values():
+                should_release, _ = lease.should_release()
+                if lease.model == model and not should_release:
+                    return True
+            return False
 
     def get_snapshot(self, max_tasks: int = 5, max_leases: int = 5) -> dict:
         """Return a compact snapshot of current A2A state for dashboards.
