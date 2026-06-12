@@ -310,6 +310,17 @@ class AuditLogger:
 # Global audit logger instance
 _audit_logger: Any = None  # AuditLogger | PersistentAuditLog | None at runtime
 
+# Ring buffer for events emitted before init_audit_logger() — flushed on
+# init so startup-ordering bugs leave a trace instead of vanishing.
+# Flushed events carry flush-time timestamps (startup window is sub-second).
+_PREINIT_BUFFER_MAX = 256
+_preinit_events: deque[tuple[str, dict[str, Any]]] = deque(maxlen=_PREINIT_BUFFER_MAX)
+
+# Deliberately NOT logging.getLogger(__name__): "bastion.audit" is the JSONL
+# audit logger's name (propagate=False, file handler) — a child logger would
+# propagate warnings into the audit file itself.
+_module_logger = logging.getLogger("bastion.audit_bootstrap")
+
 
 def init_audit_logger(
     log_path: str | None = None,
@@ -335,6 +346,14 @@ def init_audit_logger(
     """
     global _audit_logger
     _audit_logger = AuditLogger(log_path, max_bytes, backup_count, tier=tier)
+    if _preinit_events:
+        flushed = len(_preinit_events)
+        while _preinit_events:
+            event, details = _preinit_events.popleft()
+            _audit_logger.emit(event, details)
+        _module_logger.info(
+            "Flushed %d audit event(s) buffered before init", flushed
+        )
 
 
 def emit(event: str, details: dict[str, Any]) -> None:
@@ -349,9 +368,21 @@ def emit(event: str, details: dict[str, Any]) -> None:
         Event type (swap, vram_alert, queue_change, request_complete).
     details : dict
         Event-specific data.
+
+    Notes
+    -----
+    Before :func:`init_audit_logger` runs, events are held in a bounded
+    ring buffer (and a WARNING is logged) rather than silently dropped;
+    they flush to the audit log on init.
     """
     if _audit_logger is not None:
         _audit_logger.emit(event, details)
+        return
+    _preinit_events.append((event, details))
+    _module_logger.warning(
+        "audit.emit('%s') before init_audit_logger — buffered (%d pending, max %d)",
+        event, len(_preinit_events), _PREINIT_BUFFER_MAX,
+    )
 
 
 def emit_tiered(

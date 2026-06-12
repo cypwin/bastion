@@ -313,11 +313,18 @@ def task_record_factory():
 
 @pytest.fixture(autouse=True)
 def _isolate_audit_logger():
-    """Reset global audit logger between tests to prevent cross-contamination."""
+    """Reset global audit logger between tests to prevent cross-contamination.
+
+    Also clears the pre-init ring buffer so events emitted by a test without
+    an initialized logger don't flush into another test's init_audit_logger
+    call and break its line-count assertions.
+    """
     import bastion.audit
     original = bastion.audit._audit_logger
+    bastion.audit._preinit_events.clear()
     yield
     bastion.audit._audit_logger = original
+    bastion.audit._preinit_events.clear()
 
 
 @pytest.fixture(autouse=True)
