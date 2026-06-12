@@ -196,6 +196,80 @@ class TestGPUGating:
         assert len(log) == 0
 
 
+class TestGPUGatingMidSwap:
+    """The GPU-hot gate must be re-checked inside the swap path.
+
+    The top-of-tick check_gpu_safe happens many awaits before the actual
+    swap dispatch (eviction, VRAM reservation). A GPU that transitions hot
+    in that window must abort the swap — exactly the load-cycle BASTION
+    exists to prevent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_swap_aborts_when_gpu_hot_at_dispatch_time(
+        self, sched_config, dispatch_log,
+    ):
+        """_handle_swap_dispatch with a hot GPU must not dispatch."""
+        log, dispatch_fn = dispatch_log
+        queue = AffinityQueue(sched_config.scheduler)
+        tracker = VRAMTracker(sched_config)
+
+        queue.enqueue(make_request(model="qwen3:14b"))
+
+        with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=[]), \
+             patch(
+                 "bastion.scheduler.check_gpu_safe",
+                 AsyncMock(return_value=(False, "GPU too hot (mid-swap)")),
+             ), \
+             patch.object(
+                 tracker, "can_load_model",
+                 new_callable=AsyncMock, return_value=(True, "OK"),
+             ), \
+             patch.object(tracker, "log_vram_snapshot", new_callable=AsyncMock), \
+             patch.object(tracker, "get_loaded_vram_gb", new_callable=AsyncMock, return_value=0.0):
+            sched = Scheduler(sched_config, queue, tracker, dispatch_fn)
+            sched._last_swap_time = 0.0
+
+            candidate = queue.pick_next(None)
+            result = await sched._handle_swap_dispatch(candidate)
+
+        assert result is False
+        assert len(log) == 0
+        assert sched.total_swaps == 0
+
+    @pytest.mark.asyncio
+    async def test_swap_abort_releases_vram_reservation(self, sched_config, dispatch_log):
+        """A reservation made before the GPU went hot must be released on abort."""
+        log, dispatch_fn = dispatch_log
+        queue = AffinityQueue(sched_config.scheduler)
+        tracker = VRAMTracker(sched_config)
+        mgr = VRAMManager(tracker, 32 * 1024 * 1024 * 1024, safety_margin_pct=10.0)
+
+        queue.enqueue(make_request(model="qwen3:14b"))
+
+        with patch.object(tracker, "get_loaded_models", new_callable=AsyncMock, return_value=[]), \
+             patch(
+                 "bastion.scheduler.check_gpu_safe",
+                 AsyncMock(return_value=(False, "GPU too hot (mid-swap)")),
+             ), \
+             patch.object(
+                 tracker, "can_load_model",
+                 new_callable=AsyncMock, return_value=(True, "OK"),
+             ), \
+             patch.object(tracker, "log_vram_snapshot", new_callable=AsyncMock), \
+             patch.object(tracker, "get_loaded_vram_gb", new_callable=AsyncMock, return_value=0.0):
+            sched = Scheduler(sched_config, queue, tracker, dispatch_fn, vram_manager=mgr)
+            sched._last_swap_time = 0.0
+
+            candidate = queue.pick_next(None)
+            result = await sched._handle_swap_dispatch(candidate)
+
+        assert result is False
+        assert len(log) == 0
+        assert mgr.reserved_bytes == 0
+        assert mgr.allocated_bytes == 0
+
+
 class TestDrainMode:
     @pytest.mark.asyncio
     async def test_drain_mode(self, sched_config, dispatch_log):
@@ -564,6 +638,13 @@ class TestSwapCooldown:
 
 class TestHandleSwapDispatch:
     """Tests for _handle_swap_dispatch() VRAM reservation path."""
+
+    @pytest.fixture(autouse=True)
+    def _gpu_safe(self):
+        """Pin the mid-swap GPU gate safe — these tests target the
+        reservation lifecycle, not GPU gating (see TestGPUGatingMidSwap)."""
+        with patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))):
+            yield
 
     @pytest.fixture
     def swap_config(self) -> BrokerConfig:

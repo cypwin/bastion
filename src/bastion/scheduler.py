@@ -554,6 +554,18 @@ class Scheduler:
                 if not freed:
                     return False
 
+        # Re-check GPU health immediately before the swap. The top-of-tick
+        # gate ran many awaits ago (cooldown wait, eviction, VRAM
+        # reservation); a GPU that transitioned hot in that window must
+        # abort here — loading a model onto a hot GPU is exactly the
+        # crash cycle BASTION exists to prevent.
+        gpu_safe, gpu_reason = await check_gpu_safe(self.config.gpu)
+        if not gpu_safe:
+            logger.warning("Swap aborted — GPU unsafe at dispatch time: %s", gpu_reason)
+            if self.vram_manager is not None and reservation is not None:
+                await self.vram_manager.release(reservation)
+            return False
+
         # Perform the swap (serialized through load semaphore if VRAMManager available)
         logger.info(
             "Model swap: %s -> %s (queue depth for new: %d)",
