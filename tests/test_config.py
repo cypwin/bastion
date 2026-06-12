@@ -112,3 +112,18 @@ class TestLoadConfig:
         assert len(config.models) >= 10
         assert config.gpu.max_vram_gb > 0  # total - headroom must be positive
         assert config.request_overrides.use_mmap is False
+
+
+class TestLoadedFrom:
+    def test_load_config_records_resolved_source_path(self, tmp_path):
+        """/broker/catalog's registry_source depends on this being populated."""
+        path = tmp_path / "broker.yaml"
+        path.write_text(yaml.dump({"models": {"m:7b": {"vram_gb": 5.0}}}))
+        config = load_config(path)
+        assert config.loaded_from == path.resolve()
+
+    def test_default_config_has_no_source_path(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)  # ensure no broker.yaml is discovered
+        monkeypatch.delenv("BASTION_CONFIG", raising=False)
+        config = load_config(None)
+        assert config.loaded_from is None
