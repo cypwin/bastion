@@ -294,3 +294,33 @@ class TestBackstopFailOpenObservability:
                 admits, free = await _hardware_admits(9 * GB)
         assert admits is True and free is None
         assert any("failing open" in r.message for r in caplog.records)
+
+
+class TestReconcileAuditEvents:
+    @pytest.mark.asyncio
+    async def test_import_emits_vram_import_audit_event(self, manager):
+        manager._tracker.residency_cache.get_resident_loaded_models = AsyncMock(
+            return_value=[_lm("ext:13b", 9.0)]
+        )
+        events: list[tuple[str, dict]] = []
+        with patch(
+            "bastion.vram.audit.emit",
+            side_effect=lambda name, details: events.append((name, details)),
+        ):
+            await manager.reconcile({"ext:13b"})
+
+        imports = [d for n, d in events if n == "vram_import"]
+        assert len(imports) == 1
+        assert imports[0]["imported_models"] == ["ext:13b"]
+        assert imports[0]["imported_bytes"] == 9 * GB
+
+    @pytest.mark.asyncio
+    async def test_no_audit_event_when_nothing_imported(self, manager):
+        events: list[tuple[str, dict]] = []
+        with patch(
+            "bastion.vram.audit.emit",
+            side_effect=lambda name, details: events.append((name, details)),
+        ):
+            await manager.reconcile(set())
+
+        assert [n for n, _ in events if n == "vram_import"] == []

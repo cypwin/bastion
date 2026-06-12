@@ -713,3 +713,31 @@ class TestRootAndAgentCard:
         assert "name" in body
         assert "version" in body
         assert "skills" in body
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /broker/status — VRAM state-unknown coercion + indicator (S130)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestBrokerStatusVramState:
+    def test_vram_state_ok_on_live_read(self, app_with_stub_scheduler) -> None:
+        data = app_with_stub_scheduler.get("/broker/status").json()
+        assert data["vram_state"] == "ok"
+
+    def test_none_sentinel_coerces_to_empty_list_with_unknown_state(
+        self, app_with_stub_scheduler
+    ) -> None:
+        """During an Ollama outage the status contract (loaded_models: list)
+        holds, and vram_state='unknown' marks the list as a placeholder."""
+        from unittest.mock import AsyncMock
+
+        client = app_with_stub_scheduler
+        client.app.state.stubs.vram_tracker.get_loaded_models = AsyncMock(
+            return_value=None
+        )
+        resp = client.get("/broker/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["loaded_models"] == []
+        assert data["vram_state"] == "unknown"

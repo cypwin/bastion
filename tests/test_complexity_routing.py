@@ -514,3 +514,115 @@ class TestThrashingIntegration:
         assert len(complete) == 1
         assert complete[0]["routing_applied"] is False
         assert "model_requested" not in complete[0]
+
+
+class TestStreamingResponseHeaders:
+    """Streaming-path copy of the header construction (S130 gap closure)."""
+
+    class _FakeStream:
+        def __init__(self):
+            self.status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def aiter_bytes(self):
+            yield b'{"done": true}\n'
+
+    @pytest.mark.asyncio
+    async def test_thrashing_warn_only_meta_does_not_error_streaming(self):
+        """Regression (streaming twin of the non-streaming test): routing_meta
+        carrying only _thrashing_warn must not KeyError in _stream_response's
+        header construction."""
+        proxy = OllamaProxy(BrokerConfig())
+        proxy._http = MagicMock()
+        proxy._http.stream = MagicMock(return_value=self._FakeStream())
+
+        req = _make_request(
+            body={"model": "qwen3:14b", "prompt": "t", "stream": True},
+            headers={"user-agent": "test"},
+        )
+        result = await proxy._stream_response(
+            req, "http://localhost:11435/api/generate",
+            json.dumps({"model": "qwen3:14b", "prompt": "t"}).encode(),
+            model="qwen3:14b", path="/api/generate", tier=PriorityTier.AGENT,
+            routing_meta={"_thrashing_warn": "swap_ratio=0.83"},
+        )
+        assert result.headers.get("X-Swap-Penalty-Warning") == "swap_ratio=0.83"
+        assert "X-Model-Requested" not in result.headers
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_surfaces_in_streaming_headers(self):
+        proxy = OllamaProxy(BrokerConfig())
+        proxy._http = MagicMock()
+        proxy._http.stream = MagicMock(return_value=self._FakeStream())
+
+        req = _make_request(
+            body={"model": "qwen3:14b", "prompt": "t", "stream": True},
+            headers={"user-agent": "test"},
+        )
+        result = await proxy._stream_response(
+            req, "http://localhost:11435/api/generate",
+            json.dumps({"model": "qwen3:14b", "prompt": "t"}).encode(),
+            model="qwen3:14b", path="/api/generate", tier=PriorityTier.AGENT,
+            routing_meta={
+                "requested": "qwen3:14b",
+                "routed": "qwen3:14b",
+                "reason": "complexity-simple-skipped-explicit-model",
+            },
+        )
+        assert result.headers.get("X-Routing-Reason") == (
+            "complexity-simple-skipped-explicit-model"
+        )
+
+
+class TestSkippedRouteAudit:
+    """requested == routed must audit routing_applied=False with skip reason."""
+
+    @pytest.mark.asyncio
+    async def test_skipped_route_audits_not_applied(self):
+        config = BrokerConfig(
+            complexity_routing=ComplexityRoutingConfig(
+                enabled=True,
+                routes={"simple": "qwen3.5:9b"},
+                override_explicit=False,
+            ),
+            models={
+                "qwen3.5:9b": ModelInfo(vram_gb=8.1),
+                "qwen3:14b": ModelInfo(vram_gb=9.8),
+            },
+        )
+
+        async def grant(req):
+            event = asyncio.Event()
+            event.set()
+            return event, lambda: None, lambda: None
+
+        proxy = OllamaProxy(config, enqueue_fn=grant)
+        proxy._forward_response = AsyncMock(
+            return_value=MagicMock(status_code=200)
+        )
+
+        from unittest.mock import patch
+
+        events: list[tuple[str, dict]] = []
+        with patch(
+            "bastion.proxy.audit.emit",
+            side_effect=lambda name, details: events.append((name, details)),
+        ):
+            req = _make_request(
+                body={"model": "qwen3:14b", "prompt": "classify",
+                      "stream": False},
+                headers={"user-agent": "test", "x-task-complexity": "simple"},
+            )
+            await proxy._handle_scheduled(req, "/api/generate", await req.body())
+
+        completes = [d for n, d in events if n == "request_complete"]
+        assert len(completes) == 1
+        d = completes[0]
+        assert d["routing_reason"] == "complexity-simple-skipped-explicit-model"
+        assert d["routing_applied"] is False
+        assert d["model_requested"] == d["model_routed"] == "qwen3:14b"
