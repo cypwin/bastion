@@ -799,7 +799,6 @@ class VRAMManager:
         """
         if loaded_model_names is None:
             return 0
-        self._reclaim_expired_sync()
 
         # Sizes for import — only fetched when there could be something to
         # import (an empty residency set can never import, so skip the lookup).
@@ -809,6 +808,10 @@ class VRAMManager:
             sizes = {m.name: m.vram_gb for m in (loaded_list or [])}
 
         async with self._lock:
+            # Reclaim INSIDE the lock — same discipline as reserve() (C2 fix):
+            # an unlocked reclaim can double-free against a concurrent locked
+            # reclaimer, double-decrementing _reserved.
+            self._reclaim_expired_sync()
             reserved_models = {r.model for r in self._reservations.values()}
 
             # Removal: drop allocations for models Ollama no longer reports.
@@ -897,9 +900,14 @@ class VRAMManager:
         logger.warning("VRAM convergence timed out after %.1fs", timeout)
         return False
 
-    def status(self) -> dict:
+    async def status(self) -> dict:
         """Return ledger status for monitoring."""
-        self._reclaim_expired_sync()  # Clean up on every status poll
+        async with self._lock:
+            self._reclaim_expired_sync()  # Clean up on every status poll
+            return self._status_snapshot_locked()
+
+    def _status_snapshot_locked(self) -> dict:
+        """Build the status dict. Caller must hold ``self._lock``."""
         return {
             "total_bytes": self._total,
             "safety_margin_bytes": self._safety_margin,
