@@ -190,3 +190,65 @@ class TestCatalogEndpointRegistrySource:
         client = app_with_stub_scheduler
         body = client.get("/broker/catalog").json()
         assert body["registry_source"] == "<unknown>"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S130 review fixes: residency_state, tag-aware lookup, home redaction
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestCatalogResidencyState:
+    """State-unknown must be distinguishable from genuinely-nothing-loaded."""
+
+    def test_residency_state_ok_on_live_read(self, app_with_stub_scheduler) -> None:
+        body = app_with_stub_scheduler.get("/broker/catalog").json()
+        assert body["residency_state"] == "ok"
+
+    def test_residency_state_unknown_when_tracker_returns_none(
+        self, app_with_stub_scheduler
+    ) -> None:
+        client = app_with_stub_scheduler
+        client.app.state.stubs.vram_tracker.get_loaded_models = AsyncMock(
+            return_value=None
+        )
+        body = client.get("/broker/catalog").json()
+        assert body["residency_state"] == "unknown"
+        assert body["loaded_count"] == 0  # placeholder, flagged by the state
+
+
+class TestCatalogTagAwareResidency:
+    def test_latest_tagged_resident_matches_untagged_registry_key(
+        self, app_with_stub_scheduler
+    ) -> None:
+        """/api/ps reports 'nomic-embed-text:latest'; the registry key is
+        untagged — the entry must still show as loaded."""
+        client = app_with_stub_scheduler
+        client.app.state.stubs.vram_tracker.get_loaded_models = AsyncMock(
+            return_value=[
+                LoadedModel(
+                    name="nomic-embed-text:latest",
+                    size_bytes=4 * 10**8,
+                    vram_gb=0.4,
+                ),
+            ]
+        )
+        body = client.get("/broker/catalog").json()
+        entry = {e["name"]: e for e in body["models"]}["nomic-embed-text"]
+        assert entry["currently_loaded"] is True
+        assert entry["actual_vram_gb"] == 0.4
+        assert body["loaded_count"] == 1
+
+
+class TestRedactHome:
+    def test_home_prefix_replaced_with_tilde(self) -> None:
+        import os
+
+        home = os.path.expanduser("~")
+        assert server_mod._redact_home(f"{home}/proj/broker.yaml") == (
+            "~/proj/broker.yaml"
+        )
+
+    def test_non_home_path_unchanged(self) -> None:
+        assert server_mod._redact_home("/etc/bastion/broker.yaml") == (
+            "/etc/bastion/broker.yaml"
+        )
