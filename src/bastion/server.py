@@ -38,9 +38,9 @@ from bastion import audit
 from bastion.auth import make_a2a_token_dependency, make_admin_key_dependency
 from bastion.circuitbreaker import CircuitBreakerTransport
 from bastion.health import check_gpu_safe, query_gpu_status
+from bastion.latency_aggregator import aggregate_latency
 from bastion.metrics import CONTENT_TYPE_LATEST, PROMETHEUS_AVAILABLE, get_metrics_text
 from bastion.middleware import MetricsMiddleware
-from bastion.latency_aggregator import aggregate_latency
 from bastion.models import (
     BrokerCatalog,
     BrokerConfig,

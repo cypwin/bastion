@@ -97,9 +97,11 @@ class TestHardwareAdmits:
 class TestReserveBackstop:
     @pytest.mark.asyncio
     async def test_rejected_when_hardware_insufficient(self, manager):
-        with patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=5.0)):
-            with pytest.raises(ValueError, match="nvidia-smi backstop"):
-                await manager.reserve("ext:13b", 9 * GB)
+        with (
+            patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=5.0)),
+            pytest.raises(ValueError, match="nvidia-smi backstop"),
+        ):
+            await manager.reserve("ext:13b", 9 * GB)
         assert manager.reserved_bytes == 0
 
     @pytest.mark.asyncio
@@ -289,9 +291,11 @@ class TestResidencyStaleness:
 class TestBackstopFailOpenObservability:
     @pytest.mark.asyncio
     async def test_fail_open_logs_warning(self, caplog):
-        with patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=None)):
-            with caplog.at_level("WARNING", logger="bastion.vram"):
-                admits, free = await _hardware_admits(9 * GB)
+        with (
+            patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=None)),
+            caplog.at_level("WARNING", logger="bastion.vram"),
+        ):
+            admits, free = await _hardware_admits(9 * GB)
         assert admits is True and free is None
         assert any("failing open" in r.message for r in caplog.records)
 

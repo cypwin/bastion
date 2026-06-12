@@ -422,7 +422,9 @@ class VRAMTracker:
             required_free = model_vram + HARDWARE_MARGIN_GB
             await self.log_vram_snapshot("hard_gate_blocked", {
                 "model": model_name,
-                "free_gb": round(free_gb, 2),
+                # free_gb is non-None whenever hw_ok is False (fail-open
+                # returns True on a missing reading); guard for the type.
+                "free_gb": round(free_gb, 2) if free_gb is not None else None,
                 "required_free_gb": round(required_free, 2),
             })
             return False, (
