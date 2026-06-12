@@ -7,7 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `DELETE /a2a/tasks/{id}` on an already-terminal task now returns **409 Conflict** instead of 404 — 404 is reserved for tasks that never existed (or whose state was evicted). Client retry logic can now distinguish the two.
+- A2A invalid live-task state transitions are logged at WARNING (was DEBUG); the already-compacted case stays at DEBUG.
+- `audit.emit()` before `init_audit_logger()` buffers events in a bounded ring (256) with a WARNING and flushes them on init, instead of silently dropping them.
+
+### Added
+- `A2AHandler.try_create_lease(model, ...)` — atomic check-and-create for single-grant-per-model lease semantics (closes the `has_active_lease` → `create_lease` TOCTOU window). `create_lease` remains unconditional for multi-lease use.
+- Dashboard `BastionClient` logs failed admin-API GETs at DEBUG with endpoint and exception type (previously swallowed silently; empty panels were indistinguishable from outages).
+
 ### Fixed
+- `TaskStore.create` enforces its asyncio-single-loop contract: calls from a foreign thread raise `RuntimeError` instead of silently racing on the unlocked active store.
+- `VRAMManager.reconcile()` and `status()` reclaim expired reservations inside the ledger lock (same discipline as `reserve()`); `status()` is now async.
 - Scheduler re-checks the GPU-hot gate immediately before swap dispatch (releasing the VRAM reservation on abort) — a GPU transitioning hot during the swap window is no longer unprotected.
 - Upstream Ollama 5xx is forwarded with its real status in both streaming and non-streaming proxy paths (a streamed 500 was previously masked as 200), connect failures map to 502 without leaking scheduler slots, and upstream ≥500 now counts toward the circuit breaker instead of recording success.
 - `CircuitBreakerTransport` counts all `httpx.TransportError` subclasses toward the breaker (previously only `ConnectError`/`ConnectTimeout`/`ReadTimeout`; `RemoteProtocolError`, `PoolTimeout`, `WriteError` etc. bypassed it).
