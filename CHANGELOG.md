@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **M58 complexity routing no longer force-routes over an explicit client model.** New `complexity_routing.override_explicit` flag (default `false`): the route model only fills in for requests that omit `model`; an explicit `model` in the request body wins. Skipped routes are recorded with reason `complexity-<level>-skipped-explicit-model` in response headers and the audit log. Set `override_explicit: true` to restore the original force-route behavior. Root cause of a 2026-06-10 overnight-run incident (explicit instruct model silently replaced by a thinking-capable route target).
 - `request_complete` audit events now include `routing_reason`, and `routing_applied` is `true` only when the model was actually changed.
 
+- **Dashboard auto-fan trigger is now a four-band escalation curve** (was a single 80 °C → 90 % trigger with 70 °C reset): 60 °C → 30 %, 70 °C → 50 %, 80 °C → 90 %, over 85 °C → 100 %, returning to BIOS auto below 60 °C. Escalation is immediate; de-escalation applies 5 °C of hysteresis per band so boundary hovering doesn't oscillate the fan. The fan modal shows the curve and the currently applied band.
+
 ### Fixed
 - Thrashing **warn** verdict on a request without complexity routing no longer breaks the request: `routing_meta` carrying only `_thrashing_warn` raised `KeyError` in response-header construction and audit emission (surfaced as a proxy error instead of the advisory `X-Swap-Penalty-Warning` header).
 - A2A `status` skill no longer fails with a swallowed `TypeError` when VRAM state is unknown (Ollama outage) — it now answers with an empty list and `vram_state: "unknown"`.

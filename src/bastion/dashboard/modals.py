@@ -284,9 +284,12 @@ class FanControlModal(ModalScreen[str]):
     def compose(self) -> ComposeResult:
         available = fan_control_available()
         auto_fan = getattr(self.app, "_auto_fan_enabled", False)
-        auto_state = getattr(self.app, "_auto_fan_state", "idle")
+        auto_speed = getattr(self.app, "_auto_fan_speed", None)
         auto_status = "ON" if auto_fan else "OFF"
-        auto_detail = f" (80C -> 90%, {auto_state})" if auto_fan else ""
+        applied = f"{auto_speed}%" if auto_speed else "auto"
+        auto_detail = (
+            f" (60→30 70→50 80→90 85+→100; now {applied})" if auto_fan else ""
+        )
 
         with Vertical(id="fan-dialog"):
             yield Label("GPU Fan Control", id="fan-title")
