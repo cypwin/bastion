@@ -255,12 +255,15 @@ curl http://localhost:11434/broker/recent
     "queue_wait_s": 0.05,
     "duration_s": 2.3,
     "status_code": 200,
-    "streaming": true
+    "streaming": true,
+    "source": "swarm-agent-7"
   }
 ]
 ```
 
 Samples are recorded at **true completion**: for streaming requests that is after the last byte reached the client, so `duration_s` covers the full stream (not response-object construction). `status_code` is the real outcome — upstream error statuses propagate, and backend-unavailable failures record `502`. Requests rejected before dispatch (queue full, circuit breaker open, complexity-reject) are not sampled.
+
+`source` is the client's **declared** identity: the `X-Agent-ID` header when sent, otherwise the User-Agent product token (`ollama/0.5.1` → `"ollama"`), otherwise `null`. Set `X-Agent-ID` on your clients to make the dashboard's Request Trace attribute work per agent/pipeline — the broker deliberately does not attempt process-level sniffing (connection pooling and proxied paths would misattribute it).
 
 #### `GET /broker/latency`
 

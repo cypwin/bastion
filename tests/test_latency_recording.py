@@ -183,3 +183,62 @@ class TestStreamingRecording:
 
         [rec] = records
         assert rec["status_code"] == 404
+
+
+class TestSourceAttribution:
+    @pytest.mark.asyncio
+    async def test_declared_agent_id_wins(self):
+        """X-Agent-ID is the declared identity and beats the User-Agent."""
+        records: list[dict] = []
+        proxy = OllamaProxy(_make_config(), enqueue_fn=_grant_immediately)
+        proxy._record_fn = _capture_record(records)
+        proxy._forward_response = AsyncMock(
+            return_value=MagicMock(status_code=200)
+        )
+
+        req = _make_request(
+            body={"model": "qwen3:14b", "prompt": "x", "stream": False},
+            headers={"user-agent": "python-httpx/0.27",
+                     "x-agent-id": "swarm-agent-7"},
+        )
+        await proxy._handle_scheduled(req, "/api/generate", await req.body())
+
+        [rec] = records
+        assert rec["source"] == "swarm-agent-7"
+
+    @pytest.mark.asyncio
+    async def test_user_agent_product_token_fallback(self):
+        """No X-Agent-ID -> the UA product token ('ollama/0.5.1' -> 'ollama')."""
+        records: list[dict] = []
+        proxy = OllamaProxy(_make_config(), enqueue_fn=_grant_immediately)
+        proxy._record_fn = _capture_record(records)
+        proxy._forward_response = AsyncMock(
+            return_value=MagicMock(status_code=200)
+        )
+
+        req = _make_request(
+            body={"model": "qwen3:14b", "prompt": "x", "stream": False},
+            headers={"user-agent": "ollama/0.5.1"},
+        )
+        await proxy._handle_scheduled(req, "/api/generate", await req.body())
+
+        [rec] = records
+        assert rec["source"] == "ollama"
+
+    @pytest.mark.asyncio
+    async def test_no_identity_records_none(self):
+        records: list[dict] = []
+        proxy = OllamaProxy(_make_config(), enqueue_fn=_grant_immediately)
+        proxy._record_fn = _capture_record(records)
+        proxy._forward_response = AsyncMock(
+            return_value=MagicMock(status_code=200)
+        )
+
+        req = _make_request(
+            body={"model": "qwen3:14b", "prompt": "x", "stream": False},
+            headers={},
+        )
+        await proxy._handle_scheduled(req, "/api/generate", await req.body())
+
+        [rec] = records
+        assert rec["source"] is None
