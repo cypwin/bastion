@@ -202,12 +202,15 @@ def record_recent_request(
     duration_s: float,
     status_code: int,
     streaming: bool = False,
+    source: str | None = None,
 ) -> None:
     """Record a completed request in the recent requests ring buffer.
 
     Called at true completion: for streaming requests that is after the
     last byte reached the client, so ``duration_s`` covers the full
-    stream and ``status_code`` reflects the actual outcome.
+    stream and ``status_code`` reflects the actual outcome. ``source`` is
+    the client's declared identity (``X-Agent-ID`` header) or, failing
+    that, its User-Agent product token — ``None`` when neither is sent.
     """
     _recent_requests.appendleft({
         "timestamp": time.time(),
@@ -218,6 +221,7 @@ def record_recent_request(
         "duration_s": round(duration_s, 3),
         "status_code": status_code,
         "streaming": streaming,
+        "source": source,
     })
 
 

@@ -341,6 +341,14 @@ class OllamaProxy:
         target_url = f"{self._backend_url}{path}"
         dispatch_start = time.time()
 
+        # Source attribution for /broker/recent: declared identity
+        # (X-Agent-ID) wins; otherwise fall back to the User-Agent product
+        # token (e.g. "ollama/0.5.1" -> "ollama"). The broker only knows
+        # what clients declare — process/terminal sniffing is deliberately
+        # not attempted (connection pooling and SOCKS paths misattribute).
+        _ua = request.headers.get("user-agent", "")
+        source = agent_id or _ua.split("/", 1)[0].strip()[:24] or None
+
         def record_complete(status_code: int) -> None:
             # Record for /broker/recent + /broker/latency at TRUE completion:
             # duration_s is measured from dispatch_start to *now*, so for
@@ -357,6 +365,7 @@ class OllamaProxy:
                 duration_s=time.time() - dispatch_start,
                 status_code=status_code,
                 streaming=is_streaming,
+                source=source,
             )
 
         result: StreamingResponse | JSONResponse
