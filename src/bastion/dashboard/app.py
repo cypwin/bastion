@@ -630,12 +630,17 @@ class BastionDashboard(App):
     # ------------------------------------------------------------------
 
     def _check_auto_fan(self, data: dict[str, Any]) -> None:
-        """Walk the fan along the escalation curve from the CPU temperature.
+        """Walk the GPU fan along the escalation curve, CPU-triggered.
 
-        Escalates immediately when the temperature enters a hotter band
-        (60→30%, 70→50%, 80→90%, >85→100%); de-escalates — eventually back
-        to BIOS auto — only once the temperature sits
-        ``_AUTO_FAN_HYSTERESIS_C`` below the applied band's trigger.
+        The CPU temperature decides when to engage and when to release the
+        override (60→30%, 70→50%, 80→90%, >85→100%; release below the curve
+        with ``_AUTO_FAN_HYSTERESIS_C`` of hysteresis). While the override is
+        active the GPU's own VBIOS fan curve is SUSPENDED
+        (GPUFanControlState=1), so the GPU temperature acts as a floor: the
+        applied duty is never below what the GPU's own band demands —
+        otherwise a CPU-derived 30% could undercool a blazing GPU.
+        Releasing to "auto" with a hot GPU is safe: the firmware curve
+        resumes immediately.
         """
         if not self._auto_fan_enabled or not fan_control_available():
             return
@@ -643,21 +648,42 @@ class BastionDashboard(App):
         cpu_temp = self._collector.read_cpu_temp()
         if cpu_temp is None:
             return
+        gpu_temp = (data.get("gpu") or {}).get("temperature_c")
+
+        def pct(band: str | None) -> int:
+            return 0 if band is None else int(band)
+
+        # *_up: band at the actual temperature (escalation). *_down: band as
+        # if hotter by the hysteresis margin — only when even THIS lands
+        # lower has the temperature genuinely left the applied band.
+        cpu_up = _fan_band(cpu_temp)
+        cpu_down = _fan_band(cpu_temp + _AUTO_FAN_HYSTERESIS_C)
+        gpu_up = _fan_band(gpu_temp) if gpu_temp is not None else None
+        gpu_down = (
+            _fan_band(gpu_temp + _AUTO_FAN_HYSTERESIS_C)
+            if gpu_temp is not None else None
+        )
 
         applied = self._auto_fan_speed
-        target_up = _fan_band(cpu_temp)
-        # Evaluated as if the temperature were hotter by the hysteresis
-        # margin: only when even THIS lands in a lower band has the
-        # temperature genuinely left the applied band.
-        target_down = _fan_band(cpu_temp + _AUTO_FAN_HYSTERESIS_C)
-
         if applied is None:
-            if target_up is not None:
-                self._apply_auto_fan(target_up)
-        elif target_up is not None and int(target_up) > int(applied):
-            self._apply_auto_fan(target_up)
-        elif (0 if target_down is None else int(target_down)) < int(applied):
-            self._apply_auto_fan(target_down)
+            # Engagement is CPU-driven; a hot GPU in auto mode is the
+            # firmware's job, not ours.
+            if cpu_up is not None:
+                self._apply_auto_fan(str(max(pct(cpu_up), pct(gpu_up))))
+            return
+
+        if cpu_down is None:
+            # CPU left the curve — hand control back to the GPU firmware.
+            self._apply_auto_fan(None)
+            return
+
+        target_up = max(pct(cpu_up), pct(gpu_up))
+        if target_up > int(applied):
+            self._apply_auto_fan(str(target_up))
+            return
+        target_down = max(pct(cpu_down), pct(gpu_down))
+        if target_down < int(applied):
+            self._apply_auto_fan(str(target_down))
 
     def _apply_auto_fan(self, speed: str | None) -> None:
         """Set the fan to ``speed`` (None = BIOS auto) and track the state."""

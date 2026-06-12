@@ -288,7 +288,8 @@ class FanControlModal(ModalScreen[str]):
         auto_status = "ON" if auto_fan else "OFF"
         applied = f"{auto_speed}%" if auto_speed else "auto"
         auto_detail = (
-            f" (60→30 70→50 80→90 85+→100; now {applied})" if auto_fan else ""
+            f" (CPU 60→30 70→50 80→90 85+→100, GPU-safe floor; now {applied})"
+            if auto_fan else ""
         )
 
         with Vertical(id="fan-dialog"):

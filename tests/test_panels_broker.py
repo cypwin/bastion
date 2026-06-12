@@ -544,3 +544,24 @@ class TestAlertPanel:
         assert AlertPanel.TEMP_CRIT_C == 82
         assert AlertPanel.QUEUE_WARN == 10
         assert AlertPanel.QUEUE_CRIT == 50
+
+
+class TestAlertPanelTimestamps:
+    def test_alert_rows_show_raise_time(self) -> None:
+        """Alerts carry epoch 'time'; the panel renders it as HH:MM:SS."""
+        import time as _time
+        from datetime import datetime as _dt
+
+        panel = _make(AlertPanel)
+        raised = _time.time()
+        table = panel.render_data(
+            [{"severity": "warn", "message": "VRAM at 85%", "time": raised}]
+        )
+        expected = _dt.fromtimestamp(raised).strftime("%H:%M:%S")
+        first_cells = list(table.columns[0].cells)
+        assert first_cells == [expected]
+
+    def test_alert_without_time_renders_blank_cell(self) -> None:
+        panel = _make(AlertPanel)
+        table = panel.render_data([{"severity": "info", "message": "x"}])
+        assert list(table.columns[0].cells) == [""]
