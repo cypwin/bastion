@@ -443,8 +443,9 @@ class A2AHandler:
         tasks into the completed store.
 
         Returns True on success.  Returns False if the task was already
-        compacted (KeyError) or the transition is invalid (ValueError),
-        logging at DEBUG level.
+        compacted (KeyError, logged at DEBUG — expected churn) or the
+        transition is invalid (ValueError, logged at WARNING — a live task
+        attempting an illegal transition signals a state-machine race).
         """
         try:
             self._store.update_state(task_id, new_state)
@@ -456,8 +457,8 @@ class A2AHandler:
             )
             return False
         except ValueError as exc:
-            logger.debug(
-                "State transition skipped for %s -> %s: %s",
+            logger.warning(
+                "Invalid state transition for %s -> %s: %s",
                 task_id, new_state.value, exc,
             )
             return False
