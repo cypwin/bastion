@@ -536,11 +536,18 @@ class OllamaProxy:
         done_fn: Callable[[], None] | None = None,
         routing_meta: dict[str, str] | None = None,
         record_fn: Callable[[int], None] | None = None,
-    ) -> StreamingResponse:
+    ) -> StreamingResponse | JSONResponse:
         """Stream Ollama's NDJSON response back to the client.
 
         This is the most critical path — `ollama run` depends on streaming
         tokens in real time. Any buffering makes it appear frozen.
+
+        The upstream stream is opened *before* the StreamingResponse is
+        constructed so the client sees the real upstream status — an Ollama
+        5xx surfaces as a 5xx, not a 200 committed before upstream was
+        contacted. A connection-level failure returns a 502 JSONResponse
+        (done_fn/record_fn are honored on that path too, so the scheduler
+        slot is never leaked).
 
         done_fn is called in the generator's finally block so the scheduler
         is unblocked only after the last byte has been sent to the client,
@@ -552,19 +559,35 @@ class OllamaProxy:
 
         cb = self.circuit_breaker
 
+        stream_cm = self._http.stream("POST", url, content=body, headers=headers)
+        try:
+            resp = await stream_cm.__aenter__()
+        except Exception as e:
+            logger.error("Streaming proxy error (upstream connect): %s", e)
+            if cb:
+                await cb.record_failure()
+            self._requests_served += 1
+            if record_fn:
+                record_fn(502)
+            if done_fn:
+                done_fn()
+            return JSONResponse(
+                {"error": f"Ollama backend unavailable: {e}"}, status_code=502,
+            )
+
         async def generate():
-            # 502 mirrors _forward_response's backend-unavailable status; an
-            # opened stream overwrites this with the upstream status code.
-            outcome_status = 502
+            outcome_status = resp.status_code
             try:
-                async with self._http.stream(
-                    "POST", url, content=body, headers=headers,
-                ) as resp:
-                    outcome_status = resp.status_code
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
                 if cb:
-                    await cb.record_success()
+                    # An upstream 5xx is a backend failure even though no
+                    # exception was raised — count it toward the breaker
+                    # (S131: a 500 storm must not register as healthy).
+                    if resp.status_code >= 500:
+                        await cb.record_failure()
+                    else:
+                        await cb.record_success()
             except Exception as e:
                 logger.error("Streaming proxy error: %s", e)
                 outcome_status = 502
@@ -573,6 +596,8 @@ class OllamaProxy:
                 error_json = json.dumps({"error": str(e)}).encode() + b"\n"
                 yield error_json
             finally:
+                with contextlib.suppress(Exception):
+                    await stream_cm.__aexit__(None, None, None)
                 self._requests_served += 1
                 if record_fn:
                     record_fn(outcome_status)
@@ -591,6 +616,7 @@ class OllamaProxy:
 
         return StreamingResponse(
             generate(),
+            status_code=resp.status_code,
             media_type="application/x-ndjson",
             headers=response_headers,
         )
@@ -605,40 +631,55 @@ class OllamaProxy:
 
         try:
             resp = await self._http.post(url, content=body, headers=headers)
-            self._requests_served += 1
-            if self.circuit_breaker:
-                await self.circuit_breaker.record_success()
-
-            resp_json = resp.json()
-            response_headers: dict[str, str] = {}
-
-            if routing_meta:
-                # routing_meta may carry only _thrashing_warn (warn without routing)
-                if "reason" in routing_meta:
-                    response_headers["X-Model-Requested"] = routing_meta["requested"]
-                    response_headers["X-Model-Routed"] = routing_meta["routed"]
-                    response_headers["X-Routing-Reason"] = routing_meta["reason"]
-                if "_thrashing_warn" in routing_meta:
-                    response_headers["X-Swap-Penalty-Warning"] = routing_meta["_thrashing_warn"]
-
-            # Token count headers from Ollama response
-            prompt_tokens = resp_json.get("prompt_eval_count")
-            completion_tokens = resp_json.get("eval_count")
-            if prompt_tokens is not None:
-                response_headers["X-Prompt-Tokens"] = str(prompt_tokens)
-            if completion_tokens is not None:
-                response_headers["X-Completion-Tokens"] = str(completion_tokens)
-
-            return JSONResponse(
-                content=resp_json,
-                status_code=resp.status_code,
-                headers=response_headers,
-            )
         except Exception as e:
             logger.error("Forward proxy error to %s: %s: %s", url, type(e).__name__, repr(e))
             if self.circuit_breaker:
                 await self.circuit_breaker.record_failure()
             return JSONResponse({"error": f"Ollama backend unavailable: {e}"}, status_code=502)
+
+        self._requests_served += 1
+        if self.circuit_breaker:
+            # An upstream 5xx is a backend failure even though no exception
+            # was raised — count it toward the breaker (S131: a 500 storm
+            # must not register as healthy).
+            if resp.status_code >= 500:
+                await self.circuit_breaker.record_failure()
+            else:
+                await self.circuit_breaker.record_success()
+
+        try:
+            resp_json = resp.json()
+        except Exception:
+            # Upstream replied with a non-JSON body (Ollama 5xx can be plain
+            # text). Forward the upstream status with the body wrapped
+            # instead of dying or masking it as backend-unavailable.
+            resp_json = {
+                "error": f"upstream returned non-JSON response: {resp.text[:500]}",
+            }
+
+        response_headers: dict[str, str] = {}
+        if routing_meta:
+            # routing_meta may carry only _thrashing_warn (warn without routing)
+            if "reason" in routing_meta:
+                response_headers["X-Model-Requested"] = routing_meta["requested"]
+                response_headers["X-Model-Routed"] = routing_meta["routed"]
+                response_headers["X-Routing-Reason"] = routing_meta["reason"]
+            if "_thrashing_warn" in routing_meta:
+                response_headers["X-Swap-Penalty-Warning"] = routing_meta["_thrashing_warn"]
+
+        # Token count headers from Ollama response
+        prompt_tokens = resp_json.get("prompt_eval_count")
+        completion_tokens = resp_json.get("eval_count")
+        if prompt_tokens is not None:
+            response_headers["X-Prompt-Tokens"] = str(prompt_tokens)
+        if completion_tokens is not None:
+            response_headers["X-Completion-Tokens"] = str(completion_tokens)
+
+        return JSONResponse(
+            content=resp_json,
+            status_code=resp.status_code,
+            headers=response_headers,
+        )
 
     def _detect_priority(self, request: Request) -> PriorityTier:
         """Detect request priority from headers, intents, and heuristics.

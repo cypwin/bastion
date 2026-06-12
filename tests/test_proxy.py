@@ -219,3 +219,134 @@ class TestInvalidInput:
         req = _make_request(body=b"not json at all{{{")
         resp = await proxy.handle_request(req)
         assert resp.status_code == 400
+
+
+class _FakeStream:
+    """Duck-typed httpx streaming response for _stream_response tests."""
+
+    def __init__(self, chunks: list[bytes], status_code: int = 200) -> None:
+        self._chunks = chunks
+        self.status_code = status_code
+
+    async def aiter_bytes(self):
+        for chunk in self._chunks:
+            yield chunk
+
+
+def _make_breaker_mock() -> MagicMock:
+    cb = MagicMock()
+    cb.state = "closed"
+    cb.record_success = AsyncMock()
+    cb.record_failure = AsyncMock()
+    return cb
+
+
+def _stream_cm(chunks: list[bytes], status_code: int):
+    """Build an _http.stream replacement returning an async CM."""
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def stream(method, url, *, content=b"", headers=None, **kw):
+        yield _FakeStream(chunks, status_code=status_code)
+
+    return stream
+
+
+async def _drain(resp) -> bytes:
+    body = b""
+    async for chunk in resp.body_iterator:
+        body += chunk
+    return body
+
+
+class TestUpstream5xxBreakerAccounting:
+    """Upstream 5xx must count toward the circuit breaker, not as success.
+
+    S131 fix-path item 3: a 5xx is a *response*, not an httpx exception,
+    so before this the breaker only ever saw connection-level failures and
+    an Ollama 500 storm recorded as a healthy backend.
+    """
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_500_records_breaker_failure(self):
+        proxy = OllamaProxy(BrokerConfig())
+        proxy.circuit_breaker = _make_breaker_mock()
+
+        mock_resp = httpx.Response(
+            500, json={"error": "vram exhausted"},
+            request=httpx.Request("POST", "http://mock"),
+        )
+        with patch.object(proxy._http, "post", new_callable=AsyncMock, return_value=mock_resp):
+            req = _make_request()
+            resp = await proxy._forward_response(
+                req, "http://mock/api/generate", b"{}",
+            )
+
+        assert resp.status_code == 500
+        proxy.circuit_breaker.record_failure.assert_awaited_once()
+        proxy.circuit_breaker.record_success.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_200_records_breaker_success(self):
+        proxy = OllamaProxy(BrokerConfig())
+        proxy.circuit_breaker = _make_breaker_mock()
+
+        mock_resp = httpx.Response(
+            200, json={"response": "ok", "done": True},
+            request=httpx.Request("POST", "http://mock"),
+        )
+        with patch.object(proxy._http, "post", new_callable=AsyncMock, return_value=mock_resp):
+            req = _make_request()
+            resp = await proxy._forward_response(
+                req, "http://mock/api/generate", b"{}",
+            )
+
+        assert resp.status_code == 200
+        proxy.circuit_breaker.record_success.assert_awaited_once()
+        proxy.circuit_breaker.record_failure.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_streaming_500_records_breaker_failure(self):
+        proxy = OllamaProxy(BrokerConfig())
+        proxy.circuit_breaker = _make_breaker_mock()
+
+        chunks = [b'{"error": "vram exhausted"}\n']
+        with patch.object(proxy._http, "stream", _stream_cm(chunks, status_code=500)):
+            req = _make_request()
+            resp = await proxy._stream_response(req, "http://mock/api/generate", b"{}")
+            body = await _drain(resp)
+
+        assert b"vram exhausted" in body
+        proxy.circuit_breaker.record_failure.assert_awaited_once()
+        proxy.circuit_breaker.record_success.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_streaming_500_forwards_upstream_status(self):
+        """The HTTP status seen by a streaming client must be the upstream
+        5xx, not a 200 committed before upstream was contacted."""
+        proxy = OllamaProxy(BrokerConfig())
+
+        chunks = [b'{"error": "vram exhausted"}\n']
+        with patch.object(proxy._http, "stream", _stream_cm(chunks, status_code=500)):
+            req = _make_request()
+            resp = await proxy._stream_response(req, "http://mock/api/generate", b"{}")
+            await _drain(resp)
+
+        assert resp.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_streaming_done_fn_called_on_500(self):
+        """The scheduler slot must be released even on an upstream 5xx."""
+        proxy = OllamaProxy(BrokerConfig())
+        done_calls = []
+
+        chunks = [b'{"error": "boom"}\n']
+        with patch.object(proxy._http, "stream", _stream_cm(chunks, status_code=500)):
+            req = _make_request()
+            resp = await proxy._stream_response(
+                req, "http://mock/api/generate", b"{}",
+                done_fn=lambda: done_calls.append(1),
+            )
+            await _drain(resp)
+
+        assert done_calls == [1]
