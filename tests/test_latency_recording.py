@@ -31,7 +31,9 @@ def _make_request(
     req.url.path = path
     req.method = "POST"
     req.body = AsyncMock(return_value=json.dumps(body).encode())
-    req.headers = headers or {"user-agent": "test-client/1.0"}
+    # `headers or default` would replace an explicit empty dict with the
+    # default UA, silently breaking the no-identity test case.
+    req.headers = headers if headers is not None else {"user-agent": "test-client/1.0"}
     return req
 
 
