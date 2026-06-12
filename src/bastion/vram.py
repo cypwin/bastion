@@ -27,6 +27,14 @@ logger = logging.getLogger(__name__)
 
 HARDWARE_MARGIN_GB = 2.0  # nvidia-smi free-VRAM safety margin (KV/compute/fragmentation)
 
+# Sentinel reason returned by can_load_model() when residency state is
+# unknown. Callers (scheduler eviction loop) compare against this to stop
+# retry loops that cannot succeed until Ollama is reachable again.
+VRAM_STATE_UNKNOWN_REASON = (
+    "Cannot determine VRAM state: Ollama /api/ps unreachable. "
+    "Refusing to admit load while broker/Ollama is in transition."
+)
+
 
 async def _hardware_admits(
     vram_bytes: int, margin_gb: float = HARDWARE_MARGIN_GB
@@ -325,20 +333,21 @@ class VRAMTracker:
                 "model": model_name,
                 "reason": "tracker state unknown",
             })
-            return False, (
-                "Cannot determine VRAM state: Ollama /api/ps unreachable. "
-                "Refusing to admit load while broker/Ollama is in transition."
-            )
+            return False, VRAM_STATE_UNKNOWN_REASON
         loaded_names = {m.name for m in loaded}
 
         # Already loaded? No additional VRAM needed
         if model_name in loaded_names:
             return True, "Model already loaded"
 
-        # Compute proposed total VRAM
+        # Compute proposed total VRAM (tag-aware: /api/ps may report
+        # ':latest'-tagged names for untagged registry keys)
         loaded_vram = sum(
             m.vram_gb for m in loaded
-            if not (self.config.models.get(m.name) and self.config.models[m.name].always_allowed)
+            if not (
+                (info := registry_lookup(self.config.models, m.name))
+                and info.always_allowed
+            )
         )
         model_vram = known.vram_gb if known else self._estimate_vram(model_name)
         proposed_total = loaded_vram + model_vram
