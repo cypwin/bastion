@@ -32,7 +32,12 @@ from bastion.metrics import (
 )
 from bastion.models import BrokerConfig, QueuedRequest
 from bastion.queue import AffinityQueue
-from bastion.vram import VRAMManager, VRAMTracker
+from bastion.vram import (
+    VRAM_STATE_UNKNOWN_REASON,
+    VRAMManager,
+    VRAMTracker,
+    registry_lookup,
+)
 from bastion.watchdog import notify_watchdog
 
 logger = logging.getLogger(__name__)
@@ -591,8 +596,8 @@ class Scheduler:
                 m for m in resident_after
                 if m.name != candidate.model
                 and not (
-                    self.config.models.get(m.name)
-                    and self.config.models[m.name].always_allowed
+                    (info := registry_lookup(self.config.models, m.name))
+                    and info.always_allowed
                 )
                 and not (
                     self._reservation_check_fn
@@ -646,7 +651,12 @@ class Scheduler:
         evictable = [
             m for m in resident
             if m.name != candidate.model
-            and not (self.config.models.get(m.name) and self.config.models[m.name].always_allowed)
+            # Tag-aware: an always_allowed model resident as 'name:latest'
+            # must not become evictable because the registry key is untagged.
+            and not (
+                (info := registry_lookup(self.config.models, m.name))
+                and info.always_allowed
+            )
             and not (self._reservation_check_fn and self._reservation_check_fn(m.name))
             and not self._has_inflight_fn(m.name)  # Never evict in-flight models
         ]
@@ -673,6 +683,17 @@ class Scheduler:
             if can_load:
                 self._eviction_stuck_streak.pop(candidate.model, None)
                 return True
+            if vram_reason == VRAM_STATE_UNKNOWN_REASON:
+                # Tracker state became unknown mid-eviction: further unloads
+                # cannot make can_load_model pass and would tear down
+                # residents pointlessly during an Ollama transition. Stop;
+                # the caller retries when state is known again.
+                logger.warning(
+                    "_evict_for_model: tracker state unknown mid-eviction for "
+                    "'%s' (after %d eviction(s)) — stopping eviction loop",
+                    candidate.model, evicted_count,
+                )
+                return False
 
         # T3.2: suppress per-tick spam.  Log loudly the first time, then a
         # heartbeat every ~10s (100 ticks at 0.1s loop_interval) while stuck;
