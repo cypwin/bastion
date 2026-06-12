@@ -178,8 +178,14 @@ def record_recent_request(
     queue_wait_s: float,
     duration_s: float,
     status_code: int,
+    streaming: bool = False,
 ) -> None:
-    """Record a completed request in the recent requests ring buffer."""
+    """Record a completed request in the recent requests ring buffer.
+
+    Called at true completion: for streaming requests that is after the
+    last byte reached the client, so ``duration_s`` covers the full
+    stream and ``status_code`` reflects the actual outcome.
+    """
     _recent_requests.appendleft({
         "timestamp": time.time(),
         "model": model,
@@ -188,6 +194,7 @@ def record_recent_request(
         "queue_wait_s": round(queue_wait_s, 3),
         "duration_s": round(duration_s, 3),
         "status_code": status_code,
+        "streaming": streaming,
     })
 
 

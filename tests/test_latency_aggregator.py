@@ -258,3 +258,14 @@ def test_no_nan_in_percentiles_for_valid_input() -> None:
     for field in (out.overall.p50_s, out.overall.p95_s, out.overall.p99_s):
         assert field is not None
         assert not math.isnan(field)
+
+
+def test_future_timestamp_clamps_window_to_zero_instead_of_failing() -> None:
+    """Backwards wall-clock step: a sample stamped ahead of `now` must not
+    produce a negative window_s (which would fail model validation and 500
+    the endpoint)."""
+    now = 1000.0
+    samples = [_sample(timestamp=now + 5.0)]  # stamped in the "future"
+    out = aggregate_latency(samples, window_s=60.0, now=now)
+    assert out.window_s == 0.0
+    assert out.sample_total == 1
