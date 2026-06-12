@@ -885,7 +885,12 @@ class A2AHandler:
         """
         try:
             # Query current state
-            loaded = await self._vram.get_loaded_models() if self._vram else []
+            loaded_raw = await self._vram.get_loaded_models() if self._vram else []
+            # State-unknown sentinel (None) coerced to [] so the status skill
+            # keeps answering during Ollama outages; vram_state tells clients
+            # the list is unverified rather than genuinely empty.
+            loaded = loaded_raw if loaded_raw is not None else []
+            vram_state = "unknown" if loaded_raw is None else "ok"
             queue_depth = (
                 self._scheduler.queue.total_size
                 if self._scheduler and hasattr(self._scheduler, "queue")
@@ -901,6 +906,7 @@ class A2AHandler:
                 "queue_depth": queue_depth,
                 "queue_by_model": queue_by_model,
                 "loaded_models": [m.name for m in loaded],
+                "vram_state": vram_state,
                 "current_model": self._scheduler.current_model if self._scheduler else None,
             }
 

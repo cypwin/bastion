@@ -401,6 +401,24 @@ class TestStatusSkill:
         assert "queue_depth" in status_data
         assert "loaded_models" in status_data
         assert "qwen3:14b" in status_data["loaded_models"]
+        assert status_data["vram_state"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_status_completes_on_vram_state_unknown(self, a2a_handler):
+        """Regression: get_loaded_models() None sentinel (Ollama outage) must
+        not TypeError into a cryptic FAILED task — the status skill answers
+        with an empty list and vram_state='unknown'."""
+        a2a_handler._vram.get_loaded_models = AsyncMock(return_value=None)
+
+        message = {"skill_id": "status", "params": {}}
+        result = await a2a_handler.create_task(message)
+        await asyncio.sleep(0.1)
+
+        task = await a2a_handler.get_task(result["id"])
+        assert task["status"]["state"] == "completed"
+        status_data = task["artifacts"][0]["parts"][0]["data"]
+        assert status_data["loaded_models"] == []
+        assert status_data["vram_state"] == "unknown"
 
 
 # ---------------------------------------------------------------------------
