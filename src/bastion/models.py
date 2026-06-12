@@ -526,6 +526,14 @@ class BrokerStatus(BaseModel):
     total_requests_served: int = 0
     total_model_swaps: int = 0
     state: str = "running"  # running, draining, stopped
+    vram_state: str = Field(
+        default="ok",
+        description=(
+            "'ok' when loaded_models reflects a live /api/ps read; 'unknown' "
+            "when Ollama was unreachable and loaded_models is an empty "
+            "placeholder, not a verified empty"
+        ),
+    )
     vram_ledger: dict[str, Any] | None = Field(
         default=None,
         description="VRAM ledger status from VRAMManager (if available)",
@@ -688,11 +696,22 @@ class BrokerCatalog(BaseModel):
     loaded_count: int = Field(ge=0)
     evictable_count: int = Field(ge=0)
     registry_source: str = Field(
-        description="Path to the broker.yaml that sourced this registry",
+        description=(
+            "Path to the broker.yaml that sourced this registry "
+            "(home directory redacted to '~')"
+        ),
     )
     snapshot_age_s: float = Field(
         ge=0.0,
         description="Seconds since the VRAM tracker's last residency snapshot",
+    )
+    residency_state: str = Field(
+        default="ok",
+        description=(
+            "'ok' when residency fields reflect a live /api/ps read; "
+            "'unknown' when Ollama was unreachable and currently_loaded/"
+            "loaded_count collapsed to not-loaded placeholders"
+        ),
     )
 
 
