@@ -238,8 +238,10 @@ class CircuitBreakerTransport(httpx.AsyncBaseTransport):
         * CLOSED / HALF_OPEN -> forward to inner transport.
         * 5xx responses are recorded as failures and raise
           :class:`OllamaBackendError`.
-        * ``httpx.ConnectError``, ``httpx.ConnectTimeout`` and
-          ``httpx.ReadTimeout`` are recorded as failures and re-raised.
+        * ``httpx.TransportError`` (connection errors, all timeouts
+          including ``PoolTimeout``, protocol-level corruption such as
+          ``RemoteProtocolError``, network errors) is recorded as a
+          failure and re-raised.
         * Streaming responses record success on connection establishment
           (the caller is responsible for post-stream outcome recording).
         """
@@ -283,7 +285,11 @@ class CircuitBreakerTransport(httpx.AsyncBaseTransport):
 
             return response
 
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
+        except httpx.TransportError as exc:
+            # Covers ConnectError/ConnectTimeout/ReadTimeout (the original
+            # set) plus PoolTimeout (pool pressure), RemoteProtocolError
+            # (protocol corruption), and the rest of the transport-level
+            # family — all of these mean the backend round-trip failed.
             await self._breaker.record_failure()
             raise exc
 
