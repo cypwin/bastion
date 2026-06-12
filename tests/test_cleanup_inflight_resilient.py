@@ -16,6 +16,7 @@ The fix wraps the cleanup body in ``try/except`` with the decrement in
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -128,10 +129,8 @@ class TestCleanupInflightResilience:
 
         # Wait for the captured cleanup task to finish (or fail)
         for t in captured:
-            try:
+            with contextlib.suppress(Exception):  # swallow task errors
                 await asyncio.wait_for(t, timeout=2.0)
-            except Exception:  # noqa: BLE001 — we want to swallow task errors
-                pass
 
         # _dispatch_request incremented to 1; cleanup MUST decrement back to 0
         # (model removed from dict) even though done_event.wait raised. Without
