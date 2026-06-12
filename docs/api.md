@@ -130,6 +130,7 @@ curl http://localhost:11434/broker/status
   "total_requests_served": 150,
   "total_model_swaps": 12,
   "state": "running",
+  "vram_state": "ok",
   "vram_ledger": {
     "total_bytes": 34359738368,
     "safety_margin_bytes": 3435973836,
@@ -141,6 +142,8 @@ curl http://localhost:11434/broker/status
   }
 }
 ```
+
+`vram_state` is `"ok"` when `loaded_models` reflects a live `/api/ps` read, `"unknown"` when Ollama was unreachable — in that case `loaded_models` is an empty placeholder, not a verified empty.
 
 #### `GET /broker/queue`
 
@@ -251,10 +254,13 @@ curl http://localhost:11434/broker/recent
     "tier": "interactive",
     "queue_wait_s": 0.05,
     "duration_s": 2.3,
-    "status_code": 200
+    "status_code": 200,
+    "streaming": true
   }
 ]
 ```
+
+Samples are recorded at **true completion**: for streaming requests that is after the last byte reached the client, so `duration_s` covers the full stream (not response-object construction). `status_code` is the real outcome — upstream error statuses propagate, and backend-unavailable failures record `502`. Requests rejected before dispatch (queue full, circuit breaker open, complexity-reject) are not sampled.
 
 #### `GET /broker/latency`
 
@@ -306,9 +312,10 @@ curl 'http://localhost:11434/broker/latency?window_s=300'
 ```
 
 **Notes:**
-- `window_s` (top-level) reflects the *actual* age of the oldest in-window sample, not the requested window. Lets consumers detect a young broker (`window_s << requested_window_s`).
-- Percentile fields are `null` only when `sample_count == 0` for that bucket — treat as "no signal", not "zero latency".
-- `error_rate = error_count / sample_count` over `status_code >= 400`.
+- `window_s` (top-level) reflects the *actual* age of the oldest in-window sample, not the requested window. Lets consumers detect a young broker (`window_s << requested_window_s`). Clamped at `0.0` even if a sample carries a future timestamp (clock steps).
+- Buckets only exist for `sample_count >= 1`, so percentile fields are always populated in practice; `overall` is `null` (and `per_model` empty) when the window holds no samples at all.
+- `error_rate = error_count / sample_count` over `status_code >= 400`. Statuses reflect real outcomes (upstream errors and `502` backend failures included), so a non-zero error rate during an Ollama outage is expected and meaningful.
+- Durations mix streaming and non-streaming requests; both are measured end-to-end (dispatch to last byte). Each raw sample in `/broker/recent` carries a `streaming` flag if you need to separate the populations.
 
 #### `GET /broker/catalog`
 
@@ -347,14 +354,38 @@ curl http://localhost:11434/broker/catalog
   "loaded_count": 2,
   "evictable_count": 0,
   "registry_source": "/etc/bastion/broker.yaml",
-  "snapshot_age_s": 0.004
+  "snapshot_age_s": 0.004,
+  "residency_state": "ok"
 }
 ```
 
 **Notes:**
 - `is_evictable` is `true` iff the model is currently loaded AND is not the scheduler's `current_model` AND is not marked `always_allowed` in `broker.yaml`. The flag is computed at response time and can flip between calls if a swap is in flight.
-- `registry_source` is the resolved path of the loaded `broker.yaml`, or `"<unknown>"` for default/no-file configs.
-- When `/api/ps` is unreachable, the response stays valid: `loaded_count` collapses to `0` and `currently_loaded` is `false` for every entry. The registry shape itself is always queryable.
+- Residency matching is tag-aware: a registry key `nomic-embed-text` matches an `/api/ps` report of `nomic-embed-text:latest` (the implicit `:latest` tag is normalized on both sides).
+- `registry_source` is the resolved path of the loaded `broker.yaml` with the home directory redacted to `~`, or `"<unknown>"` for default/no-file configs.
+- When `/api/ps` is unreachable, the response stays valid: `residency_state` becomes `"unknown"`, `loaded_count` collapses to `0`, and `currently_loaded` is `false` for every entry — placeholders, not verified emptiness. The registry shape itself is always queryable.
+
+#### `GET /broker/version`
+
+Stable build identity for clients that need to detect mid-batch redeploys: pin `git_sha` at batch start and treat a changed SHA (or a changed `boot_time_unix` at the same SHA) on retry as "the broker restarted under you", not a transient infra blip.
+
+```bash
+curl http://localhost:11434/broker/version
+```
+
+**Response:**
+```json
+{
+  "version": "0.4.0",
+  "git_sha": "a93d40ad94f30523c9c92337decaaee3de32c83a",
+  "boot_time_unix": 1780300800.0,
+  "boot_time_iso": "2026-06-11T20:00:00+00:00"
+}
+```
+
+**Notes:**
+- `git_sha` is `BASTION_GIT_SHA` (env, set by deploy tooling) when present, otherwise `git rev-parse HEAD` for development checkouts (only when the package root itself is a git checkout), otherwise `"unknown"`. Always a string — clients compare for equality.
+- Like every `/broker/*` route, this endpoint is gated by admin auth when `auth.enabled` is set. With auth disabled (the default for localhost deployments) it discloses build identity to anything that can reach the port — see KNOWN_ISSUES for the accepted-risk note pending ADR-006 bearer auth.
 
 ### Model Management
 
@@ -377,6 +408,8 @@ curl -X POST http://localhost:11434/broker/preload \
 ```json
 {"error": "Would exceed VRAM budget: 20.0GB loaded + 9.8GB requested = 29.8GB > 24.0GB limit"}
 ```
+
+**Fail-closed during Ollama transitions:** when `/api/ps` is unreachable the broker cannot verify residency, so preload is refused with an error explaining that VRAM state is unknown ("Cannot determine VRAM state: Ollama /api/ps unreachable…"). Retry once Ollama is reachable again; admitting a load on unknown state could exceed the budget and crash the GPU.
 
 #### `POST /broker/unload`
 

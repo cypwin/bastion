@@ -113,6 +113,19 @@ _(none open — see "Resolved in v0.4.1" below)_
 
 ## Minor
 
+### Unauthenticated admin surface discloses build/config metadata (accepted risk pending ADR-006)
+
+- **Location:** `GET /broker/version` (git SHA, boot time), `GET /broker/catalog`
+  (`registry_source` config path — home directory redacted to `~` since S130).
+- **Problem:** With `auth.enabled: false` (the default for localhost
+  deployments) anything that can reach the port can read build identity and
+  the redacted config path. On the reference deployment exposure is bounded
+  by the nftables port lockdown; on other hosts it is operator
+  responsibility.
+- **Status:** Accepted risk until ADR-006 bearer-token auth lands in v0.5,
+  which gates the entire `/broker/*` surface by default. Enable
+  `auth.api_keys` today if the port is reachable beyond localhost.
+
 ### `VRAMManager._reclaim_expired_sync()` called outside lock in `reconcile()` and `status()`
 
 - **Location:** `src/bastion/vram.py:557, 608`
@@ -171,6 +184,9 @@ _(none open — see "Resolved in v0.4.1" below)_
 ---
 
 ## Resolved in v0.4.1
+
+> v0.4.1 is the upcoming release: these items live under `[Unreleased]`
+> in `CHANGELOG.md` until it is tagged.
 
 ### `VRAMTracker.get_loaded_models()` returns `[]` indistinguishable from "no models loaded"
 

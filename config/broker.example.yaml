@@ -110,6 +110,19 @@ request_overrides:
 #   exporter: "otlp"
 #   endpoint: "http://localhost:4317"
 
+# Complexity-based model routing (M58). Clients tag requests with an
+# X-Task-Complexity header (simple / moderate / complex); the broker fills
+# in a routed model for requests that omit one. With the default
+# override_explicit: false an explicit model in the request body always
+# wins; set true to force-route over explicit choices.
+# complexity_routing:
+#   enabled: true
+#   routes:
+#     simple: "small-model:tag"      # cheap classification / extraction
+#     moderate: "medium-model:tag"   # summarization / evaluation
+#   override_explicit: false
+#   complex_action: "reject"         # HTTP 422 — route complex work elsewhere
+
 # ── Observability (Prometheus / Grafana) ───────────────────────────
 # Scrape hint for prometheus.yml generation. BASTION itself does not
 # read this — it is documentation for operators and the docker-compose stack.
