@@ -341,6 +341,24 @@ class OllamaProxy:
         target_url = f"{self._backend_url}{path}"
         dispatch_start = time.time()
 
+        def record_complete(status_code: int) -> None:
+            # Record for /broker/recent + /broker/latency at TRUE completion:
+            # duration_s is measured from dispatch_start to *now*, so for
+            # streaming requests the caller must invoke this after the last
+            # byte (the generator's finally), not when the response object is
+            # constructed — otherwise streaming durations collapse to ~0.
+            if self._record_fn is None:
+                return
+            self._record_fn(
+                model=model,
+                endpoint=path,
+                tier=tier.value,
+                queue_wait_s=queue_wait_seconds,
+                duration_s=time.time() - dispatch_start,
+                status_code=status_code,
+                streaming=is_streaming,
+            )
+
         result: StreamingResponse | JSONResponse
         try:
             if is_streaming:
@@ -348,6 +366,7 @@ class OllamaProxy:
                 result = await self._stream_response(
                     request, target_url, modified_body, model, path, tier,
                     done_fn=done_fn, routing_meta=routing_meta,
+                    record_fn=record_complete,
                 )
                 done_fn = None  # Generator owns done_fn now; prevent double-call in finally
             else:
@@ -388,16 +407,13 @@ class OllamaProxy:
             audit_details["routing_applied"] = False
         audit.emit(audit.EVENT_REQUEST_COMPLETE, audit_details)
 
-        # Record for /broker/recent (S5: Dashboard Evolution)
-        if self._record_fn is not None:
-            self._record_fn(
-                model=model,
-                endpoint=path,
-                tier=tier.value,
-                queue_wait_s=queue_wait_seconds,
-                duration_s=dispatch_duration,
-                status_code=200,
-            )
+        # Record for /broker/recent (S5: Dashboard Evolution). Streaming
+        # requests record in the generator's finally instead (real duration
+        # + real status); non-streaming records here with the actual result
+        # status so error responses (e.g. the 502 backend-unavailable path)
+        # are no longer logged as 200.
+        if not is_streaming:
+            record_complete(getattr(result, "status_code", 200))
 
         return result
 
@@ -510,6 +526,7 @@ class OllamaProxy:
         model: str = "", path: str = "", tier: PriorityTier = PriorityTier.AGENT,
         done_fn: Callable[[], None] | None = None,
         routing_meta: dict[str, str] | None = None,
+        record_fn: Callable[[int], None] | None = None,
     ) -> StreamingResponse:
         """Stream Ollama's NDJSON response back to the client.
 
@@ -518,29 +535,38 @@ class OllamaProxy:
 
         done_fn is called in the generator's finally block so the scheduler
         is unblocked only after the last byte has been sent to the client,
-        preventing concurrent Ollama access.
+        preventing concurrent Ollama access. record_fn (if given) is called
+        there too, with the real outcome status, so /broker/latency sees the
+        full stream duration instead of response-object construction time.
         """
         headers = self._forward_headers(request)
 
         cb = self.circuit_breaker
 
         async def generate():
+            # 502 mirrors _forward_response's backend-unavailable status; an
+            # opened stream overwrites this with the upstream status code.
+            outcome_status = 502
             try:
                 async with self._http.stream(
                     "POST", url, content=body, headers=headers,
                 ) as resp:
+                    outcome_status = resp.status_code
                     async for chunk in resp.aiter_bytes():
                         yield chunk
                 if cb:
                     await cb.record_success()
             except Exception as e:
                 logger.error("Streaming proxy error: %s", e)
+                outcome_status = 502
                 if cb:
                     await cb.record_failure()
                 error_json = json.dumps({"error": str(e)}).encode() + b"\n"
                 yield error_json
             finally:
                 self._requests_served += 1
+                if record_fn:
+                    record_fn(outcome_status)
                 if done_fn:
                     done_fn()  # Unblock scheduler — this request is done
 
