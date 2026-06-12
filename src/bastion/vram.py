@@ -97,12 +97,16 @@ class ResidencyCache:
         vram_tracker: VRAMTracker,
         ttl_seconds: float = 1.0,
         max_stale_seconds: float = 30.0,
+        declassify_after: int = 2,
     ) -> None:
         self._vram_tracker = vram_tracker
         self._ttl_seconds = ttl_seconds
         self._max_stale_seconds = max_stale_seconds
+        self._declassify_after = declassify_after
         self._cache: list[LoadedModel] | None = None
         self._cache_timestamp: float = 0.0
+        self._miss_counts: dict[str, int] = {}
+        self._accept_next_verbatim = False
         self._lock = asyncio.Lock()
 
     async def _refresh_if_needed(self) -> bool:
@@ -141,10 +145,60 @@ class ResidencyCache:
                     return False
                 logger.debug("Residency cache refresh skipped: tracker state unknown")
                 return self._cache is not None
-            self._cache = fresh
+            self._cache = self._merge_with_flicker_hold(fresh)
             self._cache_timestamp = now
             logger.debug("Residency cache refreshed: %d models loaded", len(self._cache))
         return True
+
+    def _merge_with_flicker_hold(self, fresh: list[LoadedModel]) -> list[LoadedModel]:
+        """Debounce residency *declassification* against /api/ps partial views.
+
+        Under concurrent inference Ollama's ``/api/ps`` can omit a busy model
+        from a response while it is still resident and serving (observed
+        2026-06-12: council models missing from 1-2 consecutive 0.5s polls
+        with warm sub-second answers throughout, and a production audit entry
+        recording a swap from a model to itself). Treating a single missing
+        read as an unload sends resident models down the scheduler's swap
+        path — phantom ``total_model_swaps``, spurious 2s cooldowns that
+        serialize concurrent dispatch, thrashing-detector noise, and
+        reconcile() ledger churn.
+
+        A model previously reported resident is therefore HELD until it is
+        missing from ``declassify_after`` consecutive successful refreshes.
+        Newly appearing models are accepted immediately. BASTION-initiated
+        unloads bypass the hold: :meth:`invalidate` makes the next refresh
+        authoritative (``declassify_after=1`` disables holding entirely).
+        """
+        if self._accept_next_verbatim:
+            self._accept_next_verbatim = False
+            self._miss_counts.clear()
+            return fresh
+        fresh_names = {m.name for m in fresh}
+        held: list[LoadedModel] = []
+        for prior in self._cache or []:
+            if prior.name in fresh_names:
+                continue
+            misses = self._miss_counts.get(prior.name, 0) + 1
+            if misses >= self._declassify_after:
+                self._miss_counts.pop(prior.name, None)
+                logger.info(
+                    "Residency: '%s' missing from %d consecutive /api/ps "
+                    "reads — declassified",
+                    prior.name, misses,
+                )
+            else:
+                self._miss_counts[prior.name] = misses
+                held.append(prior)
+                logger.debug(
+                    "Residency: holding '%s' through /api/ps flicker "
+                    "(miss %d/%d)",
+                    prior.name, misses, self._declassify_after,
+                )
+        # A model that reappeared resets its miss streak.
+        for name in list(self._miss_counts):
+            if name in fresh_names:
+                self._miss_counts.pop(name)
+        return fresh + held
 
     async def get_resident_models(self) -> set[str] | None:
         """Get set of currently resident model names.
@@ -199,9 +253,12 @@ class ResidencyCache:
         """Force cache expiry on next query.
 
         Call this after BASTION-initiated load/unload operations to ensure
-        scheduler sees the updated state immediately.
+        the scheduler sees the updated state immediately. The next refresh is
+        taken verbatim — the flicker-hold debounce is bypassed so a genuine
+        unload declassifies without waiting out the miss streak.
         """
         self._cache_timestamp = 0.0
+        self._accept_next_verbatim = True
         logger.debug("Residency cache invalidated")
 
 
