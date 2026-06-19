@@ -100,6 +100,27 @@ async def test_trace_panel_handles_partial_rows() -> None:
         assert table.row_count == 1
 
 
+async def test_trace_panel_source_column() -> None:
+    """Source column shows the declared identity, '-' when absent, and
+    truncates long names to the column width."""
+    recent = [
+        {"timestamp": 1.0, "model": "m", "tier": "agent",
+         "queue_wait_s": 0.0, "duration_s": 1.0, "status_code": 200,
+         "source": "cortex-digest"},
+        {"timestamp": 2.0, "model": "m", "tier": "agent",
+         "queue_wait_s": 0.0, "duration_s": 1.0, "status_code": 200,
+         "source": "ollama"},
+        {"timestamp": 3.0, "model": "m", "tier": "agent",
+         "queue_wait_s": 0.0, "duration_s": 1.0, "status_code": 200},
+    ]
+    app = _PanelHarness(TracePanel)
+    async with app.run_test():
+        panel = app.query_one(TracePanel)
+        table = panel.render_data(recent)
+        cells = [str(c) for c in table.columns[2].cells]
+        assert cells == ["cortex-di…", "ollama", "-"]
+
+
 async def test_trace_panel_truncates_to_twenty() -> None:
     """At most 20 rows render even when the input contains many more."""
     recent = [

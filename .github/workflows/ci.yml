@@ -22,10 +22,17 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: pip install -e ".[dev,dashboard,a2a,metrics,persistence]"
+        # -c constraints.txt pins the known-good closure so CI reproduces the
+        # env where the suite is green (interim; uv/pip-tools lockfile to follow).
+        run: pip install -e ".[dev,dashboard,a2a,metrics,persistence]" -c constraints.txt
 
       - name: Lint
         run: ruff check src/ tests/
+
+      - name: Metric cardinality lint
+        # Enforce the Prometheus label permitted-set (spec Section 3 rule #2):
+        # fails the build on any per-PID/per-id label in metrics.py.
+        run: python scripts/check_metric_cardinality.py
 
       - name: Type check
         run: mypy src/bastion --ignore-missing-imports --no-strict-optional

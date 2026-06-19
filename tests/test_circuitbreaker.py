@@ -332,6 +332,55 @@ class TestCircuitBreakerTransport:
         assert breaker._consecutive_failures == 1
 
     @pytest.mark.asyncio
+    async def test_remote_protocol_error_records_failure_and_reraises(
+        self, breaker: CircuitBreaker,
+    ) -> None:
+        """RemoteProtocolError (protocol-level corruption) must count toward
+        the breaker — previously it propagated without affecting the counter."""
+        inner = AsyncMock()
+        inner.handle_async_request = AsyncMock(
+            side_effect=httpx.RemoteProtocolError("peer closed connection"),
+        )
+        transport = CircuitBreakerTransport(breaker, inner=inner)
+
+        with pytest.raises(httpx.RemoteProtocolError):
+            await transport.handle_async_request(self._make_request())
+
+        assert breaker._consecutive_failures == 1
+
+    @pytest.mark.asyncio
+    async def test_pool_timeout_records_failure_and_reraises(
+        self, breaker: CircuitBreaker,
+    ) -> None:
+        """PoolTimeout (connection-pool pressure) must count toward the breaker."""
+        inner = AsyncMock()
+        inner.handle_async_request = AsyncMock(side_effect=httpx.PoolTimeout("pool exhausted"))
+        transport = CircuitBreakerTransport(breaker, inner=inner)
+
+        with pytest.raises(httpx.PoolTimeout):
+            await transport.handle_async_request(self._make_request())
+
+        assert breaker._consecutive_failures == 1
+
+    @pytest.mark.asyncio
+    async def test_transport_errors_can_trip_circuit(self, breaker: CircuitBreaker) -> None:
+        """Three consecutive transport-level errors of mixed type open the circuit."""
+        inner = AsyncMock()
+        errors = [
+            httpx.RemoteProtocolError("corrupt"),
+            httpx.PoolTimeout("exhausted"),
+            httpx.WriteError("broken pipe"),
+        ]
+        transport = CircuitBreakerTransport(breaker, inner=inner)
+
+        for err in errors:
+            inner.handle_async_request = AsyncMock(side_effect=err)
+            with pytest.raises(httpx.TransportError):
+                await transport.handle_async_request(self._make_request())
+
+        assert breaker.state == "open"
+
+    @pytest.mark.asyncio
     async def test_aclose_closes_inner_transport(self, breaker: CircuitBreaker) -> None:
         """aclose() should delegate to the inner transport."""
         inner = AsyncMock()

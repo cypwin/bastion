@@ -34,7 +34,9 @@ from bastion.dashboard.panels_broker import (
     ThrashingPanel,
     WatchdogPanel,
 )
+from bastion.dashboard.panels_correlation import CorrelationPanel
 from bastion.dashboard.panels_gpu import GPUPanel, ModelsPanel, VRAMLedgerPanel
+from bastion.dashboard.panels_processes import ProcessAttributionPanel
 from bastion.dashboard.panels_secondary import (
     A2ATaskPanel,
     AuditStreamPanel,
@@ -58,10 +60,11 @@ LAYOUT_MODES: set[str] = {"compact", "standard", "full"}
 # ---------------------------------------------------------------------------
 # Auto-fan constants
 # ---------------------------------------------------------------------------
-
-_AUTO_FAN_TRIGGER_C = 80
-_AUTO_FAN_SPEED = "90"
-_AUTO_FAN_RESET_C = 70
+# Moved to ``bastion.constants`` so the correlation engine can reuse the
+# definitive fan curve without importing this (Textual) app module (spec
+# Section 6.5; ADR-005). Re-exported here for back-compat with existing
+# references in this module.
+from bastion.constants import _AUTO_FAN_HYSTERESIS_C, _fan_band  # noqa: E402
 
 
 class BastionDashboard(App):
@@ -152,11 +155,17 @@ class BastionDashboard(App):
         self._consecutive_failures: int = 0
         self._last_ok_time: str | None = None
         self._last_data: dict[str, Any] | None = None
+        # Cached per-process attribution snapshot (spec 5.3). Populated by
+        # refresh_data from GET /broker/processes; consumed by the
+        # ProcessAttributionPanel and read by GPUProcessListModal on open
+        # (no UI-thread subprocess). None until the first poll lands.
+        self._last_process_snapshot: dict[str, Any] | None = None
         self._backoff_until: float = 0.0
 
         # Auto-fan state
         self._auto_fan_enabled: bool = False
-        self._auto_fan_state: str = "idle"  # idle | triggered | cooling
+        self._auto_fan_state: str = "idle"  # idle | cooling
+        self._auto_fan_speed: str | None = None  # applied curve speed, None = BIOS auto
 
         # Secondary panel toggle
         self._show_secondary: bool = False
@@ -189,9 +198,17 @@ class BastionDashboard(App):
                 yield CircuitBreakerPanel(id="circuit-breaker")
                 yield ThrashingPanel(id="thrashing")
                 yield TracePanel(id="trace")
-                yield A2ATaskPanel(id="a2a-tasks")
-                yield LeasePanel(id="leases")
-                yield AuditStreamPanel(id="audit-stream")
+                # Secondary toggle group (spec 7.1): five panels rendered as a
+                # 3+2 two-column sub-grid so the column does not grow too tall.
+                # Shown only when [t] toggles _show_secondary in full layout.
+                with Horizontal(id="secondary-grid"):
+                    with VerticalScroll(id="secondary-col-a"):
+                        yield A2ATaskPanel(id="a2a-tasks")
+                        yield LeasePanel(id="leases")
+                        yield AuditStreamPanel(id="audit-stream")
+                    with VerticalScroll(id="secondary-col-b"):
+                        yield ProcessAttributionPanel(id="processes")
+                        yield CorrelationPanel(id="correlation")
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -219,8 +236,13 @@ class BastionDashboard(App):
         right_col = self.query_one("#right-col")
         third_col = self.query_one("#third-col")
 
-        # Secondary panels: hidden by default, shown with [t] toggle
-        secondary_ids = {"a2a-tasks", "leases", "audit-stream"}
+        # Secondary panels: hidden by default, shown with [t] toggle. Grew from
+        # 3 to 5 (spec 7.1) — `processes` + `correlation` joined — and now render
+        # as a 3+2 two-column sub-grid (`#secondary-grid`) so the third column
+        # does not become too tall.
+        secondary_ids = {
+            "a2a-tasks", "leases", "audit-stream", "processes", "correlation",
+        }
         # Always visible in full mode (trace is request history — essential)
         non_secondary_ids = {"scheduler", "watchdog", "circuit-breaker", "thrashing", "trace"}
 
@@ -235,7 +257,11 @@ class BastionDashboard(App):
             right_col.display = True
             third_col.display = True
 
-            # Toggle secondary vs non-secondary panels within third-col
+            # Toggle secondary vs non-secondary panels within third-col. The
+            # wrapping sub-grid container is toggled too so it occupies no space
+            # when the secondaries are hidden.
+            with contextlib.suppress(Exception):
+                self.query_one("#secondary-grid").display = self._show_secondary
             for panel_id in secondary_ids:
                 with contextlib.suppress(Exception):
                     self.query_one(f"#{panel_id}").display = self._show_secondary
@@ -337,7 +363,10 @@ class BastionDashboard(App):
         alerts = self._evaluate_alerts(data)
 
         # Fetch supplemental data in parallel
-        health_data, vram_ledger, watchdog_data, queue_diag, recent, counters, thrashing = (
+        (
+            health_data, vram_ledger, watchdog_data, queue_diag, recent,
+            counters, thrashing, processes, snapshot,
+        ) = (
             await asyncio.gather(
                 self._client.get_health(),
                 self._client.get_vram_ledger(),
@@ -346,6 +375,8 @@ class BastionDashboard(App):
                 self._client.get_recent(),
                 self._client.get_counters(),
                 self._client.get_thrashing(),
+                self._client.get_processes(),
+                self._client.get_snapshot(),
                 return_exceptions=True,
             )
         )
@@ -365,6 +396,16 @@ class BastionDashboard(App):
             counters = {}
         if isinstance(thrashing, BaseException):
             thrashing = {}
+        if isinstance(processes, BaseException) or not processes:
+            processes = self._last_process_snapshot or {}
+        # Snapshot carries the correlation leg (RiskIndex / thermal / contention
+        # / enriched stall / ring tail) — direct-accessor dict for the panel.
+        if isinstance(snapshot, BaseException) or not isinstance(snapshot, dict):
+            snapshot = {}
+        # Cache the process-attribution snapshot so the ProcessAttributionPanel
+        # and the GPUProcessListModal (which now reads app._last_process_snapshot
+        # instead of spawning a subprocess, spec 5.3) share one fetch.
+        self._last_process_snapshot = cast(dict[str, Any], processes)
 
         # Cast to concrete types after exception normalization above
         health_data = cast(dict[str, Any], health_data)
@@ -529,6 +570,25 @@ class BastionDashboard(App):
         audit_events = data.get("recent_audit_events", [])
         audit_panel.update(audit_panel.render_data(audit_events))
 
+        # Process attribution (spec 5.3) — dict-accessor panel fed the cached
+        # ProcessSnapshot from GET /broker/processes (TUI + JSON only).
+        with contextlib.suppress(Exception):
+            proc_panel = self.query_one("#processes", ProcessAttributionPanel)
+            proc_panel.update(
+                proc_panel.render_data(self._last_process_snapshot)
+            )
+
+        # Correlation (spec 6.x) — dict-accessor panel fed the `correlation` leg
+        # of GET /broker/snapshot (RiskIndex / thermal / contention / stall /
+        # ring tail). Tolerates an empty leg (no engine yet / no risk inputs).
+        with contextlib.suppress(Exception):
+            corr_panel = self.query_one("#correlation", CorrelationPanel)
+            corr_panel.update(
+                corr_panel.render_data(
+                    snapshot.get("correlation") if isinstance(snapshot, dict) else None
+                )
+            )
+
     # ------------------------------------------------------------------
     # Alert evaluation
     # ------------------------------------------------------------------
@@ -614,23 +674,68 @@ class BastionDashboard(App):
     # ------------------------------------------------------------------
 
     def _check_auto_fan(self, data: dict[str, Any]) -> None:
-        """Check CPU temperature and trigger fan speed escalation if needed."""
+        """Walk the GPU fan along the escalation curve, CPU-triggered.
+
+        The CPU temperature decides when to engage and when to release the
+        override (60→30%, 70→50%, 80→90%, >85→100%; release below the curve
+        with ``_AUTO_FAN_HYSTERESIS_C`` of hysteresis). While the override is
+        active the GPU's own VBIOS fan curve is SUSPENDED
+        (GPUFanControlState=1), so the GPU temperature acts as a floor: the
+        applied duty is never below what the GPU's own band demands —
+        otherwise a CPU-derived 30% could undercool a blazing GPU.
+        Releasing to "auto" with a hot GPU is safe: the firmware curve
+        resumes immediately.
+        """
         if not self._auto_fan_enabled or not fan_control_available():
             return
 
         cpu_temp = self._collector.read_cpu_temp()
         if cpu_temp is None:
             return
+        gpu_temp = (data.get("gpu") or {}).get("temperature_c")
 
-        if self._auto_fan_state == "idle" and cpu_temp >= _AUTO_FAN_TRIGGER_C:
-            self._auto_fan_state = "triggered"
-            success, _msg = set_fan_speed(_AUTO_FAN_SPEED)
-            if success:
-                self._auto_fan_state = "cooling"
-        elif self._auto_fan_state == "cooling" and cpu_temp < _AUTO_FAN_RESET_C:
-            success, _msg = set_fan_speed("auto")
-            if success:
-                self._auto_fan_state = "idle"
+        def pct(band: str | None) -> int:
+            return 0 if band is None else int(band)
+
+        # *_up: band at the actual temperature (escalation). *_down: band as
+        # if hotter by the hysteresis margin — only when even THIS lands
+        # lower has the temperature genuinely left the applied band.
+        cpu_up = _fan_band(cpu_temp)
+        cpu_down = _fan_band(cpu_temp + _AUTO_FAN_HYSTERESIS_C)
+        gpu_up = _fan_band(gpu_temp) if gpu_temp is not None else None
+        gpu_down = (
+            _fan_band(gpu_temp + _AUTO_FAN_HYSTERESIS_C)
+            if gpu_temp is not None else None
+        )
+
+        applied = self._auto_fan_speed
+        if applied is None:
+            # Engagement is CPU-driven; a hot GPU in auto mode is the
+            # firmware's job, not ours.
+            if cpu_up is not None:
+                self._apply_auto_fan(str(max(pct(cpu_up), pct(gpu_up))))
+            return
+
+        if cpu_down is None:
+            # CPU left the curve — hand control back to the GPU firmware.
+            self._apply_auto_fan(None)
+            return
+
+        target_up = max(pct(cpu_up), pct(gpu_up))
+        if target_up > int(applied):
+            self._apply_auto_fan(str(target_up))
+            return
+        target_down = max(pct(cpu_down), pct(gpu_down))
+        if target_down < int(applied):
+            self._apply_auto_fan(str(target_down))
+
+    def _apply_auto_fan(self, speed: str | None) -> None:
+        """Set the fan to ``speed`` (None = BIOS auto) and track the state."""
+        success, _msg = set_fan_speed(speed if speed is not None else "auto")
+        if not success:
+            return
+        self._auto_fan_speed = speed
+        self._auto_fan_state = "idle" if speed is None else "cooling"
 
     # ------------------------------------------------------------------
     # Action methods
@@ -726,6 +831,7 @@ class BastionDashboard(App):
                 self._auto_fan_enabled = not self._auto_fan_enabled
                 if not self._auto_fan_enabled:
                     self._auto_fan_state = "idle"
+                    self._auto_fan_speed = None
                 return
             success, msg = set_fan_speed(speed)
             if not success:
@@ -739,12 +845,23 @@ class BastionDashboard(App):
         def _handle_process_select(pid: str) -> None:
             if not pid:
                 return
-            # Find process details for confirmation
-            procs = SystemDataCollector.query_gpu_processes()
-            proc = next((p for p in procs if p["pid"] == pid), None)
+            # Find process details for confirmation from the cached snapshot
+            # (spec 5.3 — no UI-thread subprocess; the modal and this lookup both
+            # read app._last_process_snapshot, which refresh_data keeps current).
+            snapshot = self._last_process_snapshot or {}
+            gpu_rows = snapshot.get("gpu_processes") or []
+            proc = next(
+                (p for p in gpu_rows if str(p.get("pid")) == pid), None
+            )
             if proc is None:
                 self.notify(f"Process {pid} no longer exists", severity="warning")
                 return
+            vram = proc.get("vram_mb")
+            proc = {
+                "pid": str(proc.get("pid")),
+                "name": str(proc.get("name") or ""),
+                "vram_mb": str(vram) if vram is not None else "?",
+            }
 
             def _handle_kill_confirm(action: str) -> None:
                 if not action:

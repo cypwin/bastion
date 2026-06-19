@@ -489,3 +489,70 @@ class TestHeartbeatFlow:
         valid, reason = handler.validate_lease(lease.lease_id, token)
         assert valid is False
         assert "not found" in reason.lower()
+
+
+# ---------------------------------------------------------------------------
+# try_create_lease — atomic check-and-create (single grant per model)
+# ---------------------------------------------------------------------------
+
+
+class TestTryCreateLease:
+    """`try_create_lease` closes the TOCTOU window in the
+    `if not has_active_lease: create_lease(...)` caller pattern by doing the
+    check and the create atomically under the handler's lease lock."""
+
+    async def _make_handler(self):
+        from bastion.a2a import A2AHandler
+
+        return A2AHandler(
+            config=BrokerConfig(),
+            enqueue_fn=AsyncMock(),
+            vram_tracker=MagicMock(),
+            scheduler=MagicMock(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_grants_when_no_active_lease(self) -> None:
+        handler = await self._make_handler()
+        lease = handler.try_create_lease(
+            model="qwen3:8b", max_requests=5, ttl_seconds=60.0, idle_timeout=30.0
+        )
+        assert lease is not None
+        assert lease.model == "qwen3:8b"
+        assert lease.lease_id in handler._leases
+        assert handler.has_active_lease("qwen3:8b") is True
+
+    @pytest.mark.asyncio
+    async def test_refuses_when_active_lease_exists(self) -> None:
+        handler = await self._make_handler()
+        first = handler.try_create_lease(model="qwen3:8b")
+        assert first is not None
+        second = handler.try_create_lease(model="qwen3:8b")
+        assert second is None
+        assert len(handler._leases) == 1
+
+    @pytest.mark.asyncio
+    async def test_grants_per_model_independently(self) -> None:
+        handler = await self._make_handler()
+        assert handler.try_create_lease(model="a") is not None
+        assert handler.try_create_lease(model="b") is not None
+        assert handler.try_create_lease(model="a") is None
+
+    @pytest.mark.asyncio
+    async def test_grants_after_release(self) -> None:
+        handler = await self._make_handler()
+        first = handler.try_create_lease(model="a")
+        assert first is not None
+        handler.release_lease(first.lease_id)
+        second = handler.try_create_lease(model="a")
+        assert second is not None
+        assert second.fencing_token > first.fencing_token
+
+    @pytest.mark.asyncio
+    async def test_grants_after_expiry(self) -> None:
+        handler = await self._make_handler()
+        old = handler.try_create_lease(model="a", ttl_seconds=0.0)
+        assert old is not None
+        fresh = handler.try_create_lease(model="a")
+        assert fresh is not None
+        assert fresh.fencing_token > old.fencing_token

@@ -22,13 +22,14 @@ class TracePanel(BastionPanel):
         table = Table(title="Request Trace", expand=True, show_edge=False, pad_edge=False)
         table.add_column("Time", width=8)
         table.add_column("Model", ratio=2)
+        table.add_column("Source", width=10)
         table.add_column("Tier", width=6)
         table.add_column("Wait", width=5, justify="right")
         table.add_column("Dur", width=5, justify="right")
         table.add_column("St", width=3, justify="right")
 
         if not recent:
-            table.add_row(Text("(no requests)", style="dim"), "", "", "", "", "")
+            table.add_row(Text("(no requests)", style="dim"), "", "", "", "", "", "")
         else:
             for req in recent[:20]:  # Show last 20 in the panel
                 ts = datetime.fromtimestamp(req.get("timestamp", 0)).strftime("%H:%M:%S")
@@ -36,12 +37,19 @@ class TracePanel(BastionPanel):
                 # Truncate long model names
                 if len(model) > 15:
                     model = model[:12] + "..."
+                # Declared identity (X-Agent-ID) or User-Agent product token.
+                source = req.get("source") or "-"
+                if len(source) > 10:
+                    source = source[:9] + "…"
                 tier = req.get("tier", "?")[:4]
                 wait = f"{req.get('queue_wait_s', 0):.1f}s"
                 dur = f"{req.get('duration_s', 0):.1f}s"
                 status = str(req.get("status_code", "?"))
                 style = "green" if status == "200" else "red"
-                table.add_row(ts, model, tier, wait, dur, Text(status, style=style))
+                table.add_row(
+                    ts, model, Text(source, style="dim" if source == "-" else ""),
+                    tier, wait, dur, Text(status, style=style),
+                )
 
         return table
 

@@ -11,7 +11,7 @@ Usage:
     sudo python gpu_fan_control_wrapper.py 100     # Set to 100%
     sudo python gpu_fan_control_wrapper.py auto    # Reset to auto
 
-Origin: Adapted from PHENOTYPE project for BASTION standalone use.
+Origin: Adapted from an earlier in-house monitoring project for BASTION standalone use.
 """
 
 from __future__ import annotations

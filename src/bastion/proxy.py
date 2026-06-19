@@ -30,8 +30,9 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from bastion import audit
+from bastion import audit, metrics
 from bastion.circuitbreaker import CircuitBreaker
+from bastion.inference_tap import InferenceTapCollector
 from bastion.models import BrokerConfig, PriorityTier, QueuedRequest
 
 logger = logging.getLogger(__name__)
@@ -173,7 +174,9 @@ class OllamaProxy:
                 )
 
             route_model = self.config.complexity_routing.routes.get(task_complexity)
-            if route_model:
+            if route_model and (
+                not model or self.config.complexity_routing.override_explicit
+            ):
                 original_model = model
                 model = route_model
                 payload["model"] = model
@@ -185,6 +188,18 @@ class OllamaProxy:
                 logger.info(
                     "M58 routing: %s -> %s (complexity=%s, agent=%s)",
                     original_model, model, task_complexity,
+                    request.headers.get("x-agent-id", "unknown"),
+                )
+            elif route_model:
+                # Explicit client model wins; record the skipped route for audit.
+                routing_meta = {
+                    "requested": model,
+                    "routed": model,
+                    "reason": f"complexity-{task_complexity}-skipped-explicit-model",
+                }
+                logger.info(
+                    "M58 routing skipped: explicit model %s kept (complexity=%s, agent=%s)",
+                    model, task_complexity,
                     request.headers.get("x-agent-id", "unknown"),
                 )
 
@@ -239,6 +254,12 @@ class OllamaProxy:
         if options:
             payload["options"] = options
 
+        # ctx-utilization denominator (spec 5.4 precedence chain): the request's
+        # own options.num_ctx wins, else the value injected above (per-model
+        # default_num_ctx, else request_overrides.default_num_ctx), else None ->
+        # the tap reports ctx_utilization=None rather than a misleading ratio.
+        injected_num_ctx = options.get("num_ctx")
+
         # Detect priority tier
         tier = self._detect_priority(request)
         base_priority = tier.base_priority(self.config.priorities)
@@ -282,10 +303,19 @@ class OllamaProxy:
                     status_code=503,
                 )
             except Exception:
-                logger.error("Queue full — rejecting request for model '%s'", model)
+                # A non-RuntimeError from _enqueue_fn is a programming bug
+                # or genuine infrastructure failure — NOT a queue-full
+                # signal. Log with traceback so operators see the real
+                # cause, and surface 500 so clients distinguish 'broker
+                # bug, retrying won't help' from 503 'try again later'.
+                # KNOWN_ISSUES (resolved in v0.4.1).
+                logger.error(
+                    "Unexpected error from enqueue_fn for model '%s'",
+                    model, exc_info=True,
+                )
                 return JSONResponse(
-                    {"error": "Broker queue full — try again later"},
-                    status_code=503,
+                    {"error": "Internal broker error"},
+                    status_code=500,
                 )
 
             # Wait for scheduler to grant this request (model loaded and ready)
@@ -299,6 +329,19 @@ class OllamaProxy:
                 )
                 return JSONResponse(
                     {"error": "Request timed out waiting in scheduler queue"},
+                    status_code=504,
+                )
+
+            # A grant set by the queue sweeper is a rejection, not a grant:
+            # the scheduler never intended this request to run. Forwarding
+            # here would dispatch to Ollama (incrementing in-flight
+            # counters) for a request that was swept as stale.
+            if getattr(grant_event, "swept", False):
+                logger.warning(
+                    "Request %s was swept from the queue — rejecting", queued.id,
+                )
+                return JSONResponse(
+                    {"error": "Request swept from scheduler queue after staleness TTL"},
                     status_code=504,
                 )
 
@@ -318,6 +361,50 @@ class OllamaProxy:
         target_url = f"{self._backend_url}{path}"
         dispatch_start = time.time()
 
+        # Source attribution for /broker/recent: declared identity
+        # (X-Agent-ID) wins; otherwise fall back to the User-Agent product
+        # token (e.g. "ollama/0.5.1" -> "ollama"). The broker only knows
+        # what clients declare — process/terminal sniffing is deliberately
+        # not attempted (connection pooling and SOCKS paths misattribute).
+        _ua = request.headers.get("user-agent", "")
+        source = agent_id or _ua.split("/", 1)[0].strip()[:24] or None
+
+        # Per-request inference tap (spec 5.4): O(1)/chunk, never buffers. The
+        # streaming generator feeds on_chunk(); the non-streaming path feeds
+        # on_complete_response(). At true completion the six derived signals
+        # (decode/prefill tps, ttft, ctx-utilization, eval/prompt counts) are
+        # threaded into record_recent_request. Each is None when unmeasurable
+        # (cache hit, missing field, no num_ctx) — never a misleading 0.
+        inference_tap = InferenceTapCollector(injected_num_ctx=injected_num_ctx)
+
+        def record_complete(status_code: int) -> None:
+            # Record for /broker/recent + /broker/latency at TRUE completion:
+            # duration_s is measured from dispatch_start to *now*, so for
+            # streaming requests the caller must invoke this after the last
+            # byte (the generator's finally), not when the response object is
+            # constructed — otherwise streaming durations collapse to ~0.
+            if self._record_fn is None:
+                return
+            ttft_s: float | None = None
+            if inference_tap.first_chunk_time is not None:
+                ttft_s = max(0.0, inference_tap.first_chunk_time - dispatch_start)
+            self._record_fn(
+                model=model,
+                endpoint=path,
+                tier=tier.value,
+                queue_wait_s=queue_wait_seconds,
+                duration_s=time.time() - dispatch_start,
+                status_code=status_code,
+                streaming=is_streaming,
+                source=source,
+                prefill_tps=inference_tap.prefill_tps,
+                decode_tps=inference_tap.decode_tps,
+                ttft_s=ttft_s,
+                ctx_utilization=inference_tap.ctx_utilization,
+                eval_count=inference_tap.eval_count,
+                prompt_eval_count=inference_tap.prompt_eval_count,
+            )
+
         result: StreamingResponse | JSONResponse
         try:
             if is_streaming:
@@ -325,12 +412,14 @@ class OllamaProxy:
                 result = await self._stream_response(
                     request, target_url, modified_body, model, path, tier,
                     done_fn=done_fn, routing_meta=routing_meta,
+                    record_fn=record_complete, dispatch_start=dispatch_start,
+                    inference_tap=inference_tap,
                 )
                 done_fn = None  # Generator owns done_fn now; prevent double-call in finally
             else:
                 result = await self._forward_response(
                     request, target_url, modified_body, model, path, tier,
-                    routing_meta=routing_meta,
+                    routing_meta=routing_meta, inference_tap=inference_tap,
                 )
         finally:
             # Non-streaming: call done_fn here (after _forward_response returns).
@@ -353,24 +442,25 @@ class OllamaProxy:
             audit_details["agent_id"] = agent_id
         if task_complexity:
             audit_details["task_complexity"] = task_complexity
-        if routing_meta:
+        if routing_meta and "reason" in routing_meta:
             audit_details["model_requested"] = routing_meta["requested"]
             audit_details["model_routed"] = routing_meta["routed"]
-            audit_details["routing_applied"] = True
+            audit_details["routing_reason"] = routing_meta["reason"]
+            audit_details["routing_applied"] = (
+                routing_meta["requested"] != routing_meta["routed"]
+            )
         else:
+            # routing_meta may exist with only _thrashing_warn (no routing)
             audit_details["routing_applied"] = False
         audit.emit(audit.EVENT_REQUEST_COMPLETE, audit_details)
 
-        # Record for /broker/recent (S5: Dashboard Evolution)
-        if self._record_fn is not None:
-            self._record_fn(
-                model=model,
-                endpoint=path,
-                tier=tier.value,
-                queue_wait_s=queue_wait_seconds,
-                duration_s=dispatch_duration,
-                status_code=200,
-            )
+        # Record for /broker/recent (S5: Dashboard Evolution). Streaming
+        # requests record in the generator's finally instead (real duration
+        # + real status); non-streaming records here with the actual result
+        # status so error responses (e.g. the 502 backend-unavailable path)
+        # are no longer logged as 200.
+        if not is_streaming:
+            record_complete(getattr(result, "status_code", 200))
 
         return result
 
@@ -483,50 +573,107 @@ class OllamaProxy:
         model: str = "", path: str = "", tier: PriorityTier = PriorityTier.AGENT,
         done_fn: Callable[[], None] | None = None,
         routing_meta: dict[str, str] | None = None,
-    ) -> StreamingResponse:
+        record_fn: Callable[[int], None] | None = None,
+        dispatch_start: float | None = None,
+        inference_tap: InferenceTapCollector | None = None,
+    ) -> StreamingResponse | JSONResponse:
         """Stream Ollama's NDJSON response back to the client.
 
         This is the most critical path — `ollama run` depends on streaming
         tokens in real time. Any buffering makes it appear frozen.
 
+        The upstream stream is opened *before* the StreamingResponse is
+        constructed so the client sees the real upstream status — an Ollama
+        5xx surfaces as a 5xx, not a 200 committed before upstream was
+        contacted. A connection-level failure returns a 502 JSONResponse
+        (done_fn/record_fn are honored on that path too, so the scheduler
+        slot is never leaked).
+
         done_fn is called in the generator's finally block so the scheduler
         is unblocked only after the last byte has been sent to the client,
-        preventing concurrent Ollama access.
+        preventing concurrent Ollama access. record_fn (if given) is called
+        there too, with the real outcome status, so /broker/latency sees the
+        full stream duration instead of response-object construction time.
         """
         headers = self._forward_headers(request)
 
         cb = self.circuit_breaker
 
+        stream_cm = self._http.stream("POST", url, content=body, headers=headers)
+        try:
+            resp = await stream_cm.__aenter__()
+        except Exception as e:
+            logger.error("Streaming proxy error (upstream connect): %s", e)
+            if cb:
+                await cb.record_failure()
+            self._requests_served += 1
+            if record_fn:
+                record_fn(502)
+            if done_fn:
+                done_fn()
+            return JSONResponse(
+                {"error": f"Ollama backend unavailable: {e}"}, status_code=502,
+            )
+
+        # TTFT tap: closure-captured flag, set on the first non-empty chunk.
+        # Semantic is "Ollama-receive -> first-token" (post-grant); the value is
+        # observed exactly once per streaming request. O(1) per chunk — the tap
+        # never buffers: each chunk is yielded immediately whether or not it is
+        # the first one. An empty keep-alive chunk does not count as a token.
         async def generate():
+            outcome_status = resp.status_code
+            ttft_observed = False
             try:
-                async with self._http.stream(
-                    "POST", url, content=body, headers=headers,
-                ) as resp:
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
+                async for chunk in resp.aiter_bytes():
+                    # Feed the per-request tap (O(1): parses one small object,
+                    # captures first-chunk time + the done:true token accounting)
+                    # then yield immediately — never buffered. Guarded so a
+                    # malformed chunk can never break the stream.
+                    if inference_tap is not None:
+                        with contextlib.suppress(Exception):
+                            inference_tap.on_chunk(chunk, time.time())
+                    if not ttft_observed and chunk and dispatch_start is not None:
+                        ttft_observed = True
+                        with contextlib.suppress(Exception):
+                            metrics.observe_llm_ttft(model, time.time() - dispatch_start)
+                    yield chunk
                 if cb:
-                    await cb.record_success()
+                    # An upstream 5xx is a backend failure even though no
+                    # exception was raised — count it toward the breaker
+                    # (S131: a 500 storm must not register as healthy).
+                    if resp.status_code >= 500:
+                        await cb.record_failure()
+                    else:
+                        await cb.record_success()
             except Exception as e:
                 logger.error("Streaming proxy error: %s", e)
+                outcome_status = 502
                 if cb:
                     await cb.record_failure()
                 error_json = json.dumps({"error": str(e)}).encode() + b"\n"
                 yield error_json
             finally:
+                with contextlib.suppress(Exception):
+                    await stream_cm.__aexit__(None, None, None)
                 self._requests_served += 1
+                if record_fn:
+                    record_fn(outcome_status)
                 if done_fn:
                     done_fn()  # Unblock scheduler — this request is done
 
         response_headers: dict[str, str] = {}
         if routing_meta:
-            response_headers["X-Model-Requested"] = routing_meta["requested"]
-            response_headers["X-Model-Routed"] = routing_meta["routed"]
-            response_headers["X-Routing-Reason"] = routing_meta["reason"]
+            # routing_meta may carry only _thrashing_warn (warn without routing)
+            if "reason" in routing_meta:
+                response_headers["X-Model-Requested"] = routing_meta["requested"]
+                response_headers["X-Model-Routed"] = routing_meta["routed"]
+                response_headers["X-Routing-Reason"] = routing_meta["reason"]
             if "_thrashing_warn" in routing_meta:
                 response_headers["X-Swap-Penalty-Warning"] = routing_meta["_thrashing_warn"]
 
         return StreamingResponse(
             generate(),
+            status_code=resp.status_code,
             media_type="application/x-ndjson",
             headers=response_headers,
         )
@@ -535,44 +682,69 @@ class OllamaProxy:
         self, request: Request, url: str, body: bytes,
         model: str = "", path: str = "", tier: PriorityTier = PriorityTier.AGENT,
         routing_meta: dict[str, str] | None = None,
+        inference_tap: InferenceTapCollector | None = None,
     ) -> JSONResponse:
         """Forward a non-streaming request and return the full response."""
         headers = self._forward_headers(request)
 
         try:
             resp = await self._http.post(url, content=body, headers=headers)
-            self._requests_served += 1
-            if self.circuit_breaker:
-                await self.circuit_breaker.record_success()
-
-            resp_json = resp.json()
-            response_headers: dict[str, str] = {}
-
-            if routing_meta:
-                response_headers["X-Model-Requested"] = routing_meta["requested"]
-                response_headers["X-Model-Routed"] = routing_meta["routed"]
-                response_headers["X-Routing-Reason"] = routing_meta["reason"]
-                if "_thrashing_warn" in routing_meta:
-                    response_headers["X-Swap-Penalty-Warning"] = routing_meta["_thrashing_warn"]
-
-            # Token count headers from Ollama response
-            prompt_tokens = resp_json.get("prompt_eval_count")
-            completion_tokens = resp_json.get("eval_count")
-            if prompt_tokens is not None:
-                response_headers["X-Prompt-Tokens"] = str(prompt_tokens)
-            if completion_tokens is not None:
-                response_headers["X-Completion-Tokens"] = str(completion_tokens)
-
-            return JSONResponse(
-                content=resp_json,
-                status_code=resp.status_code,
-                headers=response_headers,
-            )
         except Exception as e:
             logger.error("Forward proxy error to %s: %s: %s", url, type(e).__name__, repr(e))
             if self.circuit_breaker:
                 await self.circuit_breaker.record_failure()
             return JSONResponse({"error": f"Ollama backend unavailable: {e}"}, status_code=502)
+
+        self._requests_served += 1
+        if self.circuit_breaker:
+            # An upstream 5xx is a backend failure even though no exception
+            # was raised — count it toward the breaker (S131: a 500 storm
+            # must not register as healthy).
+            if resp.status_code >= 500:
+                await self.circuit_breaker.record_failure()
+            else:
+                await self.circuit_breaker.record_success()
+
+        try:
+            resp_json = resp.json()
+        except Exception:
+            # Upstream replied with a non-JSON body (Ollama 5xx can be plain
+            # text). Forward the upstream status with the body wrapped
+            # instead of dying or masking it as backend-unavailable.
+            resp_json = {
+                "error": f"upstream returned non-JSON response: {resp.text[:500]}",
+            }
+
+        # Feed the non-streaming token accounting into the tap so the six
+        # inference signals reach record_recent_request (caller records after
+        # this returns). Guarded — a missing/odd field never breaks forwarding.
+        if inference_tap is not None and isinstance(resp_json, dict):
+            with contextlib.suppress(Exception):
+                inference_tap.on_complete_response(resp_json)
+
+        response_headers: dict[str, str] = {}
+        if routing_meta:
+            # routing_meta may carry only _thrashing_warn (warn without routing)
+            if "reason" in routing_meta:
+                response_headers["X-Model-Requested"] = routing_meta["requested"]
+                response_headers["X-Model-Routed"] = routing_meta["routed"]
+                response_headers["X-Routing-Reason"] = routing_meta["reason"]
+            if "_thrashing_warn" in routing_meta:
+                response_headers["X-Swap-Penalty-Warning"] = routing_meta["_thrashing_warn"]
+
+        # Token count headers from Ollama response
+        prompt_tokens = resp_json.get("prompt_eval_count")
+        completion_tokens = resp_json.get("eval_count")
+        if prompt_tokens is not None:
+            response_headers["X-Prompt-Tokens"] = str(prompt_tokens)
+        if completion_tokens is not None:
+            response_headers["X-Completion-Tokens"] = str(completion_tokens)
+
+        return JSONResponse(
+            content=resp_json,
+            status_code=resp.status_code,
+            headers=response_headers,
+        )
 
     def _detect_priority(self, request: Request) -> PriorityTier:
         """Detect request priority from headers, intents, and heuristics.

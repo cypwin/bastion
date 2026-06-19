@@ -734,6 +734,41 @@ class TestLeaseContention:
         valid, _reason = handler.validate_lease(old.lease_id, old.fencing_token)
         assert valid is False
 
+    @pytest.mark.asyncio
+    async def test_try_create_lease_single_winner_under_thread_contention(self) -> None:
+        """N threads race try_create_lease for the same model — exactly one wins.
+
+        Real threads (not asyncio tasks) so the internal lease lock is what
+        prevents the double grant, not the event loop's cooperative scheduling.
+        This is the regression test for the `has_active_lease` →
+        `create_lease` TOCTOU window.
+        """
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        handler = await _make_lease_handler()
+        n_acquirers = 16
+        barrier = threading.Barrier(n_acquirers)
+
+        def acquire():
+            barrier.wait()
+            return handler.try_create_lease(
+                model="qwen3:14b",
+                max_requests=5,
+                ttl_seconds=60.0,
+                idle_timeout=30.0,
+            )
+
+        with ThreadPoolExecutor(max_workers=n_acquirers) as pool:
+            results = list(pool.map(lambda _: acquire(), range(n_acquirers)))
+
+        winners = [lease for lease in results if lease is not None]
+        assert len(winners) == 1, (
+            f"expected exactly one grant, got {len(winners)} — TOCTOU regression"
+        )
+        assert len(handler._leases) == 1
+        assert winners[0].lease_id in handler._leases
+
 
 # ---------------------------------------------------------------------------
 # Audit log ordering

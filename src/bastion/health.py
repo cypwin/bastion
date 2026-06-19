@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 
 from bastion.gpu import get_backend
+from bastion.metrics import update_gpu_temperature
 from bastion.models import GPUConfig, GPUStatus
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,14 @@ async def check_gpu_safe(config: GPUConfig) -> tuple[bool, str]:
         (is_safe, reason). If unsafe, reason explains why.
     """
     status = await query_gpu_status()
+
+    # Tier-0 dead-metric activation (spec 5.1 row 357): the die temperature is
+    # already in hand here on the fast cadence (this is the periodic chokepoint
+    # that fetches GPUStatus every scheduler tick). Publish it guarded on
+    # not-None so StubBackend / non-NVIDIA hosts skip the gauge rather than
+    # emitting a misleading 0.
+    if status.temperature_c is not None:
+        update_gpu_temperature(status.temperature_c)
 
     if status.temperature_c is not None and status.temperature_c > config.max_temperature_c:
         return False, (

@@ -191,3 +191,126 @@ class NetworkPanel(BastionPanel):
         table.add_row("Total D/U", f"{recv_gb:.2f} / {sent_gb:.2f} GB")
 
         return table
+
+
+class ContentionPanel(BastionPanel):
+    """Host-pressure panel: PSI, swap rate, block-device IO, CPU power, OOM.
+
+    A host/system-level panel (peer to MemoryPanel/NetworkPanel, spec 5.3) that
+    renders the ``ContentionSnapshot`` (spec 4.4) served by ``/broker/contention``.
+    Per ADR-005 it is a direct dict-accessor: ``render_data`` takes the plain
+    ``model_dump()`` dict and tolerates a ``None`` / partial / all-``None``
+    payload without crashing — every leg is independently guarded so the no-PSI
+    container / no-powercap / non-NVMe host (all ``None``/``[]``) renders cleanly
+    and never shows a misleading ``0`` row.
+    """
+
+    # Block-device cap so a many-drive host cannot make the panel unbounded.
+    _MAX_DEVICE_ROWS = 6
+
+    def render_data(
+        self,
+        contention: dict | None = None,
+        psi_io_full_warn_pct: float = 5.0,
+        psi_io_full_crit_pct: float = 25.0,
+    ) -> Table:
+        table = Table(title="Contention", expand=True, show_header=True)
+        table.add_column("Signal", style="cyan")
+        table.add_column("Value", justify="right")
+        table.add_column("St", width=3)
+
+        if not contention:
+            table.add_row("[dim]no data[/]", "", "")
+            return table
+
+        has_any = False
+
+        # ── PSI (some/full avg10) — io is the most load-bearing leg ──────
+        def _psi_row(label: str, value: float | None, warn: float, crit: float) -> None:
+            nonlocal has_any
+            if value is None:
+                return
+            has_any = True
+            if value >= crit:
+                style, st = "red bold", "!"
+            elif value >= warn:
+                style, st = "yellow", "?"
+            else:
+                style, st = "green", "ok"
+            table.add_row(label, f"[{style}]{value:.1f}[/]", f"[{style}]{st}[/]")
+
+        _psi_row(
+            "PSI io some",
+            contention.get("psi_io_some_avg10"),
+            psi_io_full_warn_pct,
+            psi_io_full_crit_pct,
+        )
+        _psi_row(
+            "PSI io full",
+            contention.get("psi_io_full_avg10"),
+            psi_io_full_warn_pct,
+            psi_io_full_crit_pct,
+        )
+        _psi_row("PSI cpu some", contention.get("psi_cpu_some_avg10"), 20.0, 60.0)
+        _psi_row("PSI mem some", contention.get("psi_mem_some_avg10"), 20.0, 60.0)
+
+        # ── Swap in/out rate (MB/s): yellow > 0.1, red > 5 ───────────────
+        def _swap_row(label: str, value: float | None) -> None:
+            nonlocal has_any
+            if value is None:
+                return
+            has_any = True
+            if value > 5.0:
+                style, st = "red bold", "!"
+            elif value > 0.1:
+                style, st = "yellow", "?"
+            else:
+                style, st = "green", "ok"
+            table.add_row(label, f"[{style}]{value:.1f} MB/s[/]", f"[{style}]{st}[/]")
+
+        _swap_row("Swap in", contention.get("swap_in_rate_mb_s"))
+        _swap_row("Swap out", contention.get("swap_out_rate_mb_s"))
+
+        # ── Block-device util% + await (red > 80, yellow > 50) ───────────
+        devices = contention.get("block_devices") or []
+        for dev in devices[: self._MAX_DEVICE_ROWS]:
+            has_any = True
+            util = dev.get("util_pct", 0.0) or 0.0
+            if util > 80.0:
+                style, st = "red bold", "!"
+            elif util > 50.0:
+                style, st = "yellow", "?"
+            else:
+                style, st = "green", "ok"
+            write_await = dev.get("write_await_ms")
+            await_txt = f" w{write_await:.0f}ms" if write_await is not None else ""
+            name = dev.get("device", "?")
+            table.add_row(
+                name, f"[{style}]{util:.0f}%[/]{await_txt}", f"[{style}]{st}[/]"
+            )
+        if len(devices) > self._MAX_DEVICE_ROWS:
+            extra = len(devices) - self._MAX_DEVICE_ROWS
+            table.add_row(f"[dim]... {extra} more[/]", "", "")
+
+        # ── CPU package power (host RAPL, Intel or AMD) ──────────────────
+        cpu_w = contention.get("cpu_package_watts")
+        if cpu_w is not None:
+            has_any = True
+            table.add_row("CPU pkg", f"{cpu_w:.1f} W", "")
+
+        # ── OOM kills: red row when the rate is positive ─────────────────
+        oom_rate = contention.get("oom_kill_rate")
+        oom_total = contention.get("oom_kill_total")
+        if oom_rate is not None and oom_rate > 0:
+            has_any = True
+            table.add_row(
+                "OOM kills", f"[red bold]{oom_total}[/]", "[red bold]![/]"
+            )
+        elif oom_total is not None:
+            has_any = True
+            table.add_row("OOM kills", f"[green]{oom_total}[/]", "[green]ok[/]")
+
+        if not has_any:
+            table.add_row("[dim](no pressure data)[/]", "", "")
+
+        return table

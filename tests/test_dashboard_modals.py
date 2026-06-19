@@ -290,24 +290,31 @@ async def test_gpu_process_list_modal_empty_composes() -> None:
 
 @pytest.mark.asyncio
 async def test_gpu_process_list_modal_populated_dismisses_with_pid() -> None:
-    procs = [
-        {"pid": "12345", "name": "ollama", "vram_mb": "8192"},
-        {"pid": "67890", "name": "python", "vram_mb": "2048"},
-    ]
-    with patch(
-        "bastion.dashboard.modals.SystemDataCollector.query_gpu_processes",
-        return_value=procs,
-    ):
-        app = _ModalHarness(GPUProcessListModal)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            modal = next(
-                s for s in app.screen_stack if isinstance(s, GPUProcessListModal)
-            )
-            # Click the first process button.
-            await pilot.click(modal.query_one("#gpuproc-12345"))
-            await pilot.pause()
-            assert app.result == "12345"
+    # The modal now reads the cached ProcessSnapshot (spec 5.3), not a
+    # subprocess; feed it via the snapshot harness.
+    snapshot = {
+        "top_processes": [],
+        "gpu_processes": [
+            {"pid": 12345, "name": "ollama", "vram_mb": 8192, "sm_pct": None,
+             "mem_pct": None, "enc_pct": None, "dec_pct": None,
+             "is_inference_owned": True, "role": "ollama"},
+            {"pid": 67890, "name": "python", "vram_mb": 2048, "sm_pct": None,
+             "mem_pct": None, "enc_pct": None, "dec_pct": None,
+             "is_inference_owned": False, "role": None},
+        ],
+        "own_pids": {}, "watchlist_hits": [], "recent_churn_events": [],
+        "collected_at": 1.0, "gpu_collected_at": 1.0,
+    }
+    app = _SnapshotHarness(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        modal = next(
+            s for s in app.screen_stack if isinstance(s, GPUProcessListModal)
+        )
+        # Click the first process button.
+        await pilot.click(modal.query_one("#gpuproc-12345"))
+        await pilot.pause()
+        assert app.result == "12345"
 
 
 @pytest.mark.asyncio
@@ -344,23 +351,130 @@ async def test_gpu_process_list_modal_escape_returns_empty() -> None:
 @pytest.mark.asyncio
 async def test_gpu_process_list_button_ids_textual_safe() -> None:
     """Process PIDs are integers in string form; ids must still be valid."""
-    procs = [
-        {"pid": "1234", "name": "ollama", "vram_mb": "1024"},
-        {"pid": "5678", "name": "x", "vram_mb": "2048"},
-    ]
+    snapshot = {
+        "top_processes": [],
+        "gpu_processes": [
+            {"pid": 1234, "name": "ollama", "vram_mb": 1024, "sm_pct": None,
+             "mem_pct": None, "enc_pct": None, "dec_pct": None,
+             "is_inference_owned": True, "role": "ollama"},
+            {"pid": 5678, "name": "x", "vram_mb": 2048, "sm_pct": None,
+             "mem_pct": None, "enc_pct": None, "dec_pct": None,
+             "is_inference_owned": False, "role": None},
+        ],
+        "own_pids": {}, "watchlist_hits": [], "recent_churn_events": [],
+        "collected_at": 1.0, "gpu_collected_at": 1.0,
+    }
+    app = _SnapshotHarness(snapshot)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        modal = next(
+            s for s in app.screen_stack if isinstance(s, GPUProcessListModal)
+        )
+        for btn in modal.query("Button"):
+            assert btn.id is not None
+            assert _TEXTUAL_ID.match(btn.id), f"bad id: {btn.id!r}"
+
+
+# ---------------------------------------------------------------------------
+# GPUProcessListModal — reads the cached snapshot, NOT a subprocess (T1, 5.3)
+# ---------------------------------------------------------------------------
+
+
+class _SnapshotHarness(App[Any]):
+    """App that exposes ``_last_process_snapshot`` (the cached attribution dict).
+
+    The refactored ``GPUProcessListModal`` must read the GPU rows from
+    ``app._last_process_snapshot`` (a ``ProcessSnapshot`` dict served by the
+    broker's 10s slow tick) and must **not** spawn an nvidia-smi subprocess on
+    open (spec 5.3 — moves the modal off the UI-thread subprocess).
+    """
+
+    def __init__(self, snapshot: Any) -> None:
+        super().__init__()
+        self._last_process_snapshot: Any = snapshot
+        self.result: Any = None
+        self.result_set: bool = False
+
+    def on_mount(self) -> None:
+        def _cb(value: Any) -> None:
+            self.result = value
+            self.result_set = True
+
+        self.push_screen(GPUProcessListModal(), callback=_cb)
+
+
+_SNAPSHOT_WITH_GPU = {
+    "top_processes": [],
+    "gpu_processes": [
+        {"pid": 12345, "name": "ollama", "vram_mb": 8192, "sm_pct": 80,
+         "mem_pct": 40, "enc_pct": None, "dec_pct": None,
+         "is_inference_owned": True, "role": "ollama"},
+        {"pid": 67890, "name": "python", "vram_mb": 2048, "sm_pct": 10,
+         "mem_pct": 5, "enc_pct": None, "dec_pct": None,
+         "is_inference_owned": False, "role": None},
+    ],
+    "own_pids": {"12345": "ollama"},
+    "watchlist_hits": [],
+    "recent_churn_events": [],
+    "collected_at": 1.0,
+    "gpu_collected_at": 1.0,
+}
+
+
+@pytest.mark.asyncio
+async def test_gpu_modal_reads_cached_snapshot_no_subprocess() -> None:
+    """compose() must read app._last_process_snapshot and NOT call the subprocess."""
     with patch(
         "bastion.dashboard.modals.SystemDataCollector.query_gpu_processes",
-        return_value=procs,
-    ):
-        app = _ModalHarness(GPUProcessListModal)
+    ) as mocked:
+        app = _SnapshotHarness(_SNAPSHOT_WITH_GPU)
         async with app.run_test() as pilot:
             await pilot.pause()
             modal = next(
                 s for s in app.screen_stack if isinstance(s, GPUProcessListModal)
             )
-            for btn in modal.query("Button"):
-                assert btn.id is not None
-                assert _TEXTUAL_ID.match(btn.id), f"bad id: {btn.id!r}"
+            # The subprocess bridge must NOT have been invoked on open.
+            mocked.assert_not_called()
+            # The cached GPU rows are surfaced as kill buttons.
+            assert modal._procs[0]["pid"] == "12345"
+            await pilot.click(modal.query_one("#gpuproc-12345"))
+            await pilot.pause()
+            assert app.result == "12345"
+
+
+@pytest.mark.asyncio
+async def test_gpu_modal_empty_cached_snapshot_shows_no_processes() -> None:
+    """An empty cached snapshot (StubBackend / no GPU) shows the no-process label."""
+    empty = dict(_SNAPSHOT_WITH_GPU)
+    empty["gpu_processes"] = []
+    with patch(
+        "bastion.dashboard.modals.SystemDataCollector.query_gpu_processes",
+    ) as mocked:
+        app = _SnapshotHarness(empty)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            modal = next(
+                s for s in app.screen_stack if isinstance(s, GPUProcessListModal)
+            )
+            mocked.assert_not_called()
+            assert modal._procs == []
+            assert modal.query_one("#gpuproc-cancel") is not None
+
+
+@pytest.mark.asyncio
+async def test_gpu_modal_no_snapshot_attr_degrades_gracefully() -> None:
+    """A host app with no _last_process_snapshot yet renders empty, no crash."""
+    with patch(
+        "bastion.dashboard.modals.SystemDataCollector.query_gpu_processes",
+    ) as mocked:
+        app = _SnapshotHarness(None)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            modal = next(
+                s for s in app.screen_stack if isinstance(s, GPUProcessListModal)
+            )
+            mocked.assert_not_called()
+            assert modal._procs == []
 
 
 # ---------------------------------------------------------------------------

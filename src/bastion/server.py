@@ -18,8 +18,12 @@ Scheduler integration:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import os
+import statistics
+import subprocess
 import time
 from collections import deque
 from collections.abc import AsyncGenerator, Callable
@@ -35,20 +39,50 @@ import bastion
 from bastion import audit
 from bastion.auth import make_a2a_token_dependency, make_admin_key_dependency
 from bastion.circuitbreaker import CircuitBreakerTransport
+from bastion.correlation import (
+    ContentionEventDetector,
+    CorrelationEngine,
+    build_thermal_coupling,
+    compute_risk_index,
+    enrich_stall_reason,
+)
 from bastion.health import check_gpu_safe, query_gpu_status
-from bastion.metrics import CONTENT_TYPE_LATEST, PROMETHEUS_AVAILABLE, get_metrics_text
+from bastion.latency_aggregator import aggregate_latency
+from bastion.metrics import (
+    CONTENT_TYPE_LATEST,
+    PROMETHEUS_AVAILABLE,
+    get_metrics_text,
+    record_contention_event,
+    record_risk_dominant_factor,
+    update_risk_index,
+    update_thermal_coupling_active,
+    update_thermal_headroom_celsius,
+    update_vram_ledger_drift,
+)
 from bastion.middleware import MetricsMiddleware
 from bastion.models import (
+    BlockDeviceIOStats,
+    BrokerCatalog,
     BrokerConfig,
     BrokerCounters,
+    BrokerLatency,
     BrokerStatus,
     BrokerThrashing,
     BrokerThrashingAgent,
+    CatalogEntry,
+    ContentionSnapshot,
+    CorrelationState,
+    GPUExtendedStatus,
+    GPUStatus,
+    InferenceThroughputState,
     IntentDeclaration,
     IntentResponse,
+    MachineSnapshot,
     PriorityTier,
+    ProcessSnapshot,
     QueuedRequest,
     ThrashingVerdictLabel,
+    XidEvent,
 )
 from bastion.proxy import OllamaProxy
 from bastion.queue import AffinityQueue
@@ -79,6 +113,65 @@ _process_monitor: ProcessMonitor | None = None
 _sweep_task: asyncio.Task | None = None
 _start_time: float = 0.0
 _reset_epoch: str = ""  # ISO-8601 UTC timestamp set once at broker startup
+
+
+def _detect_git_sha() -> str:
+    """Return the BASTION git SHA for this install, or ``unknown``.
+
+    Order of precedence:
+      1. ``BASTION_GIT_SHA`` env var (set by deploy tooling for wheels).
+      2. ``git rev-parse HEAD`` in the package root (development installs).
+      3. ``unknown`` (no git, no env var — e.g., wheel install without deploy SHA).
+
+    Captured once at module load by ``_GIT_SHA``; the /broker/version route
+    returns this value so A2A clients can pin SHA across a
+    long batch and detect mid-run redeploys.
+    """
+    sha = os.environ.get("BASTION_GIT_SHA", "").strip()
+    if sha:
+        return sha
+    try:
+        # __file__ -> .../src/bastion/server.py; package repo root is two up.
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        # Only trust git when the package root itself is the checkout (.git
+        # entry present — a dir, or a file for worktrees). Without this, a
+        # wheel under site-packages nested inside some unrelated repo would
+        # report THAT repo's SHA.
+        if not os.path.exists(os.path.join(repo_root, ".git")):
+            return "unknown"
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        logger.debug(
+            "git SHA detection: rev-parse rc=%s stderr=%s",
+            result.returncode, result.stderr.strip(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("git SHA detection failed: %s", exc)
+    return "unknown"
+
+
+def _redact_home(path: str) -> str:
+    """Replace the home-directory prefix with ``~`` in operator-facing paths.
+
+    The admin surface is unauthenticated by default (ADR-006 bearer auth
+    pending); absolute paths would disclose the username and filesystem
+    layout to anything that can reach the port.
+    """
+    home = os.path.expanduser("~")
+    if home and path.startswith(home):
+        return "~" + path[len(home):]
+    return path
+
+
+_GIT_SHA: str = _detect_git_sha()
 _thrashing_detector: ThrashingDetector | None = None
 
 # Verdict label and ordering maps used by /broker/thrashing in both create_app
@@ -126,7 +219,887 @@ def _lookup_intent(intent_id: str):
     return _resolved_intents.get(intent_id)
 
 # ── Recent requests ring buffer (S5: Dashboard Evolution) ────────────
-_recent_requests: deque[dict] = deque(maxlen=50)
+_recent_requests: deque[dict] = deque(maxlen=500)
+
+# ── Machine snapshot collection (observability spec 4.9/4.10) ─────────
+# The broker owns collection so /broker/snapshot works headless; the TUI is
+# a client (ADR-005). The deque stores model_dump() dicts so ?history=N
+# slices need no re-serialization (mirrors _recent_requests). maxlen=180 ≈
+# 6 min at the 2s fast tick (Constraint #1). Bounded, in-memory, no DB.
+_machine_snapshot_deque: deque[dict] = deque(maxlen=180)
+_machine_snapshot_task: asyncio.Task | None = None
+# SSE snapshot stream (spec 5.6). Caps concurrent /broker/snapshot/stream
+# clients so a misbehaving fleet of subscribers can't open unbounded
+# generators (each holds a slow loop). The 9th concurrent client gets 503.
+# In-process int (single event loop) — no lock needed; mutated only on the
+# loop thread at stream open/close.
+_SNAPSHOT_STREAM_MAX_CLIENTS = 8
+_snapshot_stream_clients = 0
+# Most-recent slow-path GPU extended status (throttle/PCIe/Xid). Refreshed only
+# on the slow tick (spec 4.9, ~30s) by a backend subprocess; cached here so the
+# 2s fast snapshot can attach the latest value without re-polling — the fast
+# path stays free of blocking 30s-stale subprocess work. None until the first
+# slow tick runs (graceful: a partial snapshot with gpu_extended=None is valid).
+_gpu_extended_latest: GPUExtendedStatus | None = None
+# Broker-side host-pressure collector (PSI/swap/OOM). Distinct from the TUI's
+# own SystemDataCollector instance — each tracks its own delta state on an
+# independent cadence (spec 4.9). Instantiated lazily so the import stays cheap
+# and tests that never touch the snapshot path pay nothing.
+_system_collector: Any | None = None
+# Most-recent process-attribution snapshot (spec 5.3 / 4.5). Owned by the
+# broker-side slow tick so GET /broker/processes works headless (no TUI). The
+# collector instance holds the per-process IO / churn delta state; this caches
+# only the latest assembled ProcessSnapshot for the endpoint. TUI + JSON only —
+# never a Prometheus label. None until the first tick runs.
+_process_snapshot_latest: ProcessSnapshot | None = None
+# Correlation engine + discrete-contention detector (observability spec Section 6).
+# Both are in-memory + bounded (ring maxlen=512, contention deque maxlen=50). The
+# engine is PASSIVE: it consumes the MachineSnapshot the loop already assembled
+# (pull, never push) and owns no background task — its tick() runs at the end of
+# each _collect_machine_snapshot pass. Instantiated in lifespan AFTER
+# scheduler/vram_tracker/vram_manager are built and BEFORE the snapshot loop
+# starts; deps are scheduler/vram only (NOT _a2a_handler, so A2A-disabled
+# deployments are fully functional, spec 6.6).
+_correlation_engine: CorrelationEngine | None = None
+_contention_detector: ContentionEventDetector | None = None
+
+
+def _get_system_collector() -> Any:
+    """Return the broker-side SystemDataCollector, creating it on first use."""
+    global _system_collector
+    if _system_collector is None:
+        from bastion.dashboard.collectors import SystemDataCollector
+        _system_collector = SystemDataCollector()
+    return _system_collector
+
+
+async def _collect_contention() -> ContentionSnapshot | None:
+    """Assemble the host-pressure leg of the snapshot (spec 4.4, fast 2s path).
+
+    Every sub-collector is individually graceful (returns None fields / empty
+    lists on hosts that lack the source — no PSI on old kernels, no swap on
+    first read, no powercap on containers/ARM, non-NVMe storage), so a partial
+    ``ContentionSnapshot`` is the expected value here and is still emitted. All
+    of PSI/swap/OOM/block-device-IO/CPU-package-power are cheap 2s fast-path
+    signals (spec 5.2); ``gpu_board_watts`` stays ``None`` (backend-provided,
+    Tier 4). No degradation path emits a misleading ``0``.
+    """
+    try:
+        collector = _get_system_collector()
+        psi = collector.get_psi_data()
+        swap = collector.get_swap_rate_data()
+        oom = collector.get_oom_data()
+
+        device_filter = None
+        if _config is not None:
+            device_filter = _config.observability.storage_device_filter
+        rapl_path = None
+        if _config is not None:
+            rapl_path = _config.observability.rapl_domain_path
+
+        block_rows = collector.get_block_io_data(device_filter)
+        block_devices = [BlockDeviceIOStats(**row) for row in block_rows]
+        cpu_package_watts = collector.read_package_power(rapl_path)
+
+        return ContentionSnapshot(
+            psi_cpu_some_avg10=psi.get("psi_cpu_some_avg10"),
+            psi_cpu_full_avg10=psi.get("psi_cpu_full_avg10"),
+            psi_mem_some_avg10=psi.get("psi_mem_some_avg10"),
+            psi_mem_full_avg10=psi.get("psi_mem_full_avg10"),
+            psi_io_some_avg10=psi.get("psi_io_some_avg10"),
+            psi_io_full_avg10=psi.get("psi_io_full_avg10"),
+            swap_in_rate_mb_s=swap.get("swap_in_rate_mb_s"),
+            swap_out_rate_mb_s=swap.get("swap_out_rate_mb_s"),
+            block_devices=block_devices,
+            cpu_package_watts=cpu_package_watts,
+            oom_kill_total=oom.get("oom_kill_total"),
+            oom_kill_rate=oom.get("oom_kill_rate"),
+        )
+    except Exception:
+        logger.exception("contention collection failed; emitting None leg")
+        return None
+
+
+async def _collect_gpu_extended() -> GPUExtendedStatus | None:
+    """Assemble the slow-path GPU leg (spec 4.3, ~30s slow tick).
+
+    Routes every signal through the ``GPUBackend`` seam (Constraint #7c): the
+    throttle reasons, PCIe tx/rx, and Xid scan are NVIDIA concepts and come
+    back empty/``None`` from ``StubBackend`` (non-NVIDIA / no-GPU), which is
+    the *correct complete* value there — not a degradation. Each leg is
+    individually graceful so a denied ``dmesg`` (``dmesg_restrict=1``) or a
+    pre-R418 driver (no PCIe tx/rx) yields ``[]``/``None`` rather than killing
+    the slow tick. The ``recent_xids`` list is already bounded (maxlen 20) at
+    the backend.
+    """
+    from bastion.gpu import get_backend
+
+    backend = get_backend()
+    try:
+        throttle_reasons = await backend.query_throttle_reasons()
+    except Exception:
+        logger.debug("throttle-reasons slow poll failed", exc_info=True)
+        throttle_reasons = []
+    try:
+        pcie_tx, pcie_rx = await backend.query_pcie_throughput()
+    except Exception:
+        logger.debug("PCIe-throughput slow poll failed", exc_info=True)
+        pcie_tx, pcie_rx = None, None
+    try:
+        xid_rows = await backend.query_xid_errors()
+    except Exception:
+        logger.debug("Xid slow poll failed", exc_info=True)
+        xid_rows = []
+
+    recent_xids = [XidEvent(**row) for row in xid_rows]
+    # xid_count_since_start lives on NvidiaBackend; StubBackend has no such
+    # attribute, so read it defensively (0 on non-NVIDIA — correct, complete).
+    xid_count = getattr(backend, "xid_count_since_start", 0)
+
+    return GPUExtendedStatus(
+        throttle_reasons=throttle_reasons,
+        pcie_tx_kb_s=pcie_tx,
+        pcie_rx_kb_s=pcie_rx,
+        recent_xids=recent_xids,
+        xid_count_since_start=xid_count,
+        last_polled_at=time.time(),
+    )
+
+
+async def _collect_process_snapshot(slow_tick: bool) -> ProcessSnapshot | None:
+    """Assemble the per-process attribution leg (spec 5.3 / 4.5).
+
+    Delegates to the broker-side ``SystemDataCollector.collect_process_snapshot``
+    (which owns the per-process IO/churn delta state). The collector is fully
+    graceful — a missing ``psutil`` or a wholesale scan failure yields a valid
+    (empty) ``ProcessSnapshot`` — so this only guards the call itself and the
+    config read. The GPU sub-data join (compute-apps VRAM + pmon) runs only on
+    the slow tick through the async ``GPUBackend`` seam and is empty on a
+    ``StubBackend`` / no-GPU host (no error). This data is **TUI + JSON only** —
+    never a Prometheus label (Constraint #2).
+    """
+    try:
+        collector = _get_system_collector()
+        return await collector.collect_process_snapshot(_config, slow_tick=slow_tick)
+    except Exception:
+        logger.exception("process snapshot leg failed; emitting None leg")
+        return None
+
+
+def _collect_inference_throughput() -> InferenceThroughputState | None:
+    """Aggregate the stream-tapped per-request token signals (spec 4.6).
+
+    Reads the per-request token/TTFT/ctx fields that the inference tap writes
+    into ``_recent_requests`` (Section 4.6) and folds them into p50 aggregates.
+    Model-agnostic: it uses whatever ``model`` Ollama reported on each request.
+    Returns ``None`` when no recent request carried any token signal (e.g. only
+    non-inference traffic, or before the first stream completes) — never a
+    misleading ``0``.
+    """
+    try:
+        decode: list[float] = []
+        prefill: list[float] = []
+        ttft: list[float] = []
+        ctx: list[float] = []
+        last_model: str | None = None
+        for rec in _recent_requests:
+            d = rec.get("decode_tps")
+            if d is not None:
+                decode.append(d)
+            p = rec.get("prefill_tps")
+            if p is not None:
+                prefill.append(p)
+            t = rec.get("ttft_s")
+            if t is not None:
+                ttft.append(t)
+            c = rec.get("ctx_utilization")
+            if c is not None:
+                ctx.append(c)
+            if (
+                rec.get("decode_tps") is not None
+                or rec.get("ttft_s") is not None
+            ) and rec.get("model"):
+                last_model = rec.get("model")
+
+        if not (decode or prefill or ttft or ctx):
+            return None  # no token signal yet -> None, not a row of zeros
+
+        def _p50(values: list[float]) -> float | None:
+            if not values:
+                return None
+            return statistics.median(values)
+
+        return InferenceThroughputState(
+            decode_tps_p50=_p50(decode),
+            prefill_tps_p50=_p50(prefill),
+            ttft_p50_s=_p50(ttft),
+            ctx_utilization_p50=_p50(ctx),
+            last_model=last_model,
+        )
+    except Exception:
+        logger.debug("inference-throughput aggregation failed", exc_info=True)
+        return None
+
+
+async def _collect_broker_status_lite() -> BrokerStatus | None:
+    """Assemble a lightweight ``BrokerStatus`` for embedding in the snapshot.
+
+    Mirrors the /broker/status assembly but stays defensive: any missing
+    collaborator yields a partial status rather than raising, so the snapshot
+    loop never dies. The full observability-field enrichment lives on the
+    /broker/status route; the snapshot embeds the core model.
+    """
+    try:
+        loaded_raw = (
+            await _vram_tracker.get_loaded_models() if _vram_tracker else []
+        )
+        loaded = loaded_raw if loaded_raw is not None else []
+        return BrokerStatus(
+            uptime_seconds=time.time() - _start_time,
+            queue_depth=_queue.total_size if _queue else 0,
+            queue_by_model=_queue.queue_depth_by_model() if _queue else {},
+            loaded_models=loaded,
+            vram_state="unknown" if loaded_raw is None else "ok",
+            current_model=_scheduler.current_model if _scheduler else None,
+            total_requests_served=_proxy._requests_served if _proxy else 0,
+            total_model_swaps=_scheduler.total_swaps if _scheduler else 0,
+            state="draining" if (_scheduler and _scheduler.is_draining) else "running",
+            total_dispatched=_scheduler.total_dispatched if _scheduler else 0,
+            inflight_models=dict(_inflight_models),
+        )
+    except Exception:
+        logger.exception("broker status leg failed; emitting None leg")
+        return None
+
+
+def _slow_tick_divisor() -> int:
+    """Integer tick-modulo for the slow path (spec 4.9).
+
+    Derived from ``round(slow_tick_interval_s / snapshot_interval_s)`` so the
+    cadence comes from ``ObservabilityConfig`` rather than a magic literal
+    (default 30s / 2s = 15). Clamped to >=1 so a misconfiguration cannot make
+    the slow path run never or every-tick-divide-by-zero.
+    """
+    fast = 2.0
+    slow = 30.0
+    if _config is not None:
+        fast = max(0.25, _config.observability.snapshot_interval_s)
+        slow = max(fast, _config.observability.slow_tick_interval_s)
+    return max(1, round(slow / fast))
+
+
+async def _collect_machine_snapshot(tick: int) -> MachineSnapshot:
+    """Assemble one ``MachineSnapshot`` from the backend + collectors (spec 4.9).
+
+    Each leg is wrapped for graceful ``None`` (Constraint #4): a failing or
+    absent source yields a ``None``/empty leg, never an exception and never a
+    misleading ``0``. On a ``StubBackend`` / no-GPU host ``query_gpu_status``
+    returns an empty ``GPUStatus`` (all inner fields ``None``) — the correct
+    complete value there.
+
+    Two cadences (spec 4.9): the **fast 2s path** builds the GPU status,
+    contention (PSI/swap/OOM/block-IO/CPU-power), and the cheap in-memory
+    ``inference`` aggregate every tick. The **slow path** (``tick %
+    _slow_tick_divisor() == 0``, ~30s) refreshes the subprocess-heavy
+    ``gpu_extended`` leg (throttle/PCIe/Xid via the backend) and the VRAM
+    ledger-drift gauge; the most recent ``gpu_extended`` is cached in
+    ``_gpu_extended_latest`` and reattached on the intervening fast ticks, so
+    the 2s path never blocks on 30s-stale subprocess work. After assembly the
+    correlation engine ticks on the snapshot (spec 6.6) and the synthesized
+    ``correlation`` leg (RiskIndex / thermal coupling / contention events /
+    enriched stall / ring tail) is folded back in.
+    """
+    global _gpu_extended_latest, _process_snapshot_latest
+    snapshot_ts = time.time()
+
+    try:
+        gpu = await query_gpu_status()
+    except Exception:
+        logger.exception("GPU status leg failed; using empty GPUStatus")
+        gpu = GPUStatus()
+
+    broker = await _collect_broker_status_lite()
+    contention = await _collect_contention()
+    inference = _collect_inference_throughput()
+
+    slow = _slow_tick_divisor()
+    # Process attribution: the cheap top-N / IO / watchlist legs run every fast
+    # tick; the subprocess-heavy churn + GPU-join legs run only on the slow tick
+    # (gated inside the collector by ``slow_tick``). The assembled snapshot is
+    # cached for GET /broker/processes so the endpoint works headless.
+    process = await _collect_process_snapshot(slow_tick=(tick % slow == 0))
+    if process is not None:
+        _process_snapshot_latest = process
+
+    if tick % slow == 0:
+        # Slow tick: refresh the subprocess-heavy GPU extended leg and cache it
+        # so fast ticks reuse the latest value without re-polling.
+        try:
+            _gpu_extended_latest = await _collect_gpu_extended()
+        except Exception:
+            logger.debug("gpu_extended slow collection failed", exc_info=True)
+        # Publish the signed VRAM ledger-drift gauge (spec 5.4). Drift =
+        # measured (backend) − tracked (allocated+reserved). SKIP — never
+        # publish 0 — when the backend reports no measured VRAM (StubBackend /
+        # non-NVIDIA) or no VRAMManager is configured.
+        await _emit_vram_ledger_drift(gpu)
+
+    snapshot = MachineSnapshot(
+        snapshot_ts=snapshot_ts,
+        broker=broker,
+        gpu=gpu,
+        gpu_extended=_gpu_extended_latest,
+        contention=contention,
+        process=process,
+        inference=inference,
+        correlation=None,
+    )
+
+    # Tick the correlation engine on the just-assembled snapshot (pull, never
+    # push — spec 6.6: tick at the END of the iteration, consuming the snapshot
+    # the loop built) and fold the synthesized CorrelationState back in. Wrapped
+    # so a correlation failure never kills the snapshot tick (Constraint #4).
+    try:
+        snapshot.correlation = await _collect_correlation_state(snapshot)
+    except Exception:
+        logger.debug("correlation leg failed; leaving correlation=None", exc_info=True)
+
+    return snapshot
+
+
+def _correlation_config():
+    """Return the active ``CorrelationConfig`` (defaults when unconfigured)."""
+    if _config is not None:
+        return _config.observability.correlation
+    from bastion.models import CorrelationConfig
+
+    return CorrelationConfig()
+
+
+async def _vram_utilization_pct() -> float | None:
+    """VRAM used as a percentage of the budget, or ``None`` (RiskIndex input).
+
+    Reads the in-memory ledger (``allocated + reserved`` over ``total``). Returns
+    ``None`` — never a misleading ``0`` — when no ``VRAMManager`` is configured or
+    the ledger reports a non-positive total, so the RiskIndex term is *absent*
+    rather than reading zero-risk for an unmeasured budget.
+    """
+    if _vram_manager is None:
+        return None
+    try:
+        status = await _vram_manager.status()
+    except Exception:
+        return None
+    total = status.get("total_bytes") or 0
+    if total <= 0:
+        return None
+    used = (status.get("allocated_bytes") or 0) + (status.get("reserved_bytes") or 0)
+    return max(0.0, min(100.0, (used / total) * 100.0))
+
+
+def _worst_thrashing_verdict() -> str | None:
+    """The worst verdict label across tracked agents, or ``None`` (RiskIndex input).
+
+    ``None`` when no detector is configured or no agent is tracked yet — the
+    thrashing risk term is then *absent*, not a misleading zero-risk reading.
+    """
+    if _thrashing_detector is None:
+        return None
+    try:
+        snaps = _thrashing_detector.snapshot()
+    except Exception:
+        return None
+    if not snaps:
+        return None
+    # Rank OK < WARNED < HALTED; return the worst label seen.
+    order = {"OK": 0, "WARNED": 1, "HALTED": 2}
+    worst = max(snaps, key=lambda s: order.get(str(s.verdict), 0))
+    return str(worst.verdict)
+
+
+def _read_cpu_temp_for_correlation() -> float | None:
+    """Best-effort host CPU temperature for the thermal-coupling derivation.
+
+    Sourced from the broker-side ``SystemDataCollector`` (portable hwmon
+    discovery; ``None`` when no CPU sensor exists). Never raises — a missing
+    sensor degrades the coupling to its GPU-only / present-terms-only form.
+    """
+    try:
+        collector = _get_system_collector()
+        return collector.read_cpu_temp()
+    except Exception:
+        return None
+
+
+async def _collect_correlation_state(
+    snapshot: MachineSnapshot,
+) -> CorrelationState | None:
+    """Tick the engine on ``snapshot`` and assemble the ``CorrelationState`` (6.6).
+
+    This is the single integration point (spec 6.6): it (1) ticks the passive
+    :class:`CorrelationEngine` on the already-assembled snapshot so the ring
+    ingests the four pull sources, (2) feeds the discrete
+    :class:`ContentionEventDetector` with the live stall state, (3) derives the
+    composite RiskIndex + thermal coupling from inputs already in hand, (4)
+    enriches the scheduler stall reason with live host context, and (5) emits the
+    bounded-label Prometheus metrics. Every step is individually guarded so a
+    single failure never blocks the snapshot tick (Constraint #4); a partial
+    ``CorrelationState`` (e.g. no thermal coupling on a no-GPU host) is valid.
+
+    Returns ``None`` only when the engine was never constructed (e.g. an
+    out-of-lifespan on-demand collect in a degenerate test path); the snapshot is
+    still valid with ``correlation=None``.
+    """
+    engine = _correlation_engine
+    if engine is None:
+        return None
+    cfg = _correlation_config()
+
+    # (1) Tick the engine (audit/inference cursor pulls + system/GPU/throttle
+    # edge emitters). Guarded inside tick(), but belt-and-suspenders here too.
+    try:
+        engine.tick(snapshot)
+    except Exception:
+        logger.debug("engine.tick failed", exc_info=True)
+
+    # Live scheduler stall state (the coincidence-join input + enrichment base).
+    stall_reason_base = _scheduler.stall_reason if _scheduler else ""
+    inference_stalled = bool(stall_reason_base)
+
+    # (2) Discrete contention detector — fire only on a pressure crossing that
+    # COINCIDES with a real inference stall (the moat). Emits the bounded-kind
+    # Prometheus counter on a fired event (attribution stays JSON-only).
+    if _contention_detector is not None:
+        try:
+            fired = _contention_detector.feed(
+                snapshot,
+                inference_stalled=inference_stalled,
+                stall_reason=stall_reason_base or None,
+            )
+            if fired is not None:
+                with contextlib.suppress(Exception):
+                    record_contention_event(fired.kind)
+        except Exception:
+            logger.debug("contention detector feed failed", exc_info=True)
+
+    # (3a) Thermal coupling (CPU/GPU temps, fan, headroom). All inputs None-
+    # tolerant; a no-GPU host yields the CPU-only / present-terms form.
+    thermal = None
+    try:
+        gpu_max = _config.gpu.max_temperature_c if _config is not None else None
+        thermal = build_thermal_coupling(
+            cpu_temp_c=_read_cpu_temp_for_correlation(),
+            gpu_temp_c=snapshot.gpu.temperature_c if snapshot.gpu else None,
+            fan_speed_pct=snapshot.gpu.fan_speed_pct if snapshot.gpu else None,
+            gpu_max_temperature_c=gpu_max,
+            config=cfg,
+        )
+    except Exception:
+        logger.debug("thermal coupling build failed", exc_info=True)
+
+    # (3b) Composite RiskIndex — each component degrades independently (None =
+    # absent term, never a misleading zero-risk).
+    risk = None
+    try:
+        mem_psi = (
+            snapshot.contention.psi_mem_some_avg10
+            if snapshot.contention is not None
+            else None
+        )
+        risk = compute_risk_index(
+            vram_utilization_pct=await _vram_utilization_pct(),
+            thermal_headroom_c=(
+                thermal.thermal_headroom_min_c if thermal is not None else None
+            ),
+            swap_rate_level=_scheduler._swap_rate_level if _scheduler else None,
+            thrashing_verdict=_worst_thrashing_verdict(),
+            memory_psi=mem_psi,
+            config=cfg,
+        )
+    except Exception:
+        logger.debug("risk index compute failed", exc_info=True)
+
+    # (4) Enrich the stall reason with live host context (additive; None-omitting).
+    enriched_stall = enrich_stall_reason(stall_reason_base or None, snapshot)
+
+    # (5) Emit the bounded-label Prometheus metrics. Each guarded; the thermal-
+    # headroom gauge is SKIPPED (never 0) when no headroom term is computable.
+    _emit_correlation_metrics(risk, thermal)
+
+    detector = _contention_detector
+    recent_contentions = (
+        list(detector.recent_contentions) if detector is not None else []
+    )
+    tail_n = getattr(cfg, "ring_tail_in_snapshot", 32)
+    return CorrelationState(
+        risk_index=risk,
+        thermal_coupling=thermal,
+        recent_contentions=recent_contentions,
+        enriched_stall_reason=enriched_stall,
+        ring_size=len(engine.ring),
+        recent_ring_events=engine.ring.tail(tail_n),
+    )
+
+
+def _emit_correlation_metrics(risk, thermal) -> None:
+    """Publish the five bounded-label correlation metrics (spec 6.3/6.4/6.5 / 7).
+
+    Bounded labels only (Constraint #2): the risk gauge + thermal gauges are
+    label-less; the dominant-factor counter uses the 5-name ``factor`` enum.
+    Process attribution never reaches Prometheus. Guarded individually; the
+    thermal-headroom gauge is SKIPPED — never set to ``0`` — when no headroom
+    term is computable, so a no-GPU + no-CPU-sensor host does not falsely report
+    zero headroom.
+    """
+    try:
+        if risk is not None:
+            update_risk_index(risk.score)
+            if risk.dominant_factor:
+                record_risk_dominant_factor(risk.dominant_factor)
+    except Exception:
+        logger.debug("risk metric emit failed", exc_info=True)
+    try:
+        if thermal is not None:
+            update_thermal_coupling_active(bool(thermal.coupling_active))
+            if thermal.thermal_headroom_min_c is not None:
+                update_thermal_headroom_celsius(thermal.thermal_headroom_min_c)
+    except Exception:
+        logger.debug("thermal metric emit failed", exc_info=True)
+
+
+async def _emit_vram_ledger_drift(gpu: GPUStatus) -> None:
+    """Publish ``bastion_vram_ledger_drift_mb{gpu_index}`` (spec 5.4, slow tick).
+
+    Drift is the signed delta between **measured** VRAM (the backend's
+    ``query_status`` ``vram_used_mb``, already in hand on this tick) and
+    **tracked** VRAM (``allocated + reserved`` from the in-memory ledger). A
+    growing positive drift means the ledger under-counts real residency, which
+    is the unsafe direction BASTION exists to catch.
+
+    Graceful degradation (Constraint #4): if the backend reports no measured
+    value (``vram_used_mb is None`` on StubBackend / non-NVIDIA) or no
+    ``VRAMManager`` is configured, the gauge is **skipped** — publishing ``0``
+    would falsely claim a perfectly-synced ledger on a host that simply cannot
+    read VRAM. Any failure degrades to a logged skip, never an exception that
+    would kill the snapshot tick.
+    """
+    try:
+        measured_mb = gpu.vram_used_mb
+        if measured_mb is None:
+            return  # no measured value → skip, do not emit a misleading 0
+        if _vram_manager is None:
+            return  # nothing to compare against
+        status = await _vram_manager.status()
+        tracked_bytes = status.get("allocated_bytes", 0) + status.get("reserved_bytes", 0)
+        tracked_mb = tracked_bytes / (1024 * 1024)
+        drift_mb = float(measured_mb) - tracked_mb
+        update_vram_ledger_drift(gpu_index=str(gpu.gpu_index), mb=drift_mb)
+    except Exception:
+        logger.debug("VRAM ledger-drift gauge emission skipped", exc_info=True)
+
+
+async def _machine_snapshot_loop() -> None:
+    """Monotonic-anchored collection loop (spec 4.9, the single tick authority).
+
+    Records ``collection_start = time.monotonic()`` before the work and sleeps
+    ``max(0.0, interval - elapsed)`` so a slow ``nvidia-smi`` (up to its 5s
+    timeout during a GPU lockup) does not compound cadence drift. The interval
+    is the configured fast tick (``observability.snapshot_interval_s``, default
+    2s). The body is wrapped so a transient exception never kills the loop and
+    leaves the snapshot stale forever.
+    """
+    interval = 2.0
+    if _config is not None:
+        interval = max(0.25, _config.observability.snapshot_interval_s)
+    tick = 0
+    while True:
+        collection_start = time.monotonic()
+        try:
+            snap = await _collect_machine_snapshot(tick)
+            _machine_snapshot_deque.appendleft(snap.model_dump())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("snapshot loop iteration failed")  # loop never dies
+        tick += 1
+        elapsed = time.monotonic() - collection_start
+        await asyncio.sleep(max(0.0, interval - elapsed))
+
+
+async def _handle_snapshot(request: Request) -> Any:
+    """Standalone handler for ``GET /broker/snapshot`` (dual-registered, 4.10).
+
+    Returns the most recent ``MachineSnapshot`` from the in-memory deque. If
+    the collection loop has not produced one yet (e.g. immediately after
+    startup), it collects one on demand so the endpoint never 404s or returns
+    an empty body before the first tick. ``?history=N`` returns the last N
+    snapshots (newest first), capped at the deque length. ``?include_ring=true``
+    expands the full correlation ring into ``correlation.recent_ring_events``
+    (debug surface, spec 6.1) instead of the default bounded tail.
+    """
+    history_raw = request.query_params.get("history")
+    if history_raw is not None:
+        try:
+            n = int(history_raw)
+        except ValueError:
+            n = 1
+        n = max(1, min(n, len(_machine_snapshot_deque) or 1))
+        items = list(_machine_snapshot_deque)[:n]
+        if not items:
+            items = [(await _collect_machine_snapshot(0)).model_dump()]
+        return JSONResponse({"snapshots": items, "count": len(items)})
+
+    include_ring = request.query_params.get("include_ring", "").lower() in (
+        "1", "true", "yes",
+    )
+    if _machine_snapshot_deque:
+        body = _machine_snapshot_deque[0]
+    else:
+        # No tick has landed yet — collect one on demand.
+        body = (await _collect_machine_snapshot(0)).model_dump()
+    if include_ring:
+        body = _expand_full_ring(body)
+    return JSONResponse(body)
+
+
+def _expand_full_ring(body: dict) -> dict:
+    """Return a copy of ``body`` with the FULL correlation ring (6.1 debug).
+
+    The snapshot deque stores only the bounded ring tail; ``?include_ring=true``
+    swaps in the entire ring from the live engine. Degrades to the unchanged body
+    when the engine is absent or the correlation leg is missing — never an error.
+    """
+    engine = _correlation_engine
+    corr = body.get("correlation")
+    if engine is None or not isinstance(corr, dict):
+        return body
+    try:
+        full = [ev.model_dump() for ev in engine.ring]
+    except Exception:
+        return body
+    out = dict(body)
+    out_corr = dict(corr)
+    out_corr["recent_ring_events"] = full
+    out_corr["ring_size"] = len(full)
+    out["correlation"] = out_corr
+    return out
+
+
+async def _sse_wrapper(
+    generator: AsyncGenerator[dict | None, None],
+) -> AsyncGenerator[bytes, None]:
+    """Wrap a dict-event generator as SSE-formatted bytes (shared helper).
+
+    Single shared SSE encoder for every ``StreamingResponse`` in this module
+    (the A2A task stream and ``/broker/snapshot/stream``). Deduped from the two
+    near-identical nested copies that previously lived inside ``create_app`` and
+    ``create_admin_app``. Handles three event shapes:
+
+    - Heartbeats (``{"_heartbeat": True}``): emitted as an SSE comment
+      ``: heartbeat\\n\\n`` (keeps the connection warm without a data frame).
+    - Sentinels (``None``): stop the stream cleanly (generator should end).
+    - Regular events (any other dict): ``data: {json}\\n\\n``.
+    """
+    async for event in generator:
+        if event is None:
+            break
+        if isinstance(event, dict) and event.get("_heartbeat"):
+            yield b": heartbeat\n\n"
+            continue
+        data = json.dumps(event)
+        yield f"data: {data}\n\n".encode()
+
+
+async def _snapshot_stream_events(
+    request: Request,
+) -> AsyncGenerator[dict | None, None]:
+    """Yield the latest ``MachineSnapshot`` dict periodically for SSE (5.6).
+
+    Emits the freshest snapshot immediately, then re-emits on the configured
+    fast-tick cadence (``observability.snapshot_interval_s``). Between snapshot
+    emits it yields a heartbeat marker so a stalled collection loop still keeps
+    the connection warm. Honors client disconnect (``request.is_disconnected``)
+    so a closed browser tab frees its slot promptly. Non-buffering: each frame
+    is yielded the instant it is built (Constraint #3 — no accumulation).
+    """
+    interval = 2.0
+    if _config is not None:
+        interval = max(0.25, _config.observability.snapshot_interval_s)
+    # Emit one snapshot right away so a subscriber sees data without waiting a
+    # full interval; collect on demand if the loop hasn't produced one yet.
+    if _machine_snapshot_deque:
+        yield _machine_snapshot_deque[0]
+    else:
+        yield (await _collect_machine_snapshot(0)).model_dump()
+    last_emitted: int = id(_machine_snapshot_deque[0]) if _machine_snapshot_deque else 0
+    # Poll on a short sub-cadence so disconnects are noticed quickly, but only
+    # push a new data frame when a fresh snapshot has actually landed.
+    poll = min(0.5, interval)
+    while True:
+        if await request.is_disconnected():
+            break
+        await asyncio.sleep(poll)
+        if _machine_snapshot_deque:
+            head = _machine_snapshot_deque[0]
+            if id(head) != last_emitted:
+                last_emitted = id(head)
+                yield head
+                continue
+        yield {"_heartbeat": True}
+
+
+async def _handle_snapshot_stream(request: Request) -> Any:
+    """Standalone handler for ``GET /broker/snapshot/stream`` (dual-registered).
+
+    Server-Sent-Events surface (spec 5.6) that pushes the latest
+    ``MachineSnapshot`` to web/monitoring/MCP clients. Supersedes the older
+    2026-03-13 ``/broker/status/stream``; the TUI is unaffected (it keeps
+    polling). Returns **501** when the stream is disabled by config
+    (``observability.snapshot_stream_enabled``); caps concurrent clients at
+    ``_SNAPSHOT_STREAM_MAX_CLIENTS`` (8) and returns **503** beyond that. The
+    live-client counter is decremented in the generator's ``finally`` so a
+    disconnect always frees the slot.
+    """
+    global _snapshot_stream_clients
+    enabled = True
+    if _config is not None:
+        enabled = _config.observability.snapshot_stream_enabled
+    if not enabled:
+        return JSONResponse(
+            {"error": "snapshot stream disabled"}, status_code=501
+        )
+    if _snapshot_stream_clients >= _SNAPSHOT_STREAM_MAX_CLIENTS:
+        return JSONResponse(
+            {"error": "too many concurrent stream clients"}, status_code=503
+        )
+    _snapshot_stream_clients += 1
+
+    async def _bounded() -> AsyncGenerator[bytes, None]:
+        global _snapshot_stream_clients
+        try:
+            async for frame in _sse_wrapper(_snapshot_stream_events(request)):
+                yield frame
+        finally:
+            _snapshot_stream_clients -= 1
+
+    return StreamingResponse(
+        _bounded(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Prevents nginx 16KB buffering
+        },
+    )
+
+
+async def _handle_contention(request: Request) -> Any:
+    """Standalone handler for ``GET /broker/contention`` (dual-registered, 4.10).
+
+    Returns the host-pressure leg (``ContentionSnapshot``, spec 4.4) of the
+    most recent ``MachineSnapshot`` when the loop has produced one; otherwise
+    collects the leg on demand so the endpoint never 404s before the first
+    tick. ``None`` legs (no PSI on an old kernel/container, no powercap, no
+    matching block device) are valid and returned as a partial snapshot with
+    ``None`` fields — never a misleading ``0``.
+    """
+    if _machine_snapshot_deque:
+        latest = _machine_snapshot_deque[0]
+        contention = latest.get("contention")
+        if contention is not None:
+            return JSONResponse(contention)
+    snap = await _collect_contention()
+    if snap is None:
+        # Collection failed wholesale — still return a valid (empty) body, not
+        # a 500: a partial/empty ContentionSnapshot is the graceful contract.
+        return JSONResponse(ContentionSnapshot().model_dump())
+    return JSONResponse(snap.model_dump())
+
+
+async def _handle_gpu_extended(request: Request) -> Any:
+    """Standalone handler for ``GET /broker/gpu/extended`` (dual-registered, 4.10).
+
+    Returns the slow-path GPU leg (``GPUExtendedStatus``, spec 4.3) — throttle
+    reasons, PCIe tx/rx, recent Xids. Serves the cached value the slow tick
+    maintains (``_gpu_extended_latest``); if no slow tick has run yet it
+    collects once on demand. On a ``StubBackend`` / non-NVIDIA host the lists
+    are the *correct complete* empty value, not an error.
+    """
+    if _gpu_extended_latest is not None:
+        return JSONResponse(_gpu_extended_latest.model_dump())
+    ext = await _collect_gpu_extended()
+    if ext is None:
+        return JSONResponse(GPUExtendedStatus().model_dump())
+    return JSONResponse(ext.model_dump())
+
+
+async def _handle_processes(request: Request) -> Any:
+    """Standalone handler for ``GET /broker/processes`` (dual-registered, 4.10).
+
+    Returns the most-recent ``ProcessSnapshot`` (spec 4.5) the slow tick
+    maintains. If no tick has run yet it collects one on demand (fast legs only)
+    so the endpoint returns **empty lists, not a 404**, before the first run. On
+    a ``StubBackend`` / no-GPU host ``gpu_processes`` is the correct complete
+    empty list. This is the JSON surface for the attribution data, which is
+    **TUI + JSON only** — never a Prometheus label (Constraint #2).
+    """
+    if _process_snapshot_latest is not None:
+        return JSONResponse(_process_snapshot_latest.model_dump())
+    snap = await _collect_process_snapshot(slow_tick=False)
+    if snap is None:
+        return JSONResponse(ProcessSnapshot(collected_at=time.time()).model_dump())
+    return JSONResponse(snap.model_dump())
+
+
+def _latest_correlation_dict() -> dict | None:
+    """Return the ``correlation`` leg of the most recent snapshot, or ``None``."""
+    if _machine_snapshot_deque:
+        corr = _machine_snapshot_deque[0].get("correlation")
+        if corr is not None:
+            return corr
+    return None
+
+
+async def _handle_correlation_risk(request: Request) -> Any:
+    """Standalone handler for ``GET /broker/correlation/risk`` (dual-registered).
+
+    Surfaces the composite RiskIndex + CPU<->GPU thermal coupling (spec 6.4/6.5)
+    from the correlation leg of the most recent ``MachineSnapshot``. If no tick
+    has produced one yet it collects a snapshot on demand so the endpoint never
+    404s before the first collection. Both inner fields may legitimately be
+    ``None`` (no GPU / no recent risk inputs) — a partial body, never an error.
+    """
+    corr = _latest_correlation_dict()
+    if corr is None:
+        # No tick has landed yet — collect one on demand (also ticks the engine).
+        with contextlib.suppress(Exception):
+            snap = await _collect_machine_snapshot(0)
+            corr = snap.correlation.model_dump() if snap.correlation else None
+    if corr is None:
+        # Engine not constructed (out-of-lifespan): empty, not a 500.
+        return JSONResponse({"risk_index": None, "thermal_coupling": None})
+    return JSONResponse(
+        {
+            "risk_index": corr.get("risk_index"),
+            "thermal_coupling": corr.get("thermal_coupling"),
+        }
+    )
+
+
+async def _handle_correlation_contentions(request: Request) -> Any:
+    """Standalone handler for ``GET /broker/correlation/contentions`` (dual-reg).
+
+    Returns the last-N discrete contention events (spec 6.3) from the detector's
+    dedicated bounded ``deque(maxlen=50)`` — kept separate from the snapshot body
+    because contention events are not in the snapshot. Returns an **empty list,
+    not a 404**, before the first coincidence fires. Attribution stays
+    category-level (it may name a device, never a process — JSON-only).
+    """
+    detector = _contention_detector
+    if detector is None:
+        return JSONResponse({"contentions": [], "count": 0})
+    events = [ev.model_dump() for ev in detector.recent_contentions]
+    return JSONResponse({"contentions": events, "count": len(events)})
 
 
 def record_recent_request(
@@ -136,8 +1109,31 @@ def record_recent_request(
     queue_wait_s: float,
     duration_s: float,
     status_code: int,
+    streaming: bool = False,
+    source: str | None = None,
+    *,
+    prefill_tps: float | None = None,
+    decode_tps: float | None = None,
+    ttft_s: float | None = None,
+    ctx_utilization: float | None = None,
+    eval_count: int | None = None,
+    prompt_eval_count: int | None = None,
 ) -> None:
-    """Record a completed request in the recent requests ring buffer."""
+    """Record a completed request in the recent requests ring buffer.
+
+    Called at true completion: for streaming requests that is after the
+    last byte reached the client, so ``duration_s`` covers the full
+    stream and ``status_code`` reflects the actual outcome. ``source`` is
+    the client's declared identity (``X-Agent-ID`` header) or, failing
+    that, its User-Agent product token — ``None`` when neither is sent.
+
+    The six keyword-only inference signals (spec 4.6) are supplied by the
+    proxy's :class:`~bastion.inference_tap.InferenceTapCollector` when a
+    request completes; they all default to ``None`` so every existing
+    caller that omits them keeps working unchanged (back-compat is a hard
+    requirement). A ``None`` means "not measured" — never a misleading 0
+    (e.g. a cache hit with ``eval_duration==0`` records ``decode_tps=None``).
+    """
     _recent_requests.appendleft({
         "timestamp": time.time(),
         "model": model,
@@ -146,6 +1142,14 @@ def record_recent_request(
         "queue_wait_s": round(queue_wait_s, 3),
         "duration_s": round(duration_s, 3),
         "status_code": status_code,
+        "streaming": streaming,
+        "source": source,
+        "prefill_tps": prefill_tps,
+        "decode_tps": decode_tps,
+        "ttft_s": ttft_s,
+        "ctx_utilization": ctx_utilization,
+        "eval_count": eval_count,
+        "prompt_eval_count": prompt_eval_count,
     })
 
 
@@ -220,6 +1224,31 @@ def inflight_count() -> int:
     return sum(_inflight_models.values())
 
 
+def _release_swept_request(req: QueuedRequest) -> None:
+    """Release tracking state for a request swept as stale.
+
+    The grant event is marked ``swept`` before being set so the waiting
+    proxy handler returns 504 instead of forwarding to Ollama — a sweep
+    is a rejection, not a grant (see KNOWN_ISSUES, resolved in v0.5).
+    """
+    grant_evt = _pending_grants.pop(req.id, None)
+    if grant_evt:
+        grant_evt.swept = True  # type: ignore[attr-defined]
+        grant_evt.set()  # Unblock proxy handler waiting for grant
+    completion_evt = _pending_completions.pop(req.id, None)
+    if completion_evt:
+        completion_evt.set()
+    logger.warning(
+        "Swept stale request %s (model=%s, age=%.0fs)",
+        req.id, req.model, req.age_seconds,
+    )
+    audit.emit("queue_sweep", {
+        "request_id": req.id,
+        "model": req.model,
+        "age_seconds": round(req.age_seconds, 1),
+    })
+
+
 async def _queue_sweep_loop(ttl_seconds: float) -> None:
     """Background task that sweeps stale requests every 60 seconds.
 
@@ -238,21 +1267,7 @@ async def _queue_sweep_loop(ttl_seconds: float) -> None:
                 continue
             swept = _queue.sweep_stale(ttl_seconds)
             for req in swept:
-                grant_evt = _pending_grants.pop(req.id, None)
-                if grant_evt:
-                    grant_evt.set()  # Unblock proxy handler waiting for grant
-                completion_evt = _pending_completions.pop(req.id, None)
-                if completion_evt:
-                    completion_evt.set()
-                logger.warning(
-                    "Swept stale request %s (model=%s, age=%.0fs)",
-                    req.id, req.model, req.age_seconds,
-                )
-                audit.emit("queue_sweep", {
-                    "request_id": req.id,
-                    "model": req.model,
-                    "age_seconds": round(req.age_seconds, 1),
-                })
+                _release_swept_request(req)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -349,29 +1364,62 @@ async def _dispatch_request(request: QueuedRequest, needs_swap: bool = True) -> 
         # Wrap the done_fn cleanup: when the proxy signals completion,
         # also clean up inflight tracking
         async def _cleanup_inflight() -> None:
-            if original_done_event is not None:
-                timeout = (_config.proxy.inference_timeout_seconds if _config else 300.0) + 60.0
-                try:
-                    await asyncio.wait_for(original_done_event.wait(), timeout=timeout)
-                except TimeoutError:
-                    logger.warning(
-                        "Completion event timed out for non-blocking request %s (%.0fs)",
-                        request.id, timeout,
-                    )
-                    _pending_completions.pop(request.id, None)
-            # Clean up inflight tracking
-            if _inflight_lock is not None:
-                async with _inflight_lock:
-                    count = _inflight_models.get(request.model, 1) - 1
-                    if count <= 0:
-                        _inflight_models.pop(request.model, None)
-                    else:
-                        _inflight_models[request.model] = count
-            # Wake the scheduler so it can dispatch queued same-model requests
-            # immediately instead of waiting for the next loop_interval timeout.
-            # (Fix for issue #3: see reference/QUEUE_STALENESS_INVESTIGATION.md)
-            if _scheduler:
-                _scheduler.notify()
+            # The wait + decrement are wrapped in try/finally so the
+            # inflight counter decrement ALWAYS runs — otherwise a raise
+            # inside done_event.wait() (CancelledError, network errors, ...)
+            # would pin the counter above its true value and block the
+            # scheduler from evicting this model forever. KNOWN_ISSUES,
+            # resolved in v0.4.1.
+            try:
+                if original_done_event is not None:
+                    timeout = (
+                        _config.proxy.inference_timeout_seconds
+                        if _config else 300.0
+                    ) + 60.0
+                    try:
+                        await asyncio.wait_for(
+                            original_done_event.wait(), timeout=timeout,
+                        )
+                    except TimeoutError:
+                        logger.warning(
+                            "Completion event timed out for non-blocking request %s (%.0fs)",
+                            request.id, timeout,
+                        )
+                        _pending_completions.pop(request.id, None)
+            except Exception:
+                logger.exception(
+                    "Unexpected error waiting on completion event "
+                    "(request=%s); decrementing inflight anyway",
+                    request.id,
+                )
+            finally:
+                # Decrement inflight tracking even when the wait failed —
+                # otherwise this model's counter is stuck above its true
+                # value and the scheduler refuses to evict it.
+                if _inflight_lock is not None:
+                    try:
+                        async with _inflight_lock:
+                            count = _inflight_models.get(request.model, 1) - 1
+                            if count <= 0:
+                                _inflight_models.pop(request.model, None)
+                            else:
+                                _inflight_models[request.model] = count
+                    except Exception:
+                        logger.exception(
+                            "Failed to decrement _inflight_models for request=%s",
+                            request.id,
+                        )
+                # Wake the scheduler so it can dispatch queued same-model requests
+                # immediately instead of waiting for the next loop_interval timeout.
+                # (Fix for issue #3: see reference/QUEUE_STALENESS_INVESTIGATION.md)
+                if _scheduler:
+                    try:
+                        _scheduler.notify()
+                    except Exception:
+                        logger.exception(
+                            "Failed to notify scheduler after cleanup (request=%s)",
+                            request.id,
+                        )
 
         # Fire-and-forget: track completion in background
         asyncio.create_task(_cleanup_inflight(), name=f"inflight-cleanup-{request.id}")
@@ -633,6 +1681,39 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     )
     logger.info("Queue sweep started (TTL=%.0fs, interval=60s)", ttl)
 
+    # Construct the correlation engine + discrete-contention detector AFTER the
+    # scheduler/vram_tracker/vram_manager are built and BEFORE the snapshot loop
+    # starts (spec 6.6). Deps are scheduler/vram only — NOT _a2a_handler, so an
+    # A2A-disabled deployment is fully functional. The engine is PASSIVE: its
+    # tick() runs inside _collect_machine_snapshot on the snapshot the loop
+    # already assembled (pull, never push) and it owns no background task. The
+    # inference emitter PULLS _recent_requests via this provider callable, so the
+    # record site (record_recent_request) never imports the engine.
+    global _correlation_engine, _contention_detector
+    _corr_cfg = config.observability.correlation
+    _correlation_engine = CorrelationEngine(
+        recent_requests_provider=lambda: list(_recent_requests),
+        config=_corr_cfg,
+    )
+    _contention_detector = ContentionEventDetector(config=_corr_cfg)
+    logger.info(
+        "Correlation engine started (ring maxlen=%d, contention maxlen=%d)",
+        _correlation_engine.ring.maxlen,
+        _contention_detector.recent_contentions.maxlen,
+    )
+
+    # Start the broker-side machine-snapshot collection loop (observability
+    # spec 4.9). The broker owns collection so /broker/snapshot works headless;
+    # the TUI is a client that polls it (ADR-005).
+    global _machine_snapshot_task
+    _machine_snapshot_task = asyncio.create_task(
+        _machine_snapshot_loop(), name="bastion-machine-snapshot"
+    )
+    logger.info(
+        "Machine snapshot loop started (interval=%.1fs)",
+        config.observability.snapshot_interval_s,
+    )
+
     # Start process monitor (Ollama health + GPU lockup detection)
     global _process_monitor
     _process_monitor = ProcessMonitor(
@@ -662,6 +1743,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     if _sweep_task:
         _sweep_task.cancel()
         _sweep_task = None
+    if _machine_snapshot_task:
+        _machine_snapshot_task.cancel()
+        _machine_snapshot_task = None
     if _process_monitor:
         await _process_monitor.stop()
     if _scheduler:
@@ -726,19 +1810,23 @@ def create_app(config: BrokerConfig) -> FastAPI:
         fields (total_dispatched, swap_rate_level, stall diagnostics,
         inflight models, circuit breaker state, GPU safety, VRAM budget).
         """
-        loaded = await _vram_tracker.get_loaded_models() if _vram_tracker else []
+        loaded_raw = await _vram_tracker.get_loaded_models() if _vram_tracker else []
+        # State-unknown sentinel (None) coerced to [] so the BrokerStatus
+        # contract (loaded_models: list) stays satisfied during outages.
+        loaded = loaded_raw if loaded_raw is not None else []
         gpu = await query_gpu_status()
         status = BrokerStatus(
             uptime_seconds=time.time() - _start_time,
             queue_depth=_queue.total_size if _queue else 0,
             queue_by_model=_queue.queue_depth_by_model() if _queue else {},
             loaded_models=loaded,
+            vram_state="unknown" if loaded_raw is None else "ok",
             gpu=gpu,
             current_model=_scheduler.current_model if _scheduler else None,
             total_requests_served=_proxy._requests_served if _proxy else 0,
             total_model_swaps=_scheduler.total_swaps if _scheduler else 0,
             state="draining" if (_scheduler and _scheduler.is_draining) else "running",
-            vram_ledger=_vram_manager.status() if _vram_manager else None,
+            vram_ledger=(await _vram_manager.status()) if _vram_manager else None,
         )
         result = status.model_dump()
 
@@ -849,7 +1937,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
         """
         if not _vram_manager:
             return JSONResponse({"error": "VRAMManager not initialized"}, status_code=503)
-        return _vram_manager.status()
+        return await _vram_manager.status()
 
     # ── Kubernetes-compatible health probes ──────────────────────────
 
@@ -1045,6 +2133,26 @@ def create_app(config: BrokerConfig) -> FastAPI:
             global_verdict = "OK"
         return BrokerThrashing(detector_state=global_verdict, agents=agent_entries)
 
+    @broker_router.get("/version")
+    async def broker_version() -> dict[str, Any]:
+        """Build identity for client SHA-pinning during long batches.
+
+        Returns the BASTION version, git SHA, and process boot timestamp.
+        A2A clients can pin ``git_sha`` at the start of a long
+        batch and refuse to retry against a different SHA — the signal that
+        a mid-run redeploy (not a transient infra blip) caused the errors.
+        ``boot_time_unix`` distinguishes process restarts at unchanged SHA.
+        """
+        return {
+            "version": bastion.__version__,
+            "git_sha": _GIT_SHA,
+            "boot_time_unix": _start_time,
+            "boot_time_iso": (
+                datetime.fromtimestamp(_start_time, UTC).isoformat()
+                if _start_time else ""
+            ),
+        }
+
     # ── S6: Model Intent API ────────────────────────────────────────
 
     @broker_router.post("/intent")
@@ -1131,24 +2239,112 @@ def create_app(config: BrokerConfig) -> FastAPI:
         logger.info("Intent deleted: %s", intent_id)
         return {"status": "deleted", "intent_id": intent_id}
 
-    # ── A2A Interface Routes ────────────────────────────────────────
+    @broker_router.get("/latency")
+    async def broker_latency(window_s: float = 300.0) -> BrokerLatency:
+        """Per-model latency percentiles over the rolling window.
 
-    async def _sse_wrapper(generator: AsyncGenerator[dict, None]) -> AsyncGenerator[bytes, None]:
-        """Wrap A2A events as SSE-formatted bytes.
+        Aggregates the ``_recent_requests`` ring buffer. Models with fewer
+        than 3 samples in the window are omitted from ``per_model``
+        (single-call noise); the ``overall`` bucket aggregates everything.
 
-        Handles three event types:
-        - Regular events: formatted as "data: {json}\\n\\n"
-        - Heartbeats: formatted as SSE comment ": heartbeat\\n\\n"
-        - Sentinels (None): ignored (generator should stop)
+        Query parameters
+        ----------------
+        window_s : float
+            Default 300.0 (5 min). Clamped to ``[10.0, 3600.0]``.
         """
-        async for event in generator:
-            if event is None:
-                break
-            if isinstance(event, dict) and event.get("_heartbeat"):
-                yield b": heartbeat\n\n"
-                continue
-            data = json.dumps(event)
-            yield f"data: {data}\n\n".encode()
+        window_s = max(10.0, min(3600.0, window_s))
+        return aggregate_latency(list(_recent_requests), window_s)
+
+    @broker_router.get("/catalog")
+    async def broker_catalog() -> BrokerCatalog:
+        """Registered models from broker.yaml enriched with residency state.
+
+        Returns the full ``models:`` dict from broker.yaml, augmented with:
+        - ``currently_loaded`` — whether VRAMTracker reports the model in
+          Ollama right now
+        - ``actual_vram_gb`` — measured VRAM at the snapshot, or null
+        - ``is_evictable`` — loaded AND not the scheduler's current model
+          AND not always_allowed
+
+        ``snapshot_age_s`` reflects the age of the residency snapshot used
+        to build this response (close to zero — a fresh ``/api/ps`` query
+        is issued per request). ``is_evictable`` is computed at response
+        time and can flip between calls if a swap is in flight.
+
+        When ``/api/ps`` is unreachable, residency information collapses
+        to "nothing loaded" rather than raising — the catalog itself
+        remains queryable so operators can still see the registry shape
+        during an Ollama outage.
+        """
+        snapshot_ts = time.time()
+        loaded_raw = await _vram_tracker.get_loaded_models() if _vram_tracker else []
+        loaded = loaded_raw if loaded_raw is not None else []
+        # Tag-aware residency: /api/ps reports 'name:latest' for untagged
+        # registry keys — normalize the implicit tag on both sides so a
+        # resident model isn't shown as not-loaded under a tag mismatch.
+        loaded_norm = {m.name.removesuffix(":latest"): m for m in loaded}
+        snapshot_age_s = max(0.0, time.time() - snapshot_ts)
+        current = _scheduler.current_model if _scheduler else None
+
+        entries: list[CatalogEntry] = []
+        for name, info in config.models.items():
+            resident = loaded_norm.get(name.removesuffix(":latest"))
+            is_loaded = resident is not None
+            entries.append(CatalogEntry(
+                name=name,
+                vram_gb=info.vram_gb,
+                default_num_ctx=info.default_num_ctx,
+                tags=list(info.tags),
+                always_allowed=info.always_allowed,
+                currently_loaded=is_loaded,
+                actual_vram_gb=resident.vram_gb if resident is not None else None,
+                is_evictable=(
+                    is_loaded
+                    and name != current
+                    and not info.always_allowed
+                ),
+            ))
+
+        return BrokerCatalog(
+            models=entries,
+            total=len(entries),
+            loaded_count=sum(1 for e in entries if e.currently_loaded),
+            evictable_count=sum(1 for e in entries if e.is_evictable),
+            registry_source=(
+                _redact_home(str(config.loaded_from))
+                if config.loaded_from else "<unknown>"
+            ),
+            snapshot_age_s=snapshot_age_s,
+            residency_state="unknown" if loaded_raw is None else "ok",
+        )
+
+    # ── Machine snapshot (observability spec 4.9/4.10) ──────────────
+    # Single-sourced handlers registered in BOTH factories (dual-factory tax,
+    # spec 4.10 — there is no shared router; registering once would 404 in the
+    # admin-only two-port deployment).
+    broker_router.add_api_route("/snapshot", _handle_snapshot, methods=["GET"])
+    broker_router.add_api_route(
+        "/snapshot/stream", _handle_snapshot_stream, methods=["GET"]
+    )
+    broker_router.add_api_route("/contention", _handle_contention, methods=["GET"])
+    broker_router.add_api_route(
+        "/gpu/extended", _handle_gpu_extended, methods=["GET"]
+    )
+    broker_router.add_api_route("/processes", _handle_processes, methods=["GET"])
+    # Correlation engine surfaces (spec 6.4/6.3/7). Ring + enriched stall are
+    # FOLDED into /broker/snapshot (no /ring or /stall endpoints); only the
+    # composite-risk and discrete-contention surfaces get their own routes.
+    broker_router.add_api_route(
+        "/correlation/risk", _handle_correlation_risk, methods=["GET"]
+    )
+    broker_router.add_api_route(
+        "/correlation/contentions",
+        _handle_correlation_contentions,
+        methods=["GET"],
+    )
+
+    # ── A2A Interface Routes ────────────────────────────────────────
+    # SSE encoding is the shared module-level _sse_wrapper (deduped, spec 5.6).
 
     @a2a_router.get("/stats")
     async def a2a_stats():
@@ -1207,7 +2403,12 @@ def create_app(config: BrokerConfig) -> FastAPI:
 
         success = await _a2a_handler.cancel_task(task_id)
         if not success:
-            return JSONResponse({"error": "Task not found or not cancelable"}, status_code=404)
+            if _a2a_handler.is_task_terminal(task_id):
+                return JSONResponse(
+                    {"error": "Task already in terminal state (not cancelable)"},
+                    status_code=409,
+                )
+            return JSONResponse({"error": "Task not found"}, status_code=404)
         return {"status": "canceled", "task_id": task_id}
 
     # ── Lease Management (Hybrid Lease Model) ───────────────────────
@@ -1489,19 +2690,23 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
         fields (total_dispatched, swap_rate_level, stall diagnostics,
         inflight models, circuit breaker state, GPU safety, VRAM budget).
         """
-        loaded = await _vram_tracker.get_loaded_models() if _vram_tracker else []
+        loaded_raw = await _vram_tracker.get_loaded_models() if _vram_tracker else []
+        # State-unknown sentinel (None) coerced to [] so the BrokerStatus
+        # contract (loaded_models: list) stays satisfied during outages.
+        loaded = loaded_raw if loaded_raw is not None else []
         gpu = await query_gpu_status()
         status = BrokerStatus(
             uptime_seconds=time.time() - _start_time,
             queue_depth=_queue.total_size if _queue else 0,
             queue_by_model=_queue.queue_depth_by_model() if _queue else {},
             loaded_models=loaded,
+            vram_state="unknown" if loaded_raw is None else "ok",
             gpu=gpu,
             current_model=_scheduler.current_model if _scheduler else None,
             total_requests_served=_proxy._requests_served if _proxy else 0,
             total_model_swaps=_scheduler.total_swaps if _scheduler else 0,
             state="draining" if (_scheduler and _scheduler.is_draining) else "running",
-            vram_ledger=_vram_manager.status() if _vram_manager else None,
+            vram_ledger=(await _vram_manager.status()) if _vram_manager else None,
         )
         result = status.model_dump()
 
@@ -1601,7 +2806,7 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
         """VRAM ledger status from VRAMManager."""
         if not _vram_manager:
             return JSONResponse({"error": "VRAMManager not initialized"}, status_code=503)
-        return _vram_manager.status()
+        return await _vram_manager.status()
 
     @broker_router.get("/livez")
     async def broker_livez():
@@ -1771,6 +2976,26 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
             global_verdict = "OK"
         return BrokerThrashing(detector_state=global_verdict, agents=agent_entries)
 
+    @broker_router.get("/version")
+    async def broker_version() -> dict[str, Any]:
+        """Build identity for client SHA-pinning during long batches.
+
+        Returns the BASTION version, git SHA, and process boot timestamp.
+        A2A clients can pin ``git_sha`` at the start of a long
+        batch and refuse to retry against a different SHA — the signal that
+        a mid-run redeploy (not a transient infra blip) caused the errors.
+        ``boot_time_unix`` distinguishes process restarts at unchanged SHA.
+        """
+        return {
+            "version": bastion.__version__,
+            "git_sha": _GIT_SHA,
+            "boot_time_unix": _start_time,
+            "boot_time_iso": (
+                datetime.fromtimestamp(_start_time, UTC).isoformat()
+                if _start_time else ""
+            ),
+        }
+
     @broker_router.post("/intent")
     async def broker_intent(request: Request):
         """Declare an upcoming model sequence for scheduler optimization."""
@@ -1836,20 +3061,111 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
         logger.info("Intent deleted: %s", intent_id)
         return {"status": "deleted", "intent_id": intent_id}
 
-    # ── A2A Interface Routes ────────────────────────────────────────
+    @broker_router.get("/latency")
+    async def broker_latency(window_s: float = 300.0) -> BrokerLatency:
+        """Per-model latency percentiles over the rolling window.
 
-    async def _sse_wrapper_admin(
-        generator: AsyncGenerator[dict, None],
-    ) -> AsyncGenerator[bytes, None]:
-        """Wrap A2A events as SSE-formatted bytes."""
-        async for event in generator:
-            if event is None:
-                break
-            if isinstance(event, dict) and event.get("_heartbeat"):
-                yield b": heartbeat\n\n"
-                continue
-            data = json.dumps(event)
-            yield f"data: {data}\n\n".encode()
+        Aggregates the ``_recent_requests`` ring buffer. Models with fewer
+        than 3 samples in the window are omitted from ``per_model``
+        (single-call noise); the ``overall`` bucket aggregates everything.
+
+        Query parameters
+        ----------------
+        window_s : float
+            Default 300.0 (5 min). Clamped to ``[10.0, 3600.0]``.
+        """
+        window_s = max(10.0, min(3600.0, window_s))
+        return aggregate_latency(list(_recent_requests), window_s)
+
+    @broker_router.get("/catalog")
+    async def broker_catalog() -> BrokerCatalog:
+        """Registered models from broker.yaml enriched with residency state.
+
+        Returns the full ``models:`` dict from broker.yaml, augmented with:
+        - ``currently_loaded`` — whether VRAMTracker reports the model in
+          Ollama right now
+        - ``actual_vram_gb`` — measured VRAM at the snapshot, or null
+        - ``is_evictable`` — loaded AND not the scheduler's current model
+          AND not always_allowed
+
+        ``snapshot_age_s`` reflects the age of the residency snapshot used
+        to build this response (close to zero — a fresh ``/api/ps`` query
+        is issued per request). ``is_evictable`` is computed at response
+        time and can flip between calls if a swap is in flight.
+
+        When ``/api/ps`` is unreachable, residency information collapses
+        to "nothing loaded" rather than raising — the catalog itself
+        remains queryable so operators can still see the registry shape
+        during an Ollama outage.
+        """
+        snapshot_ts = time.time()
+        loaded_raw = await _vram_tracker.get_loaded_models() if _vram_tracker else []
+        loaded = loaded_raw if loaded_raw is not None else []
+        # Tag-aware residency: /api/ps reports 'name:latest' for untagged
+        # registry keys — normalize the implicit tag on both sides so a
+        # resident model isn't shown as not-loaded under a tag mismatch.
+        loaded_norm = {m.name.removesuffix(":latest"): m for m in loaded}
+        snapshot_age_s = max(0.0, time.time() - snapshot_ts)
+        current = _scheduler.current_model if _scheduler else None
+
+        entries: list[CatalogEntry] = []
+        for name, info in config.models.items():
+            resident = loaded_norm.get(name.removesuffix(":latest"))
+            is_loaded = resident is not None
+            entries.append(CatalogEntry(
+                name=name,
+                vram_gb=info.vram_gb,
+                default_num_ctx=info.default_num_ctx,
+                tags=list(info.tags),
+                always_allowed=info.always_allowed,
+                currently_loaded=is_loaded,
+                actual_vram_gb=resident.vram_gb if resident is not None else None,
+                is_evictable=(
+                    is_loaded
+                    and name != current
+                    and not info.always_allowed
+                ),
+            ))
+
+        return BrokerCatalog(
+            models=entries,
+            total=len(entries),
+            loaded_count=sum(1 for e in entries if e.currently_loaded),
+            evictable_count=sum(1 for e in entries if e.is_evictable),
+            registry_source=(
+                _redact_home(str(config.loaded_from))
+                if config.loaded_from else "<unknown>"
+            ),
+            snapshot_age_s=snapshot_age_s,
+            residency_state="unknown" if loaded_raw is None else "ok",
+        )
+
+    # ── Machine snapshot (observability spec 4.9/4.10) ──────────────
+    # Same single-sourced handlers as create_app — registered here too so the
+    # admin-only two-port deployment serves these endpoints (spec 4.10).
+    broker_router.add_api_route("/snapshot", _handle_snapshot, methods=["GET"])
+    broker_router.add_api_route(
+        "/snapshot/stream", _handle_snapshot_stream, methods=["GET"]
+    )
+    broker_router.add_api_route("/contention", _handle_contention, methods=["GET"])
+    broker_router.add_api_route(
+        "/gpu/extended", _handle_gpu_extended, methods=["GET"]
+    )
+    broker_router.add_api_route("/processes", _handle_processes, methods=["GET"])
+    # Correlation engine surfaces (spec 6.4/6.3/7). Ring + enriched stall are
+    # FOLDED into /broker/snapshot (no /ring or /stall endpoints); only the
+    # composite-risk and discrete-contention surfaces get their own routes.
+    broker_router.add_api_route(
+        "/correlation/risk", _handle_correlation_risk, methods=["GET"]
+    )
+    broker_router.add_api_route(
+        "/correlation/contentions",
+        _handle_correlation_contentions,
+        methods=["GET"],
+    )
+
+    # ── A2A Interface Routes ────────────────────────────────────────
+    # SSE encoding is the shared module-level _sse_wrapper (deduped, spec 5.6).
 
     @a2a_router.get("/stats")
     async def a2a_stats():
@@ -1886,7 +3202,7 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
             return JSONResponse({"error": "Task not found"}, status_code=404)
         generator = _a2a_handler.subscribe_task(task_id, request=request)
         return StreamingResponse(
-            _sse_wrapper_admin(generator),
+            _sse_wrapper(generator),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -1902,7 +3218,12 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
             return JSONResponse({"error": "A2A interface not enabled"}, status_code=501)
         success = await _a2a_handler.cancel_task(task_id)
         if not success:
-            return JSONResponse({"error": "Task not found or not cancelable"}, status_code=404)
+            if _a2a_handler.is_task_terminal(task_id):
+                return JSONResponse(
+                    {"error": "Task already in terminal state (not cancelable)"},
+                    status_code=409,
+                )
+            return JSONResponse({"error": "Task not found"}, status_code=404)
         return {"status": "canceled", "task_id": task_id}
 
     @a2a_router.post("/leases/{lease_id}/heartbeat")

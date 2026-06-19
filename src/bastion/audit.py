@@ -146,10 +146,70 @@ def build_audit_event(
 # Ring buffer of recent audit events (newest last, capped at 50)
 _recent_events: deque = deque(maxlen=50)
 
+# Monotonic sequence number incremented on EVERY append to ``_recent_events``.
+# It is a stable cursor for consumers (the correlation engine) that need an
+# index which survives the bounded ring discarding its left end on overflow —
+# a raw deque index drifts once the ring wraps, a sequence number does not.
+# See design spec 2026-06-19 Section 6.2 (emitter A — public cursor API).
+_event_seq: int = 0
+
+
+def _append_event(entry: dict) -> None:
+    """Append an audit event to the recent-events ring and bump the sequence.
+
+    The single funnel for every ``_recent_events.append`` so ``_event_seq``
+    stays strictly monotonic regardless of which emit path produced the event.
+    """
+    global _event_seq
+    _recent_events.append(entry)
+    _event_seq += 1
+
 
 def recent_events(limit: int = 10) -> list[dict]:
     """Return the most recent audit events, newest last."""
     return list(_recent_events)[-limit:]
+
+
+def get_events_since(cursor: int) -> tuple[list[dict], int]:
+    """Return audit events appended since ``cursor`` plus the new cursor.
+
+    ``cursor`` is a monotonic sequence number (see ``_event_seq``), **not** a
+    deque index, so it is stable across ring wraps and external mutation of
+    ``_recent_events``. The correlation engine stores its ``last_ingested_seq``
+    and calls this each tick to pull only-new events (pull, never push).
+
+    Because ``_recent_events`` is bounded, events whose sequence numbers fall
+    below the oldest retained event have been discarded; this returns only the
+    slice the ring still holds whose sequence number is greater than
+    ``cursor`` — never a misleading duplicate and never an exception. The
+    returned cursor is always the latest sequence number so the caller advances
+    past discarded events rather than re-requesting them forever.
+
+    Parameters
+    ----------
+    cursor : int
+        The last sequence number the caller has already ingested (``0`` to
+        start from the beginning of whatever the ring currently retains).
+
+    Returns
+    -------
+    tuple[list[dict], int]
+        ``(new_events, new_cursor)`` where ``new_events`` are the retained
+        events with sequence number ``> cursor`` (oldest first) and
+        ``new_cursor`` is the current ``_event_seq``.
+    """
+    latest = _event_seq
+    if cursor >= latest:
+        return [], latest
+    # Sequence number of the oldest event still in the bounded ring: the most
+    # recent ``len(_recent_events)`` appends occupy seqs (latest-N, latest].
+    retained = list(_recent_events)
+    oldest_retained_seq = latest - len(retained)  # seq of retained[0] is this+1
+    # Number of events the caller is missing that we can still serve.
+    skip = max(0, cursor - oldest_retained_seq)
+    if skip >= len(retained):
+        return [], latest
+    return retained[skip:], latest
 
 
 def _open_audit_handler(
@@ -254,7 +314,7 @@ class AuditLogger:
             "event": event,
             "details": details,
         }
-        _recent_events.append(entry)
+        _append_event(entry)
         self.logger.info(json.dumps(entry))
 
     def emit_tiered(
@@ -303,12 +363,23 @@ class AuditLogger:
             prompt=prompt,
             response=response,
         )
-        _recent_events.append(entry)
+        _append_event(entry)
         self.logger.info(json.dumps(entry))
 
 
 # Global audit logger instance
 _audit_logger: Any = None  # AuditLogger | PersistentAuditLog | None at runtime
+
+# Ring buffer for events emitted before init_audit_logger() — flushed on
+# init so startup-ordering bugs leave a trace instead of vanishing.
+# Flushed events carry flush-time timestamps (startup window is sub-second).
+_PREINIT_BUFFER_MAX = 256
+_preinit_events: deque[tuple[str, dict[str, Any]]] = deque(maxlen=_PREINIT_BUFFER_MAX)
+
+# Deliberately NOT logging.getLogger(__name__): "bastion.audit" is the JSONL
+# audit logger's name (propagate=False, file handler) — a child logger would
+# propagate warnings into the audit file itself.
+_module_logger = logging.getLogger("bastion.audit_bootstrap")
 
 
 def init_audit_logger(
@@ -335,6 +406,14 @@ def init_audit_logger(
     """
     global _audit_logger
     _audit_logger = AuditLogger(log_path, max_bytes, backup_count, tier=tier)
+    if _preinit_events:
+        flushed = len(_preinit_events)
+        while _preinit_events:
+            event, details = _preinit_events.popleft()
+            _audit_logger.emit(event, details)
+        _module_logger.info(
+            "Flushed %d audit event(s) buffered before init", flushed
+        )
 
 
 def emit(event: str, details: dict[str, Any]) -> None:
@@ -349,9 +428,21 @@ def emit(event: str, details: dict[str, Any]) -> None:
         Event type (swap, vram_alert, queue_change, request_complete).
     details : dict
         Event-specific data.
+
+    Notes
+    -----
+    Before :func:`init_audit_logger` runs, events are held in a bounded
+    ring buffer (and a WARNING is logged) rather than silently dropped;
+    they flush to the audit log on init.
     """
     if _audit_logger is not None:
         _audit_logger.emit(event, details)
+        return
+    _preinit_events.append((event, details))
+    _module_logger.warning(
+        "audit.emit('%s') before init_audit_logger — buffered (%d pending, max %d)",
+        event, len(_preinit_events), _PREINIT_BUFFER_MAX,
+    )
 
 
 def emit_tiered(

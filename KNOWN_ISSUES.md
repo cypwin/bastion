@@ -22,198 +22,265 @@ remainder can be folded into v0.5 work.
 
 ## Critical
 
-### `VRAMTracker.get_loaded_models()` returns `[]` indistinguishable from "no models loaded"
-
-- **Location:** `src/bastion/vram.py:133-135`
-- **Problem:** Every downstream consumer (`can_load_model`, `reconcile`,
-  scheduler's `_evict_for_model`, VRAM budget check) treats `[]` as "VRAM
-  is free." If `/api/ps` is transiently unreachable, the broker silently
-  thinks all models are unloaded and may approve a load that exceeds the
-  24 GB budget — the exact crash failure mode BASTION is built to prevent.
-- **Fix path:** either propagate the exception or return a sentinel
-  `None` and have callers skip budget enforcement when the state is
-  unknown. The latter is less invasive but every caller needs auditing.
-- **Surfaced by:** silent-failure-hunter audit, v0.4 campaign.
+_(none open — see "Resolved in v0.4.1" below)_
 
 ---
 
 ## Important
 
-### `_queue_sweep_loop` grants events for swept requests without distinguishing them
+### Broker dies after upstream Ollama 500 (under VRAM contention)
 
-- **Location:** `src/bastion/server.py:237-239`
-- **Problem:** When a stale request is swept, `grant_evt.set()` unblocks
-  the waiting proxy handler, which then proceeds to forward to Ollama as
-  if it had been legitimately granted. The proxy has no signal that the
-  request was *swept* rather than *granted*, so it dispatches to Ollama
-  (incrementing in-flight counters) for a request the scheduler never
-  intended to run.
-- **Fix path:** introduce a `swept` flag or separate "rejected" event
-  type so the proxy handler returns 503/504 instead of forwarding.
+- **Observed:** 2026-06-11 ~22:02, during the the-batch-client atlas bulk-extract
+  sweep (~600 trees of `/api/chat` calls through the proxy). Under
+  concurrent-session VRAM contention Ollama returned a 500; shortly after, the
+  broker stopped serving entirely. Ollama itself never crashed
+  (journalctl-verified). Repro evidence: journalctl around 2026-06-11 22:02;
+  client-side symptoms recorded in the-batch-client
+  (`the batch client` header comment + S129/S130 session notes).
+- **Problem:** an upstream 5xx is a *response*, not an httpx exception — so
+  `CircuitBreakerTransport` never counts it (see the existing
+  `RemoteProtocolError`/`PoolTimeout` item) and no handler path treats
+  upstream-500 specially. Whatever killed the broker was therefore not the
+  breaker opening; the actual death path needs the journal traceback to pin
+  down.
+- **Consequence worth flagging:** the failure pushed the batch client to ship
+  a proxy-bypass (`OLLAMA_HOST_OVERRIDE` → direct :11434) — i.e. this bug's
+  practical effect is clients routing AROUND the crash-prevention layer,
+  re-exposing exactly the load class BASTION exists to absorb.
+- **Fix path:** (1) pull the traceback from journalctl for 2026-06-11 ~22:02;
+  (2) harden the dispatch/stream path so an upstream 5xx is forwarded (or
+  mapped to 502) without killing the broker; (3) consider counting upstream
+  5xx storms toward the circuit breaker. Regression test: upstream returns 500
+  mid-batch → broker stays up and serves subsequent requests.
+- **Status:** Defensive half landed S131 (75727bb): upstream 5xx is forwarded
+  with its real status in both streaming and non-streaming paths, connect
+  failures map to 502 without leaking scheduler slots, and upstream ≥500
+  counts toward the circuit breaker. Regression tests pin the contract
+  (`TestUpstream500Survival`). **Root cause still open** — needs the
+  journalctl traceback from 2026-06-11 ~22:02 to pin the actual death path.
+- **Surfaced by:** the-batch-client S129 data/sessions sweep (2026-06-11); filed
+  S131 (2026-06-12).
+
+### `_dispatch_error_cleanup` sets grant events without distinguishing failure from grant
+
+- **Location:** `src/bastion/server.py:351-363`
+- **Problem:** Same bug class as the swept-request issue resolved in v0.5
+  (see below): when dispatch fails, `_dispatch_error_cleanup` pops and sets
+  the grant event with no marker, so the waiting proxy handler treats the
+  failure as a grant and forwards to Ollama anyway.
+- **Fix path:** reuse the `swept`-style attribute marker (perhaps renamed
+  to a generic `rejected`) so the proxy returns an error instead of
+  forwarding; one unit test mirroring `TestReleaseSweptRequest`.
+- **Surfaced by:** S131 swept-vs-granted fix (deliberately not folded in to
+  keep that change minimal).
+
+### A2A `_handle_status` swallows handler exceptions without logging (FIXED in v0.4.1)
+
+- **Status:** Resolved (S130). The `except` block now calls
+  `logger.exception("A2A status handler error (task=%s)", ...)` before the
+  FAILED transition, and the handler no longer crashes on the VRAM
+  state-unknown sentinel in the first place (answers with
+  `vram_state: "unknown"`).
 - **Surfaced by:** silent-failure-hunter, v0.4 campaign.
-
-### Scheduler ignores `unload_model()` return value
-
-- **Location:** `src/bastion/vram.py:285-287` + `src/bastion/scheduler.py::_unload_model`
-- **Problem:** The 901c910 fix made `unload_model()` *honest* about
-  whether VRAM converged. But the scheduler's `_unload_model` only logs
-  the return value — it doesn't gate the subsequent load path. Eviction
-  can silently fail and the scheduler may then attempt to load a new
-  model into full VRAM.
-- **Fix path:** check the return value in `_unload_model` and abort the
-  swap when unload reports `False`.
-- **Surfaced by:** silent-failure-hunter, v0.4 campaign.
-
-### `_cleanup_inflight` background task has no exception handler
-
-- **Location:** `src/bastion/server.py:365`
-- **Problem:** The task is responsible for decrementing `_inflight_models`
-  and calling `_scheduler.notify()`. If `_inflight_lock` is None
-  unexpectedly or any context manager raises, the task dies silently. The
-  inflight counter stays incremented forever, blocking the scheduler
-  from evicting that model.
-- **Fix path:** wrap the task body in `try/except Exception` and ensure
-  `_inflight_models` decrement happens in a `finally` block.
-- **Surfaced by:** silent-failure-hunter, v0.4 campaign.
-
-### A2A `create_lease` has TOCTOU window with `has_active_lease`
-
-- **Location:** `src/bastion/a2a.py:1479-1517`
-- **Problem:** "Single grant per model" semantics are enforced by the
-  caller pattern `if not has_active_lease: create_lease(...)`. Two
-  concurrent callers can both pass `has_active_lease` False before
-  either calls `create_lease`.
-- **Fix path:** introduce `try_create_lease(model, ...)` that atomically
-  checks + creates under an internal lock.
-- **Surfaced by:** concurrency-test agent, v0.4 campaign.
-
-### `CircuitBreakerTransport` ignores `RemoteProtocolError` and `PoolTimeout`
-
-- **Location:** `src/bastion/circuitbreaker.py:267-269`
-- **Problem:** The `except` clause explicitly catches `ConnectError`,
-  `ConnectTimeout`, `ReadTimeout`. Other httpx exceptions
-  (`RemoteProtocolError`, `PoolTimeout`, etc.) propagate without
-  affecting the breaker counter — connection-pool pressure and protocol-
-  level corruption never trigger the breaker.
-- **Fix path:** broaden the except clause OR wrap with a general handler
-  that classifies non-transient httpx errors as failures.
-- **Surfaced by:** Agent 2 (failure GPU + Ollama), v0.4 campaign.
-
-### Scheduler's GPU-hot gate doesn't guard mid-swap
-
-- **Location:** `src/bastion/scheduler.py::_process_tick` (gate at top of tick)
-- **Problem:** `check_gpu_safe` is called at the top of `_process_tick`
-  but not re-checked inside `_handle_swap_dispatch` before the actual
-  `_dispatch_for_model` call. A GPU that transitions hot during the swap
-  is unprotected — exactly the load-cycle the system exists to prevent.
-- **Fix path:** re-check `check_gpu_safe` immediately before the dispatch
-  call inside the swap path.
-- **Surfaced by:** Agent 2 (failure GPU + Ollama), v0.4 campaign.
-
-### Dashboard `BastionClient` swallows all errors silently
-
-- **Location:** `src/bastion/dashboard/client.py:34-89`
-- **Problem:** Six methods (`get_recent`, `get_queue`, `get_health`,
-  `get_vram_ledger`, `get_watchdog`, `get_counters`, `get_thrashing`)
-  have `except Exception: return []` / `return {}` with no logging. The
-  dashboard renders empty panels on any error — auth failure, 404, network
-  partition — with no indication that data is absent vs. truly empty.
-- **Fix path:** log at DEBUG level with endpoint name and exception type
-  so the dashboard log captures the failure even if the UI doesn't.
-- **Surfaced by:** silent-failure-hunter, v0.4 campaign.
-
-### Proxy enqueue bare `except Exception` reports any failure as "queue full"
-
-- **Location:** `src/bastion/proxy.py:284-290`
-- **Problem:** Any unexpected exception from `_enqueue_fn` (programming
-  error, attribute error, ...) is silently reported to the client as
-  "Broker queue full." The log message says "Queue full" regardless of
-  cause, with no traceback.
-- **Fix path:** narrow the exception handler to `RuntimeError` (the
-  queue-full signal), log non-RuntimeError cases at ERROR with
-  `exc_info=True`.
-- **Surfaced by:** silent-failure-hunter, v0.4 campaign.
-
-### A2A `_handle_status` swallows handler exceptions without logging
-
-- **Location:** `src/bastion/a2a.py:918-923`
-- **Problem:** `except Exception` block sets `record.error = str(e)` and
-  transitions to FAILED, but no `logger.error` / `logger.exception`. A
-  bug in the status handler fails tasks silently.
-- **Fix path:** add `logger.exception("A2A status handler error
-  (task=%s)", record.task_id)` before the state transition.
-- **Surfaced by:** silent-failure-hunter, v0.4 campaign.
-
-### `TaskStore.create` is not lock-protected
-
-- **Location:** `src/bastion/taskstore.py:147`
-- **Problem:** Safe under asyncio's single-loop because the writes don't
-  cross an `await` boundary, but the safety is undocumented and fragile.
-  Any threaded caller (anyio thread pool, executor offload) races on
-  `self._active[task_id]` and `_active_timestamps`.
-- **Fix path:** either document the asyncio-only contract explicitly or
-  add a `threading.Lock`. Concurrency tests added in v0.4 only exercise
-  the asyncio path.
-- **Surfaced by:** concurrency-test agent, v0.4 campaign.
 
 ---
 
 ## Minor
 
-### `VRAMManager._reclaim_expired_sync()` called outside lock in `reconcile()` and `status()`
+### Unauthenticated admin surface discloses build/config metadata (accepted risk pending ADR-006)
 
-- **Location:** `src/bastion/vram.py:557, 608`
-- **Problem:** Same pattern as the C2 fix landed in v0.4 (`reserve()`
-  moved reclaim inside the lock), but `reconcile()` and `status()` still
-  call it outside. Lower risk than `reserve()` because these are diagnostic
-  paths not on the budget hot-path, but still incorrect under concurrent
-  callers.
-- **Fix path:** wrap each call in `async with self._lock`.
-
-### `audit.emit()` is a global no-op before `init_audit_logger()` is called
-
-- **Location:** `src/bastion/audit.py:342-346`
-- **Problem:** Any audit event during startup before `init_audit_logger`
-  completes is silently discarded. Startup window is short so this is
-  minor, but startup-ordering bugs become invisible.
-- **Fix path:** buffer pre-init events in a small ring buffer and flush
-  on init; OR log at WARNING when emit fires pre-init.
-
-### `_safe_transition` debug-logs invalid transitions
-
-- **Location:** `src/bastion/a2a.py:447-458`
-- **Problem:** `KeyError` (task not in active store) or invalid
-  `ValueError` transition logs at DEBUG. If the task state machine enters
-  an inconsistent state due to a race, no one notices unless DEBUG logging
-  is enabled.
-- **Fix path:** raise log level to WARNING for the ValueError branch
-  (the KeyError branch — already-compacted — is fine at DEBUG).
-
-### `ResidencyCache.invalidate()` is not lock-protected
-
-- **Location:** `src/bastion/vram.py:92-95`
-- **Problem:** Writes `self._cache_timestamp = 0.0` without holding
-  `self._lock`. Safe for asyncio (CPython attribute writes are atomic)
-  but the assumption is undocumented and would break under any future
-  threading.
-- **Fix path:** add a one-line comment documenting the asyncio-only
-  contract, OR take the lock for symmetry with other mutations.
-
-### DELETE `/a2a/tasks/{id}` returns 404 for already-terminal tasks
-
-- **Location:** `src/bastion/server.py` (A2A delete route)
-- **Problem:** 409 Conflict is arguably more semantically correct than
-  404 Not Found for a task that *exists* but is in a terminal state. The
-  current 404 also confuses retry logic in clients that expect 404 to
-  mean "this never existed."
-- **Fix path:** distinguish "never existed" (404) from "already terminal"
-  (409 or 200 idempotent). Low priority unless an A2A client surfaces
-  the confusion in practice.
+- **Location:** `GET /broker/version` (git SHA, boot time), `GET /broker/catalog`
+  (`registry_source` config path — home directory redacted to `~` since S130).
+- **Problem:** With `auth.enabled: false` (the default for localhost
+  deployments) anything that can reach the port can read build identity and
+  the redacted config path. On the reference deployment exposure is bounded
+  by the nftables port lockdown; on other hosts it is operator
+  responsibility.
+- **Status:** Accepted risk until ADR-006 bearer-token auth lands in v0.5,
+  which gates the entire `/broker/*` surface by default. Enable
+  `auth.api_keys` today if the port is reachable beyond localhost.
 
 ### Dev `httpx` dep was unpinned (FIXED in v0.4 Phase 4)
 
 - **Status:** Resolved. `pyproject.toml` dev now reads
   `httpx>=0.27,<1.0` matching the dashboard extra.
+
+---
+
+## Resolved in v0.5 (unreleased)
+
+> Fixed on main after the v0.4.1 tag; these items live under `[Unreleased]`
+> in `CHANGELOG.md` until v0.5 is cut.
+
+### `_queue_sweep_loop` grants events for swept requests without distinguishing them
+
+- **Was:** when a stale request was swept, `grant_evt.set()` unblocked the
+  waiting proxy handler with no signal that the request was *swept* rather
+  than *granted*, so the proxy forwarded to Ollama (incrementing in-flight
+  counters) for a request the scheduler never intended to run.
+- **Status:** Resolved (S131, 08e8bad). The sweep loop marks the grant event
+  `swept = True` before setting it; the proxy handler returns 504 instead of
+  forwarding. Pinned by `TestSweptRequests` (proxy side) and
+  `TestReleaseSweptRequest` (server side). The sibling
+  `_dispatch_error_cleanup` path has the same bug class — filed separately
+  under Important.
+- **Surfaced by:** silent-failure-hunter, v0.4 campaign.
+
+### `CircuitBreakerTransport` ignores `RemoteProtocolError` and `PoolTimeout`
+
+- **Was:** the `except` clause caught only `ConnectError`, `ConnectTimeout`,
+  `ReadTimeout`, so connection-pool pressure and protocol-level corruption
+  never affected the breaker counter.
+- **Status:** Resolved (S131, d39915c). Except clause broadened to
+  `httpx.TransportError`, covering `RemoteProtocolError`, `PoolTimeout`,
+  `WriteError`, and friends. Mixed-exception-type trip-to-open is tested.
+- **Surfaced by:** Agent 2 (failure GPU + Ollama), v0.4 campaign.
+
+### Scheduler's GPU-hot gate doesn't guard mid-swap
+
+- **Was:** `check_gpu_safe` ran at the top of `_process_tick` but was not
+  re-checked inside `_handle_swap_dispatch`, so a GPU transitioning hot
+  during the swap window was unprotected.
+- **Status:** Resolved (S131, 35d177c). The gate is re-checked immediately
+  before swap dispatch; an abort releases the VRAM reservation. Pinned by
+  `TestGPUGatingMidSwap`.
+- **Surfaced by:** Agent 2 (failure GPU + Ollama), v0.4 campaign.
+
+### A2A `create_lease` has TOCTOU window with `has_active_lease`
+
+- **Was:** single-grant-per-model required the racy caller pattern
+  `if not has_active_lease: create_lease(...)` — two concurrent acquirers
+  could both pass the check.
+- **Status:** Resolved (S132, be7cbe9). New atomic `try_create_lease()`
+  does check+create under an internal `threading.RLock`; `create_lease`
+  and `has_active_lease` take the same lock. Pinned by `TestTryCreateLease`
+  and a 16-thread contention test (exactly one winner).
+- **Surfaced by:** concurrency-test agent, v0.4 campaign.
+
+### `TaskStore.create` is not lock-protected
+
+- **Was:** asyncio-only safety was undocumented and fragile — a threaded
+  caller would race on `_active`/`_active_timestamps` silently.
+- **Status:** Resolved (S132, bb374bc). The asyncio-single-loop contract is
+  documented at class level and enforced: `create` binds the owner thread on
+  first use and raises `RuntimeError` from any other thread (fail-loud
+  instead of silent corruption). Pinned by `TestThreadAffinityContract`.
+- **Surfaced by:** concurrency-test agent, v0.4 campaign.
+
+### Dashboard `BastionClient` swallows all errors silently
+
+- **Was:** nine GET methods had `except Exception: return []/{}` with no
+  logging — empty panels were indistinguishable from outages.
+- **Status:** Resolved (S132, b10a81c). All safe GETs route through one
+  `_get_safe` helper that logs endpoint + exception type at DEBUG. Pinned
+  by parametrized logging tests across all nine endpoints.
+- **Surfaced by:** silent-failure-hunter, v0.4 campaign.
+
+### Minor batch (all resolved S132)
+
+- **`_reclaim_expired_sync` outside lock in `reconcile()`/`status()`**
+  (926ed8b): reclaim moved inside the ledger lock; `status()` is now async.
+  Pinned by `TestLockDiscipline`.
+- **`audit.emit()` silent pre-init no-op** (b3b7aa9): pre-init events go to
+  a bounded ring buffer (256) with a WARNING, flushed on init.
+- **`_safe_transition` debug-logs invalid transitions** (164fbf9):
+  ValueError branch (live task, illegal transition — state-machine race
+  signal) raised to WARNING; KeyError branch (already compacted) stays DEBUG.
+- **`ResidencyCache.invalidate()` lock contract** (1e23c76): documented
+  asyncio-single-loop contract (sync method, asyncio lock — can't take it).
+- **DELETE `/a2a/tasks/{id}` 404 for already-terminal** (1e23c76): now 409
+  via `A2AHandler.is_task_terminal()`; 404 reserved for never-existed /
+  tombstoned. Both app factories updated.
+
+---
+
+## Resolved in v0.4.1
+
+> v0.4.1 is the upcoming release: these items live under `[Unreleased]`
+> in `CHANGELOG.md` until it is tagged.
+
+### `VRAMTracker.get_loaded_models()` returns `[]` indistinguishable from "no models loaded"
+
+- **Was:** `src/bastion/vram.py:133-135` returned `[]` on any HTTP exception,
+  so every downstream consumer treated transient `/api/ps` failures as "VRAM
+  is free" — exactly the misclassification that approved a second 31B load on
+  top of an unflushed one during the S122-merge restart burst and crashed the
+  5090 (downstream batch-client crash dossier, 2026-05-19).
+- **Fix:** `get_loaded_models()` now returns `list[LoadedModel] | None`;
+  `None` is the "state unknown" sentinel. Callers propagated:
+  - `can_load_model()` — fail-closed: returns `(False, "VRAM state unknown…")`
+  - `unload_model()` — poll continues until timeout instead of falsely
+    confirming convergence on an empty `/api/ps` response
+  - `ResidencyCache` — preserves the prior cache across a transient outage
+    (stale-OK semantics); first cold-cache failure surfaces as `None`
+  - `VRAMManager.reconcile(None)` — no-op (ledger preserved instead of wiped)
+  - `Scheduler._process_tick` — bails out with `tracker_state_unknown` stall
+    reason; next 100ms tick retries
+  - `Scheduler._evict_for_model` — refuses to pick eviction candidates
+    without ground truth; returns `False` so the caller retries
+- **Regression tests:** `tests/test_vram.py::test_connection_failure_returns_none`,
+  `::test_fail_closed_when_tracker_state_unknown`,
+  `::test_unload_does_not_falsely_confirm_when_ps_unreachable`, and
+  `tests/test_vram_state_unknown_extra.py::{TestResidencyCacheStateUnknown,
+  TestVRAMManagerReconcileStateUnknown}`.
+
+### Scheduler ignores `unload_model()` return value
+
+- **Was:** `scheduler._unload_model()` returned `None` and ignored the bool
+  from `vram.unload_model()`. The 901c910 fix made `unload_model()` honest
+  about convergence, but the eviction loop kept paying for
+  `wait_for_vram_convergence()` + `can_load_model()` on iterations where no
+  VRAM was actually freed, and logged misleading "Cannot load X after evicting
+  N models" lines where N counted *attempts* not successes.
+- **Fix:** `_unload_model() -> bool` propagates the result. `_evict_for_model`
+  now `continue`s on a False return (skips the convergence wait and
+  can_load_model retry) so failed unloads don't masquerade as eviction
+  progress. Defer-branches (active reservation, in-flight request) also
+  return False — caller treats as "no VRAM freed."
+- **Test:** `tests/test_scheduler_unload_gate.py::TestUnloadReturnGate`.
+
+### `_cleanup_inflight` background task has no exception handler
+
+- **Was:** `server.py::_cleanup_inflight` (the closure inside
+  `_dispatch_request`) had no outer `try/except`. If `done_event.wait()`
+  raised something other than `TimeoutError` (CancelledError, network
+  error, attribute error), the task died and the `_inflight_models` counter
+  stayed pinned above its true value forever — blocking the scheduler from
+  ever evicting that model.
+- **Fix:** body wrapped in `try/except Exception` with the decrement +
+  scheduler `notify()` in `finally`. Inner `try/except` around the lock
+  acquisition itself guards the decrement against unexpected lock state.
+  Each block logs with `logger.exception(...)` so the real failure surfaces
+  in logs instead of being swallowed.
+- **Test:** `tests/test_cleanup_inflight_resilient.py::TestCleanupInflightResilience`
+  (covers `done_event.wait()` raising `RuntimeError` and the happy path).
+
+### Proxy enqueue bare `except Exception` reports any failure as "queue full"
+
+- **Was:** `proxy.py` had a bare `except Exception` after the `except
+  RuntimeError` handler that returned the same `503 "Broker queue full"`
+  body and logged `"Queue full"` without `exc_info`. Programming bugs
+  (AttributeError, TypeError) and infra failures all looked identical to
+  clients (and identical in logs) — burned client backoff budgets on
+  conditions retry can't fix.
+- **Fix:** unexpected exceptions now log at `ERROR` with `exc_info=True`
+  (real type + traceback) and return `500 "Internal broker error"`. Clients
+  retain 503 for legitimate queue-full / drain conditions only.
+- **Test:** `tests/test_proxy_enqueue_narrow_except.py::TestProxyEnqueueNarrowExcept`.
+
+### `GET /broker/version` (new endpoint, paired with the fix above)
+
+- **Was:** A2A batch clients had no way to detect
+  that BASTION was redeployed mid-batch. Three S122 merges restarted the
+  broker mid-batch and surfaced as four distinct error shapes downstream,
+  each needing independent retry tuning.
+- **Fix:** `GET /broker/version` returns `{version, git_sha, boot_time_unix,
+  boot_time_iso}`. `git_sha` is captured at module load (env-var
+  `BASTION_GIT_SHA` overrides; falls back to `git rev-parse HEAD`; final
+  fallback `"unknown"`). Clients pin SHA at batch start and treat a change
+  on retry as "infra in transition, longer backoff" rather than a normal
+  5xx blip.
+- **Test:** `tests/test_broker_version.py::TestBrokerVersion`.
 
 ---
 

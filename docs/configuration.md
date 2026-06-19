@@ -255,6 +255,7 @@ Complexity-based model routing.
 |-------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable complexity routing |
 | `routes` | dict | `{}` | Map complexity level to model name (e.g. `"simple": "qwen3:1.7b"`) |
+| `override_explicit` | bool | `false` | When `false` (default), an explicit `model` in the request body **wins** — the route only fills in for requests that omit the model, and the skip is recorded as `complexity-<level>-skipped-explicit-model` in response headers and the audit log. Set `true` to restore the original force-route behavior (route model replaces the client's choice). |
 | `complex_action` | string | `"reject"` | Action for complex requests: `"reject"` returns HTTP 422 |
 
 Clients set complexity via header: `X-Task-Complexity: simple`
