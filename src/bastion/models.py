@@ -284,6 +284,11 @@ class ObservabilityConfig(BaseModel):
     # result is cached and reused on the intervening fast ticks so the 2s fast
     # path is never blocked by 30s-stale subprocess work.
     slow_tick_interval_s: float = 30.0
+    # Whether GET /broker/snapshot/stream serves the SSE push surface (spec
+    # 5.6). Default on: the stream supersedes the older 2026-03-13
+    # /broker/status/stream and is a first-class external surface. When False
+    # the endpoint returns 501 (the TUI never depends on it — it polls).
+    snapshot_stream_enabled: bool = True
     # List of process names or `pid:NNN` always shown in the attribution panel.
     process_watchlist: list[str] = Field(default_factory=list)
     churn_threshold: int = 5  # New-PID count per slow tick that fires a churn event
