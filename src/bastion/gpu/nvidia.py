@@ -23,12 +23,28 @@ class NvidiaBackend:
         """Query all GPU metrics in a single nvidia-smi call.
 
         Uses ``asyncio.create_subprocess_exec()`` to avoid blocking the
-        event loop.
+        event loop.  Extends the original five-field query to sixteen fields
+        so the eleven new fast-path :class:`GPUStatus` signals (compute/memory
+        utilization, SM/graphics/memory clocks, fan speed, GDDR junction temp,
+        and PCIe link gen/width current/max) are populated from this *single*
+        subprocess — no second nvidia-smi on the fast path (observability spec
+        Section 5.1).  Parsing is **per-field**: each value is read positionally
+        and guarded with ``len(parts) > i``, so a driver returning fewer columns
+        (or ``[N/A]`` in any column) degrades that field to ``None`` rather than
+        dropping every field after the first gap.  The nvidia-smi field names
+        live only here inside ``NvidiaBackend`` (protocol seam, Constraint #7c).
         """
         try:
             proc = await asyncio.create_subprocess_exec(
                 "nvidia-smi",
-                "--query-gpu=temperature.gpu,memory.used,memory.free,memory.total,power.draw",
+                (
+                    "--query-gpu="
+                    "temperature.gpu,memory.used,memory.free,memory.total,power.draw,"
+                    "utilization.gpu,utilization.memory,clocks.sm,clocks.gr,clocks.mem,"
+                    "fan.speed,temperature.memory,"
+                    "pcie.link.gen.current,pcie.link.gen.max,"
+                    "pcie.link.width.current,pcie.link.width.max"
+                ),
                 "--format=csv,noheader,nounits",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -49,13 +65,34 @@ class NvidiaBackend:
                 return GPUStatus()
 
             output = stdout.decode()
+            # GPU 0 only (single-GPU shipped path; multi-GPU line selection is a
+            # future track per spec Section 5.1).  ``[N/A]`` and malformed tokens
+            # are absorbed by ``_safe_int``/``_safe_float`` per-field.
             parts = [p.strip() for p in output.strip().split("\n")[0].split(",")]
+
+            def _int(i: int) -> int | None:
+                return _safe_int(parts[i]) if len(parts) > i else None
+
+            def _float(i: int) -> float | None:
+                return _safe_float(parts[i]) if len(parts) > i else None
+
             return GPUStatus(
-                temperature_c=_safe_int(parts[0]) if len(parts) > 0 else None,
-                vram_used_mb=_safe_int(parts[1]) if len(parts) > 1 else None,
-                vram_free_mb=_safe_int(parts[2]) if len(parts) > 2 else None,
-                vram_total_mb=_safe_int(parts[3]) if len(parts) > 3 else None,
-                power_draw_watts=_safe_float(parts[4]) if len(parts) > 4 else None,
+                temperature_c=_int(0),
+                vram_used_mb=_int(1),
+                vram_free_mb=_int(2),
+                vram_total_mb=_int(3),
+                power_draw_watts=_float(4),
+                compute_utilization_pct=_int(5),
+                memory_bandwidth_utilization_pct=_int(6),
+                sm_clock_mhz=_int(7),
+                gr_clock_mhz=_int(8),
+                mem_clock_mhz=_int(9),
+                fan_speed_pct=_int(10),
+                memory_junction_temp_c=_int(11),
+                pcie_link_gen_current=_int(12),
+                pcie_link_gen_max=_int(13),
+                pcie_link_width_current=_int(14),
+                pcie_link_width_max=_int(15),
             )
         except FileNotFoundError:
             logger.debug("nvidia-smi not found")
