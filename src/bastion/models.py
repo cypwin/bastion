@@ -274,6 +274,9 @@ class ObservabilityConfig(BaseModel):
     pinning a key overrides discovery.  See the spec table for the full
     discovery strategy per key.
     """
+    # Fast-tick cadence (seconds) for the broker-side _machine_snapshot_loop
+    # (spec 4.9). Monotonic-anchored: a slow nvidia-smi does not compound drift.
+    snapshot_interval_s: float = 2.0
     # List of process names or `pid:NNN` always shown in the attribution panel.
     process_watchlist: list[str] = Field(default_factory=list)
     churn_threshold: int = 5  # New-PID count per slow tick that fires a churn event
