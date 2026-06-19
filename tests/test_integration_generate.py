@@ -563,6 +563,62 @@ class TestUpstreamErrorPropagation:
         assert "totally-fake:9000" in payload["error"]
 
 
+class TestUpstream500Survival:
+    """S131 regression: an upstream Ollama 500 mid-batch must be forwarded
+    to the client and the broker must stay up and serve subsequent requests.
+
+    Observed 2026-06-11: under concurrent-session VRAM contention Ollama
+    returned a 500 and the broker stopped serving shortly after. The exact
+    death path needs the journal traceback; this pins the contract the fix
+    must preserve either way.
+    """
+
+    def test_streaming_500_forwarded_then_next_request_succeeds(
+        self, integration_harness: tuple[TestClient, FakeOllama],
+    ) -> None:
+        client, fake = integration_harness
+
+        fake.generate_status = 500
+        fake.generate_chunks = [b'{"error": "vram exhausted"}\n']
+        body = {"model": "qwen3:14b", "prompt": "x", "stream": True}
+
+        with client.stream("POST", "/api/generate", json=body) as resp:
+            assert resp.status_code == 500
+            lines = [line for line in resp.iter_lines() if line.strip()]
+        assert "error" in json.loads(lines[0])
+
+        # The broker must still serve the next request.
+        fake.generate_status = 200
+        fake.generate_chunks = [
+            b'{"model": "qwen3:14b", "response": "ok", "done": true}\n',
+        ]
+        with client.stream("POST", "/api/generate", json=body) as resp2:
+            assert resp2.status_code == 200
+            lines2 = [line for line in resp2.iter_lines() if line.strip()]
+        assert json.loads(lines2[-1])["done"] is True
+
+    def test_non_streaming_500_forwarded_then_next_request_succeeds(
+        self, integration_harness: tuple[TestClient, FakeOllama],
+    ) -> None:
+        client, fake = integration_harness
+
+        fake.generate_status = 500
+        fake.generate_chunks = [b'{"error": "vram exhausted"}\n']
+        body = {"model": "qwen3:14b", "prompt": "x", "stream": False}
+
+        resp = client.post("/api/generate", json=body)
+        assert resp.status_code == 500
+        assert "error" in resp.json()
+
+        fake.generate_status = 200
+        fake.generate_chunks = [
+            b'{"model": "qwen3:14b", "response": "ok", "done": true}\n',
+        ]
+        resp2 = client.post("/api/generate", json=body)
+        assert resp2.status_code == 200
+        assert resp2.json()["done"] is True
+
+
 class TestPriorityTierRouting:
     """Priority ordering under burst — deferred to concurrency suite."""
 

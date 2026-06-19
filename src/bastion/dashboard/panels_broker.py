@@ -345,17 +345,27 @@ class AlertPanel(BastionPanel):
             show_edge=False,
             pad_edge=False,
         )
+        table.add_column("Time", width=8, style="dim")
         table.add_column("Sev", width=5, style="bold")
         table.add_column("Message", ratio=1)
 
         if not alerts:
-            table.add_row(Text("OK", style="green"), Text("No active alerts", style="dim"))
+            table.add_row(
+                "", Text("OK", style="green"), Text("No active alerts", style="dim")
+            )
         else:
             for alert in alerts:
                 severity = alert.get("severity", self.SEVERITY_INFO)
                 message = alert.get("message", "")
+                raised_at = alert.get("time")
+                when = (
+                    datetime.fromtimestamp(raised_at).strftime("%H:%M:%S")
+                    if raised_at else ""
+                )
                 style = self._SEVERITY_STYLES.get(severity, "dim")
                 label = self._SEVERITY_LABELS.get(severity, "?")
-                table.add_row(Text(label, style=style), Text(message, style=style))
+                table.add_row(
+                    when, Text(label, style=style), Text(message, style=style)
+                )
 
         return table

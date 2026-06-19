@@ -571,13 +571,28 @@ async def test_action_gpu_kill_empty_pid_noop() -> None:
             os_kill.assert_not_called()
 
 
+def _gpu_snapshot(rows: list[dict]) -> dict:
+    """Build a ProcessSnapshot-shaped dict with the given gpu_processes rows.
+
+    The kill flow now reads ``app._last_process_snapshot`` (spec 5.3), not a
+    subprocess, so the action tests seed the cached snapshot directly.
+    """
+    return {
+        "top_processes": [],
+        "gpu_processes": rows,
+        "own_pids": {},
+        "watchlist_hits": [],
+        "recent_churn_events": [],
+        "collected_at": 1.0,
+        "gpu_collected_at": 1.0,
+    }
+
+
 async def test_action_gpu_kill_pid_not_found_warns() -> None:
     """If the PID disappears between modals, surface a warning."""
-    with patch(
-        "bastion.dashboard.app.SystemDataCollector.query_gpu_processes",
-        return_value=[],
-    ), patch("os.kill") as os_kill:
+    with patch("os.kill") as os_kill:
         async with _mounted_dashboard() as (app, _pilot, runner):
+            app._last_process_snapshot = _gpu_snapshot([])
             runner.next_value = "12345"  # user selects a PID
             app.action_gpu_kill()
             os_kill.assert_not_called()
@@ -586,12 +601,10 @@ async def test_action_gpu_kill_pid_not_found_warns() -> None:
 
 
 async def test_action_gpu_kill_sigterm_sent() -> None:
-    procs = [{"pid": "12345", "name": "ollama", "vram_mb": "8192"}]
-    with patch(
-        "bastion.dashboard.app.SystemDataCollector.query_gpu_processes",
-        return_value=procs,
-    ), patch("os.kill") as os_kill:
+    rows = [{"pid": 12345, "name": "ollama", "vram_mb": 8192}]
+    with patch("os.kill") as os_kill:
         async with _mounted_dashboard() as (app, _pilot, runner):
+            app._last_process_snapshot = _gpu_snapshot(rows)
             runner.values = ["12345", "kill"]
             app.action_gpu_kill()
             import signal as _sig
@@ -600,12 +613,10 @@ async def test_action_gpu_kill_sigterm_sent() -> None:
 
 
 async def test_action_gpu_kill_sigkill_sent_on_force() -> None:
-    procs = [{"pid": "67890", "name": "python", "vram_mb": "2048"}]
-    with patch(
-        "bastion.dashboard.app.SystemDataCollector.query_gpu_processes",
-        return_value=procs,
-    ), patch("os.kill") as os_kill:
+    rows = [{"pid": 67890, "name": "python", "vram_mb": 2048}]
+    with patch("os.kill") as os_kill:
         async with _mounted_dashboard() as (app, _pilot, runner):
+            app._last_process_snapshot = _gpu_snapshot(rows)
             runner.values = ["67890", "kill-9"]
             app.action_gpu_kill()
             import signal as _sig
@@ -613,12 +624,10 @@ async def test_action_gpu_kill_sigkill_sent_on_force() -> None:
 
 
 async def test_action_gpu_kill_permission_error_notifies() -> None:
-    procs = [{"pid": "12345", "name": "ollama", "vram_mb": "8192"}]
-    with patch(
-        "bastion.dashboard.app.SystemDataCollector.query_gpu_processes",
-        return_value=procs,
-    ), patch("os.kill", side_effect=PermissionError("denied")):
+    rows = [{"pid": 12345, "name": "ollama", "vram_mb": 8192}]
+    with patch("os.kill", side_effect=PermissionError("denied")):
         async with _mounted_dashboard() as (app, _pilot, runner):
+            app._last_process_snapshot = _gpu_snapshot(rows)
             runner.values = ["12345", "kill"]
             app.action_gpu_kill()
             msgs = app._notifications
@@ -628,12 +637,10 @@ async def test_action_gpu_kill_permission_error_notifies() -> None:
 
 async def test_action_gpu_kill_inner_cancel_no_call() -> None:
     """User cancels the confirm modal -> os.kill must not be called."""
-    procs = [{"pid": "12345", "name": "ollama", "vram_mb": "8192"}]
-    with patch(
-        "bastion.dashboard.app.SystemDataCollector.query_gpu_processes",
-        return_value=procs,
-    ), patch("os.kill") as os_kill:
+    rows = [{"pid": 12345, "name": "ollama", "vram_mb": 8192}]
+    with patch("os.kill") as os_kill:
         async with _mounted_dashboard() as (app, _pilot, runner):
+            app._last_process_snapshot = _gpu_snapshot(rows)
             runner.values = ["12345", ""]
             app.action_gpu_kill()
             os_kill.assert_not_called()
@@ -667,8 +674,20 @@ async def test_check_auto_fan_no_temp_no_action() -> None:
             set_fan.assert_not_called()
 
 
-async def test_check_auto_fan_triggers_at_high_temp() -> None:
-    """CPU >= 80C in idle state -> trigger 90% fan speed."""
+@pytest.mark.parametrize(
+    "temp,expected_speed",
+    [
+        (59.9, None),   # below the curve — stays on BIOS auto
+        (60.0, "30"),
+        (69.9, "30"),
+        (70.0, "50"),
+        (80.0, "90"),
+        (85.0, "90"),   # boundary: 100% only OVER 85C (operator spec)
+        (85.1, "100"),
+    ],
+)
+async def test_check_auto_fan_escalation_curve(temp, expected_speed) -> None:
+    """From idle, each curve band applies its speed (60/70/80/85+)."""
     with patch(
         "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
     ) as set_fan, patch(
@@ -676,15 +695,71 @@ async def test_check_auto_fan_triggers_at_high_temp() -> None:
     ):
         async with _mounted_dashboard() as (app, _pilot, _runner):
             app._auto_fan_enabled = True
-            app._auto_fan_state = "idle"
-            app._collector.read_cpu_temp = MagicMock(return_value=85.0)
+            app._collector.read_cpu_temp = MagicMock(return_value=temp)
+            app._check_auto_fan({})
+            if expected_speed is None:
+                set_fan.assert_not_called()
+                assert app._auto_fan_state == "idle"
+            else:
+                set_fan.assert_called_once_with(expected_speed)
+                assert app._auto_fan_speed == expected_speed
+                assert app._auto_fan_state == "cooling"
+
+
+async def test_check_auto_fan_escalates_from_lower_band() -> None:
+    """Already at 30%, temperature jumps into the 80C band -> 90%."""
+    with patch(
+        "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
+    ) as set_fan, patch(
+        "bastion.dashboard.app.fan_control_available", return_value=True
+    ):
+        async with _mounted_dashboard() as (app, _pilot, _runner):
+            app._auto_fan_enabled = True
+            app._auto_fan_speed = "30"
+            app._auto_fan_state = "cooling"
+            app._collector.read_cpu_temp = MagicMock(return_value=81.0)
             app._check_auto_fan({})
             set_fan.assert_called_once_with("90")
+            assert app._auto_fan_speed == "90"
+
+
+async def test_check_auto_fan_holds_band_within_hysteresis() -> None:
+    """At 90% (80C band), 76C is within the 5C hysteresis -> no change."""
+    with patch(
+        "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
+    ) as set_fan, patch(
+        "bastion.dashboard.app.fan_control_available", return_value=True
+    ):
+        async with _mounted_dashboard() as (app, _pilot, _runner):
+            app._auto_fan_enabled = True
+            app._auto_fan_speed = "90"
+            app._auto_fan_state = "cooling"
+            app._collector.read_cpu_temp = MagicMock(return_value=76.0)
+            app._check_auto_fan({})
+            set_fan.assert_not_called()
+            assert app._auto_fan_speed == "90"
+
+
+async def test_check_auto_fan_steps_down_past_hysteresis() -> None:
+    """At 90%, 74C (>5C below the 80C trigger) -> step down to 50%."""
+    with patch(
+        "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
+    ) as set_fan, patch(
+        "bastion.dashboard.app.fan_control_available", return_value=True
+    ):
+        async with _mounted_dashboard() as (app, _pilot, _runner):
+            app._auto_fan_enabled = True
+            app._auto_fan_speed = "90"
+            app._auto_fan_state = "cooling"
+            app._collector.read_cpu_temp = MagicMock(return_value=74.0)
+            app._check_auto_fan({})
+            set_fan.assert_called_once_with("50")
+            assert app._auto_fan_speed == "50"
             assert app._auto_fan_state == "cooling"
 
 
-async def test_check_auto_fan_resets_when_cool() -> None:
-    """CPU < 70C while cooling -> set fan auto and return to idle."""
+async def test_check_auto_fan_returns_to_bios_auto_when_cool() -> None:
+    """At 30% (60C band), 54C (>5C below 60) -> back to BIOS auto + idle."""
     with patch(
         "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
     ) as set_fan, patch(
@@ -692,10 +767,109 @@ async def test_check_auto_fan_resets_when_cool() -> None:
     ):
         async with _mounted_dashboard() as (app, _pilot, _runner):
             app._auto_fan_enabled = True
+            app._auto_fan_speed = "30"
             app._auto_fan_state = "cooling"
-            app._collector.read_cpu_temp = MagicMock(return_value=65.0)
+            app._collector.read_cpu_temp = MagicMock(return_value=54.0)
             app._check_auto_fan({})
             set_fan.assert_called_once_with("auto")
+            assert app._auto_fan_speed is None
+            assert app._auto_fan_state == "idle"
+
+
+async def test_check_auto_fan_gpu_floor_raises_engagement_speed() -> None:
+    """CPU triggers at 62C (30% band) but GPU sits at 84C -> engage at 90%,
+    never below what the GPU's own band demands (its firmware curve is
+    suspended while we override)."""
+    with patch(
+        "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
+    ) as set_fan, patch(
+        "bastion.dashboard.app.fan_control_available", return_value=True
+    ):
+        async with _mounted_dashboard() as (app, _pilot, _runner):
+            app._auto_fan_enabled = True
+            app._collector.read_cpu_temp = MagicMock(return_value=62.0)
+            app._check_auto_fan({"gpu": {"temperature_c": 84.0}})
+            set_fan.assert_called_once_with("90")
+
+
+async def test_check_auto_fan_gpu_floor_escalates_active_override() -> None:
+    """Override active at 30% (CPU band), GPU climbs over 85C -> 100%."""
+    with patch(
+        "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
+    ) as set_fan, patch(
+        "bastion.dashboard.app.fan_control_available", return_value=True
+    ):
+        async with _mounted_dashboard() as (app, _pilot, _runner):
+            app._auto_fan_enabled = True
+            app._auto_fan_speed = "30"
+            app._auto_fan_state = "cooling"
+            app._collector.read_cpu_temp = MagicMock(return_value=62.0)
+            app._check_auto_fan({"gpu": {"temperature_c": 86.0}})
+            set_fan.assert_called_once_with("100")
+
+
+async def test_check_auto_fan_gpu_floor_holds_within_hysteresis() -> None:
+    """At 90% on the GPU floor, GPU 76C is within hysteresis -> no change."""
+    with patch(
+        "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
+    ) as set_fan, patch(
+        "bastion.dashboard.app.fan_control_available", return_value=True
+    ):
+        async with _mounted_dashboard() as (app, _pilot, _runner):
+            app._auto_fan_enabled = True
+            app._auto_fan_speed = "90"
+            app._auto_fan_state = "cooling"
+            app._collector.read_cpu_temp = MagicMock(return_value=62.0)
+            app._check_auto_fan({"gpu": {"temperature_c": 76.0}})
+            set_fan.assert_not_called()
+
+
+async def test_check_auto_fan_cpu_release_wins_over_hot_gpu() -> None:
+    """CPU fully below the curve -> release to BIOS auto even with a hot
+    GPU: GPUFanControlState=0 resumes the firmware's own (finer) curve."""
+    with patch(
+        "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
+    ) as set_fan, patch(
+        "bastion.dashboard.app.fan_control_available", return_value=True
+    ):
+        async with _mounted_dashboard() as (app, _pilot, _runner):
+            app._auto_fan_enabled = True
+            app._auto_fan_speed = "90"
+            app._auto_fan_state = "cooling"
+            app._collector.read_cpu_temp = MagicMock(return_value=50.0)
+            app._check_auto_fan({"gpu": {"temperature_c": 84.0}})
+            set_fan.assert_called_once_with("auto")
+            assert app._auto_fan_speed is None
+            assert app._auto_fan_state == "idle"
+
+
+async def test_check_auto_fan_hot_gpu_alone_does_not_engage() -> None:
+    """GPU hot but CPU below the curve and no override active -> do nothing;
+    the GPU firmware curve is in control."""
+    with patch(
+        "bastion.dashboard.app.set_fan_speed", return_value=(True, "ok")
+    ) as set_fan, patch(
+        "bastion.dashboard.app.fan_control_available", return_value=True
+    ):
+        async with _mounted_dashboard() as (app, _pilot, _runner):
+            app._auto_fan_enabled = True
+            app._collector.read_cpu_temp = MagicMock(return_value=45.0)
+            app._check_auto_fan({"gpu": {"temperature_c": 88.0}})
+            set_fan.assert_not_called()
+
+
+async def test_check_auto_fan_failed_set_keeps_state() -> None:
+    """A failed set_fan_speed must not update the tracked speed/state."""
+    with patch(
+        "bastion.dashboard.app.set_fan_speed", return_value=(False, "err")
+    ), patch(
+        "bastion.dashboard.app.fan_control_available", return_value=True
+    ):
+        async with _mounted_dashboard() as (app, _pilot, _runner):
+            app._auto_fan_enabled = True
+            app._collector.read_cpu_temp = MagicMock(return_value=82.0)
+            app._check_auto_fan({})
+            assert app._auto_fan_speed is None  # retried next tick
             assert app._auto_fan_state == "idle"
 
 

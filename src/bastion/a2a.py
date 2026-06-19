@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -146,6 +147,10 @@ class A2AHandler:
         # Hybrid leases (lease_id -> ModelLease) — upgrade from simple reservations
         self._leases: dict[str, ModelLease] = {}
         self._fencing_counter: int = 0
+        # Guards check-and-create atomicity (try_create_lease) and the
+        # fencing counter against threaded callers. RLock because
+        # try_create_lease calls create_lease while holding it.
+        self._lease_lock = threading.RLock()
 
         # Skill routing table
         self._skill_handlers: dict[str, Callable] = {
@@ -357,6 +362,23 @@ class A2AHandler:
         logger.info("A2A task canceled: %s", task_id)
         return True
 
+    def is_task_terminal(self, task_id: str) -> bool:
+        """True if the task exists but is already in a terminal state.
+
+        Lets the DELETE route distinguish "already terminal" (409) from
+        "never existed / evicted" (404) after :meth:`cancel_task` returns
+        False. Tombstoned tasks report False — their state is gone, so
+        404 is the honest answer.
+        """
+        record = self._store.get_active(task_id)
+        if record is not None:
+            return record.state in (
+                A2ATaskState.COMPLETED,
+                A2ATaskState.FAILED,
+                A2ATaskState.CANCELED,
+            )
+        return isinstance(self._store.get(task_id), CompactedResult)
+
     async def subscribe_task(self, task_id: str, request: Any = None) -> AsyncGenerator[dict, None]:
         """SSE event generator for task status/artifact updates.
 
@@ -438,8 +460,9 @@ class A2AHandler:
         tasks into the completed store.
 
         Returns True on success.  Returns False if the task was already
-        compacted (KeyError) or the transition is invalid (ValueError),
-        logging at DEBUG level.
+        compacted (KeyError, logged at DEBUG — expected churn) or the
+        transition is invalid (ValueError, logged at WARNING — a live task
+        attempting an illegal transition signals a state-machine race).
         """
         try:
             self._store.update_state(task_id, new_state)
@@ -451,8 +474,8 @@ class A2AHandler:
             )
             return False
         except ValueError as exc:
-            logger.debug(
-                "State transition skipped for %s -> %s: %s",
+            logger.warning(
+                "Invalid state transition for %s -> %s: %s",
                 task_id, new_state.value, exc,
             )
             return False
@@ -885,7 +908,12 @@ class A2AHandler:
         """
         try:
             # Query current state
-            loaded = await self._vram.get_loaded_models() if self._vram else []
+            loaded_raw = await self._vram.get_loaded_models() if self._vram else []
+            # State-unknown sentinel (None) coerced to [] so the status skill
+            # keeps answering during Ollama outages; vram_state tells clients
+            # the list is unverified rather than genuinely empty.
+            loaded = loaded_raw if loaded_raw is not None else []
+            vram_state = "unknown" if loaded_raw is None else "ok"
             queue_depth = (
                 self._scheduler.queue.total_size
                 if self._scheduler and hasattr(self._scheduler, "queue")
@@ -901,6 +929,7 @@ class A2AHandler:
                 "queue_depth": queue_depth,
                 "queue_by_model": queue_by_model,
                 "loaded_models": [m.name for m in loaded],
+                "vram_state": vram_state,
                 "current_model": self._scheduler.current_model if self._scheduler else None,
             }
 
@@ -917,6 +946,9 @@ class A2AHandler:
 
         except Exception as e:
             record.error = str(e)
+            logger.exception(
+                "A2A status handler error (task=%s)", record.task_id
+            )
             if self._safe_transition(record.task_id, A2ATaskState.FAILED):
                 await self._notify_subscribers(
                     record.task_id,
@@ -1500,21 +1532,61 @@ class A2AHandler:
         -------
         ModelLease
             The newly created lease with a unique fencing token.
+
+        Notes
+        -----
+        Creates unconditionally — multiple leases per model are allowed.
+        Callers wanting single-grant-per-model semantics must use
+        :meth:`try_create_lease`; checking :meth:`has_active_lease` first
+        is a TOCTOU race.
         """
-        lease = ModelLease(
-            model=model,
-            max_requests=max_requests,
-            remaining_requests=max_requests,
-            expiry=time.monotonic() + ttl_seconds,
-            idle_timeout=idle_timeout,
-            fencing_token=self._next_fencing_token(),
-        )
-        self._leases[lease.lease_id] = lease
+        with self._lease_lock:
+            lease = ModelLease(
+                model=model,
+                max_requests=max_requests,
+                remaining_requests=max_requests,
+                expiry=time.monotonic() + ttl_seconds,
+                idle_timeout=idle_timeout,
+                fencing_token=self._next_fencing_token(),
+            )
+            self._leases[lease.lease_id] = lease
         logger.info(
             "Lease created: %s model=%s requests=%d ttl=%.0fs idle=%.0fs token=%d",
             lease.lease_id, model, max_requests, ttl_seconds, idle_timeout, lease.fencing_token,
         )
         return lease
+
+    def try_create_lease(
+        self,
+        model: str,
+        max_requests: int = 100,
+        ttl_seconds: float = 600.0,
+        idle_timeout: float = 60.0,
+    ) -> ModelLease | None:
+        """Atomically create a lease iff no active lease exists for the model.
+
+        Closes the TOCTOU window in the
+        ``if not has_active_lease(model): create_lease(model)`` pattern:
+        the check and the create happen under the same lock, so two
+        concurrent acquirers can never both be granted.
+
+        Parameters are identical to :meth:`create_lease`.
+
+        Returns
+        -------
+        ModelLease | None
+            The new lease, or ``None`` if an active lease already holds
+            the model (the caller lost the race or arrived late).
+        """
+        with self._lease_lock:
+            if self.has_active_lease(model):
+                return None
+            return self.create_lease(
+                model=model,
+                max_requests=max_requests,
+                ttl_seconds=ttl_seconds,
+                idle_timeout=idle_timeout,
+            )
 
     def validate_lease(self, lease_id: str, fencing_token: int) -> tuple[bool, str]:
         """Validate a lease is active and fencing token matches.
@@ -1584,11 +1656,12 @@ class A2AHandler:
         bool
             True if an active lease exists, False otherwise.
         """
-        for lease in self._leases.values():
-            should_release, _ = lease.should_release()
-            if lease.model == model and not should_release:
-                return True
-        return False
+        with self._lease_lock:
+            for lease in self._leases.values():
+                should_release, _ = lease.should_release()
+                if lease.model == model and not should_release:
+                    return True
+            return False
 
     def get_snapshot(self, max_tasks: int = 5, max_leases: int = 5) -> dict:
         """Return a compact snapshot of current A2A state for dashboards.

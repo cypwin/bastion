@@ -12,6 +12,7 @@ API:
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -155,6 +156,127 @@ async def test_get_thrashing_returns_dict() -> None:
         assert await client.get_thrashing() == payload
 
 
+async def test_get_latency_returns_dict() -> None:
+    payload = {"sample_total": 0, "per_model": [], "overall": None}
+    client = BastionClient("http://localhost:11434")
+    with patch.object(
+        client._client, "get", new=AsyncMock(return_value=_resp(200, payload))
+    ) as get:
+        assert await client.get_latency() == payload
+        get.assert_awaited_once_with(
+            "http://localhost:11434/broker/latency",
+            params={"window_s": 300.0},
+        )
+
+
+async def test_get_latency_forwards_custom_window() -> None:
+    client = BastionClient("http://localhost:11434")
+    with patch.object(
+        client._client, "get", new=AsyncMock(return_value=_resp(200, {}))
+    ) as get:
+        await client.get_latency(window_s=60.0)
+        get.assert_awaited_once_with(
+            "http://localhost:11434/broker/latency",
+            params={"window_s": 60.0},
+        )
+
+
+async def test_get_catalog_returns_dict() -> None:
+    payload = {"models": [], "total": 0, "registry_source": "<unknown>"}
+    client = BastionClient("http://localhost:11434")
+    with patch.object(
+        client._client, "get", new=AsyncMock(return_value=_resp(200, payload))
+    ):
+        assert await client.get_catalog() == payload
+
+
+# ---------------------------------------------------------------------------
+# Observability T6 — snapshot + contention fan-out (spec 5.6 BastionClient)
+# ---------------------------------------------------------------------------
+
+
+async def test_get_snapshot_returns_machine_snapshot_dict() -> None:
+    """get_snapshot parses a MachineSnapshot-shaped payload (history=1)."""
+    payload = {
+        "snapshot_ts": 1234567890.0,
+        "broker": None,
+        "gpu": {"gpu_index": 0},
+        "gpu_extended": None,
+        "contention": None,
+        "process": None,
+        "inference": None,
+        "correlation": None,
+    }
+    client = BastionClient("http://localhost:11434")
+    with patch.object(
+        client._client, "get", new=AsyncMock(return_value=_resp(200, payload))
+    ) as get:
+        assert await client.get_snapshot() == payload
+        get.assert_awaited_once_with(
+            "http://localhost:11434/broker/snapshot",
+            params={"history": 1},
+        )
+
+
+async def test_get_snapshot_forwards_history() -> None:
+    client = BastionClient("http://localhost:11434")
+    with patch.object(
+        client._client, "get", new=AsyncMock(return_value=_resp(200, {}))
+    ) as get:
+        await client.get_snapshot(history=5)
+        get.assert_awaited_once_with(
+            "http://localhost:11434/broker/snapshot",
+            params={"history": 5},
+        )
+
+
+async def test_get_contention_returns_dict() -> None:
+    """get_contention parses a ContentionSnapshot-shaped payload."""
+    payload = {
+        "psi_cpu_some_avg10": 1.0,
+        "swap_in_rate_mb_s": None,
+        "block_devices": [
+            {
+                "device": "nvme0n1",
+                "util_pct": 12.0,
+                "read_await_ms": None,
+                "write_await_ms": None,
+                "read_rate_mb_s": 0.0,
+                "write_rate_mb_s": 0.0,
+            }
+        ],
+        "cpu_package_watts": 80.0,
+        "oom_kill_total": 0,
+        "sampled_at": 1.0,
+    }
+    client = BastionClient("http://localhost:11434")
+    with patch.object(
+        client._client, "get", new=AsyncMock(return_value=_resp(200, payload))
+    ) as get:
+        assert await client.get_contention() == payload
+        get.assert_awaited_once_with(
+            "http://localhost:11434/broker/contention", params=None
+        )
+
+
+async def test_get_snapshot_returns_default_on_error() -> None:
+    client = BastionClient("http://localhost:11434")
+    with patch.object(
+        client._client, "get", new=AsyncMock(return_value=_resp(500))
+    ):
+        assert await client.get_snapshot() == {}
+
+
+async def test_get_contention_returns_default_on_error() -> None:
+    client = BastionClient("http://localhost:11434")
+    with patch.object(
+        client._client,
+        "get",
+        new=AsyncMock(side_effect=httpx.ConnectError("boom")),
+    ):
+        assert await client.get_contention() == {}
+
+
 # ---------------------------------------------------------------------------
 # GET error handling — methods must swallow errors and return safe defaults
 # ---------------------------------------------------------------------------
@@ -170,6 +292,8 @@ async def test_get_thrashing_returns_dict() -> None:
         ("get_watchdog", {}),
         ("get_counters", {}),
         ("get_thrashing", {}),
+        ("get_latency", {}),
+        ("get_catalog", {}),
     ],
 )
 async def test_get_methods_return_default_on_http_error(
@@ -194,6 +318,8 @@ async def test_get_methods_return_default_on_http_error(
         ("get_watchdog", {}),
         ("get_counters", {}),
         ("get_thrashing", {}),
+        ("get_latency", {}),
+        ("get_catalog", {}),
     ],
 )
 async def test_get_methods_return_default_on_network_error(
@@ -218,6 +344,60 @@ async def test_get_methods_return_default_on_timeout() -> None:
         new=AsyncMock(side_effect=httpx.TimeoutException("slow")),
     ):
         assert await client.get_queue() == {}
+
+
+# ---------------------------------------------------------------------------
+# GET error handling — failures must be logged at DEBUG, never silently
+# dropped. The dashboard renders an empty panel either way; the log is the
+# only place auth failures / 404s / network partitions become visible.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "method_name,endpoint",
+    [
+        ("get_recent", "/broker/recent"),
+        ("get_queue", "/broker/queue"),
+        ("get_health", "/broker/health"),
+        ("get_vram_ledger", "/broker/vram"),
+        ("get_watchdog", "/broker/watchdog"),
+        ("get_counters", "/broker/counters"),
+        ("get_thrashing", "/broker/thrashing"),
+        ("get_latency", "/broker/latency"),
+        ("get_catalog", "/broker/catalog"),
+    ],
+)
+async def test_get_methods_log_network_error_at_debug(
+    method_name: str, endpoint: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = BastionClient("http://localhost:11434")
+    with patch.object(
+        client._client,
+        "get",
+        new=AsyncMock(side_effect=httpx.ConnectError("boom")),
+    ), caplog.at_level(logging.DEBUG, logger="bastion.dashboard.client"):
+        await getattr(client, method_name)()
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(endpoint in m and "ConnectError" in m for m in messages), (
+        f"{method_name} swallowed ConnectError without logging "
+        f"endpoint + exception type; got: {messages}"
+    )
+
+
+async def test_get_methods_log_http_status_error_at_debug(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = BastionClient("http://localhost:11434")
+    with patch.object(
+        client._client, "get", new=AsyncMock(return_value=_resp(500))
+    ), caplog.at_level(logging.DEBUG, logger="bastion.dashboard.client"):
+        await client.get_health()
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(
+        "/broker/health" in m and "HTTPStatusError" in m for m in messages
+    )
 
 
 # ``poll`` does NOT swallow errors — it propagates via raise_for_status.

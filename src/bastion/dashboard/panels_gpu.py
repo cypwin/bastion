@@ -115,7 +115,26 @@ class ModelsPanel(BastionPanel):
 class VRAMLedgerPanel(BastionPanel):
     """VRAM budget panel showing VRAMManager's allocated/reserved ledger."""
 
-    def render_data(self, ledger: dict[str, Any]) -> Table:
+    def _measured_used_mb_from_app(self) -> float | None:
+        """Latest nvidia-smi VRAM (MB) from app state, or None if unavailable.
+
+        Mirrors how :class:`GPUPanel` reads ``app.vram_history``; lets the panel
+        show the Measured/Δ rows in production without the refresh loop having to
+        thread the value in explicitly. Guarded so unit tests (unmounted panels,
+        or a harness without history) simply get ``None``.
+        """
+        try:
+            app = self.app
+        except Exception:
+            return None
+        history = getattr(app, "vram_history", None)
+        if history:
+            return history[-1]
+        return None
+
+    def render_data(
+        self, ledger: dict[str, Any], measured_used_mb: float | None = None
+    ) -> Table:
         table = Table(title="VRAM Ledger", expand=True, show_edge=False, pad_edge=False)
         table.add_column("key", style="bold", width=12)
         table.add_column("value")
@@ -138,9 +157,23 @@ class VRAMLedgerPanel(BastionPanel):
         table.add_row("Available", Text(format_bytes_gb(available), style="green bold"))
         table.add_row("Reserv#", str(active_res))
 
-        # Show utilization bar
+        # Measured (nvidia-smi) vs reserved (ledger) — makes the gap explicit.
+        if measured_used_mb is None:
+            measured_used_mb = self._measured_used_mb_from_app()
+        if measured_used_mb is not None:
+            measured_bytes = int(measured_used_mb * 1024 * 1024)
+            table.add_row("Measured", Text(format_bytes_gb(measured_bytes), style="cyan"))
+            tracked = (allocated or 0) + (reserved or 0)
+            delta = measured_bytes - tracked
+            sign = "+" if delta >= 0 else "-"
+            table.add_row(
+                "Δ overhead",
+                Text(f"{sign}{format_bytes_gb(int(abs(delta)))}", style="yellow"),
+            )
+
+        # Show utilization bar (safety margin shown separately, not counted here)
         if total and total > 0:
-            used = (allocated or 0) + (reserved or 0) + (safety or 0)
+            used = (allocated or 0) + (reserved or 0)
             pct = used / total * 100
             bar_width = 20
             filled = int(min(pct, 100) / 100 * bar_width)

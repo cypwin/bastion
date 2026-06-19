@@ -100,26 +100,28 @@ class TestOllamaUnreachable:
         return VRAMTracker(config)
 
     @pytest.mark.asyncio
-    async def test_get_loaded_models_returns_empty_on_connect_error(
+    async def test_get_loaded_models_returns_none_on_connect_error(
         self, tracker: VRAMTracker,
     ) -> None:
+        """Ollama unreachable -> None state-unknown sentinel (not [])."""
         with patch.object(
             tracker._http, "get",
             new_callable=AsyncMock, side_effect=httpx.ConnectError("refused"),
         ):
             models = await tracker.get_loaded_models()
-        assert models == []
+        assert models is None
 
     @pytest.mark.asyncio
-    async def test_get_loaded_models_returns_empty_on_timeout(
+    async def test_get_loaded_models_returns_none_on_timeout(
         self, tracker: VRAMTracker,
     ) -> None:
+        """Ollama timeout -> None state-unknown sentinel (not [])."""
         with patch.object(
             tracker._http, "get",
             new_callable=AsyncMock, side_effect=httpx.ReadTimeout("timeout"),
         ):
             models = await tracker.get_loaded_models()
-        assert models == []
+        assert models is None
 
     @pytest.mark.asyncio
     async def test_unload_model_returns_false_on_error(
@@ -164,10 +166,10 @@ class TestOllamaUnreachable:
         assert "hot" in reason.lower()
 
     @pytest.mark.asyncio
-    async def test_get_loaded_models_returns_empty_on_http_error(
+    async def test_get_loaded_models_returns_none_on_http_error(
         self, tracker: VRAMTracker,
     ) -> None:
-        """HTTP 500 from Ollama should return empty list."""
+        """HTTP 5xx from Ollama -> None state-unknown sentinel (not [])."""
         mock_resp = httpx.Response(
             500,
             json={"error": "Internal server error"},
@@ -178,7 +180,7 @@ class TestOllamaUnreachable:
         ))
         with patch.object(tracker._http, "get", new_callable=AsyncMock, return_value=mock_resp):
             models = await tracker.get_loaded_models()
-        assert models == []
+        assert models is None
 
 
 # ---------------------------------------------------------------------------

@@ -265,7 +265,7 @@ class TestConvergencePolling:
 class TestVRAMManagerStatus:
     @pytest.mark.asyncio
     async def test_status_empty(self, manager: VRAMManager) -> None:
-        status = manager.status()
+        status = await manager.status()
         assert status["active_reservations"] == 0
         assert status["allocated_bytes"] == 0
         assert status["reserved_bytes"] == 0
@@ -273,7 +273,7 @@ class TestVRAMManagerStatus:
     @pytest.mark.asyncio
     async def test_status_with_reservation(self, manager: VRAMManager) -> None:
         r = await manager.reserve("test:7b", 1_000_000_000)
-        status = manager.status()
+        status = await manager.status()
         assert status["active_reservations"] == 1
         assert status["reserved_bytes"] == 1_000_000_000
         assert len(status["reservations"]) == 1
@@ -313,3 +313,57 @@ class TestVRAMContention:
         # Clean up
         for r in reservations:
             await manager.release(r)
+
+
+# ---------------------------------------------------------------------------
+# Lock discipline: reclaim must run INSIDE the ledger lock everywhere
+# ---------------------------------------------------------------------------
+
+
+class TestLockDiscipline:
+    """`reconcile()` and `status()` must reclaim expired reservations under
+    the ledger lock — the same discipline `reserve()` got in the v0.4 C2
+    fix. An unlocked reclaim can double-free an expired reservation against
+    a concurrent locked reclaimer, double-decrementing `_reserved` and
+    inflating `available_vram` beyond the budget.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reconcile_reclaims_under_lock(self, manager: VRAMManager) -> None:
+        await manager.reserve("test:7b", 1_000_000_000, ttl=0.01)
+        await asyncio.sleep(0.05)  # reservation now expired
+
+        await manager._lock.acquire()
+        try:
+            task = asyncio.create_task(manager.reconcile(set()))
+            await asyncio.sleep(0.05)
+            # While we hold the lock, reconcile must not have reclaimed
+            assert len(manager._reservations) == 1, (
+                "reconcile reclaimed expired reservations OUTSIDE the lock"
+            )
+            assert not task.done()
+        finally:
+            manager._lock.release()
+
+        await task
+        assert len(manager._reservations) == 0
+
+    @pytest.mark.asyncio
+    async def test_status_reclaims_under_lock(self, manager: VRAMManager) -> None:
+        await manager.reserve("test:7b", 1_000_000_000, ttl=0.01)
+        await asyncio.sleep(0.05)  # reservation now expired
+
+        await manager._lock.acquire()
+        try:
+            task = asyncio.create_task(manager.status())
+            await asyncio.sleep(0.05)
+            assert len(manager._reservations) == 1, (
+                "status reclaimed expired reservations OUTSIDE the lock"
+            )
+            assert not task.done()
+        finally:
+            manager._lock.release()
+
+        status = await task
+        assert status["active_reservations"] == 0
+        assert status["reserved_bytes"] == 0

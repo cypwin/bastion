@@ -63,6 +63,7 @@ def load_config(path: Path | None = None) -> BrokerConfig:
             "then `bastion --detect-models` to discover your Ollama models."
         )
         config = BrokerConfig()
+        # _loaded_from stays None for default/no-file configs.
         resolve_gpu_defaults(config)
         _apply_env_overrides(config)
         return config
@@ -83,6 +84,12 @@ def load_config(path: Path | None = None) -> BrokerConfig:
         }
 
     config = BrokerConfig(**raw)
+    # Record the source path so /broker/catalog can surface registry_source.
+    # ``resolve()`` makes it absolute and follows symlinks — stable for ops.
+    try:
+        config._loaded_from = config_path.resolve()
+    except OSError:
+        config._loaded_from = config_path
     resolve_gpu_defaults(config, explicit_fields=set(user_gpu.keys()))
     _apply_env_overrides(config)
 

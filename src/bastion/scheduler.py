@@ -26,13 +26,20 @@ from typing import Any
 from bastion import audit
 from bastion.health import check_gpu_safe, query_gpu_status  # noqa: F401
 from bastion.metrics import (
+    record_cooldown_wait,
     record_model_swap,
+    record_model_swap_duration,
     record_queue_wait,
     set_concurrent_requests_active,
 )
 from bastion.models import BrokerConfig, QueuedRequest
 from bastion.queue import AffinityQueue
-from bastion.vram import VRAMManager, VRAMTracker
+from bastion.vram import (
+    VRAM_STATE_UNKNOWN_REASON,
+    VRAMManager,
+    VRAMTracker,
+    registry_lookup,
+)
 from bastion.watchdog import notify_watchdog
 
 logger = logging.getLogger(__name__)
@@ -294,6 +301,20 @@ class Scheduler:
         if self.vram_manager is not None:
             await self.vram_manager.reconcile(resident_models)
 
+        # State unknown (Ollama unreachable). Reconcile above was a no-op so
+        # the ledger is preserved. Bail out of this tick rather than make
+        # dispatch decisions on missing residency data; scheduler retries
+        # on the next 100ms loop.
+        if resident_models is None:
+            if self._last_stall_reason != "tracker_state_unknown":
+                logger.info(
+                    "Scheduler tick skipped: VRAM tracker state unknown "
+                    "(Ollama /api/ps unreachable); ledger preserved",
+                )
+                self._last_stall_reason = "tracker_state_unknown"
+                self._last_stall_time = time.time()
+            return False
+
         dispatch_delay = self.config.scheduler.concurrent_dispatch_delay_seconds
 
         while current_inflight < max_concurrent:
@@ -394,6 +415,11 @@ class Scheduler:
         resident_models = await self.vram.residency_cache.get_resident_models()
         models_with_work = self.queue.get_models_with_requests()
 
+        # _process_tick bails before invoking this when state is unknown,
+        # but guard defensively in case future callers reuse this helper.
+        if resident_models is None:
+            resident_models = set()
+
         reason = "unknown"
         detail = ""
 
@@ -479,6 +505,9 @@ class Scheduler:
                 return await self._dispatch_for_model(self._current_model, needs_swap=False)
             else:
                 # Wait for cooldown
+                # Tier-0 dead-metric activation (spec 5.4): count each enforced
+                # cooldown wait so the swap-rate limiter is visible to alerts.
+                record_cooldown_wait()
                 logger.debug("Cooldown: %.1fs remaining before model swap", remaining)
                 await asyncio.sleep(min(remaining, 0.5))
                 return False
@@ -530,6 +559,18 @@ class Scheduler:
                 if not freed:
                     return False
 
+        # Re-check GPU health immediately before the swap. The top-of-tick
+        # gate ran many awaits ago (cooldown wait, eviction, VRAM
+        # reservation); a GPU that transitioned hot in that window must
+        # abort here — loading a model onto a hot GPU is exactly the
+        # crash cycle BASTION exists to prevent.
+        gpu_safe, gpu_reason = await check_gpu_safe(self.config.gpu)
+        if not gpu_safe:
+            logger.warning("Swap aborted — GPU unsafe at dispatch time: %s", gpu_reason)
+            if self.vram_manager is not None and reservation is not None:
+                await self.vram_manager.release(reservation)
+            return False
+
         # Perform the swap (serialized through load semaphore if VRAMManager available)
         logger.info(
             "Model swap: %s -> %s (queue depth for new: %d)",
@@ -563,16 +604,17 @@ class Scheduler:
         self._total_swaps += 1
 
         # Proactive eviction: if resident count exceeds max_loaded_models,
-        # evict the least-useful excess model
+        # evict the least-useful excess model. Skip when tracker state is
+        # unknown — we cannot decide what to evict without ground truth.
         max_loaded = self.config.scheduler.ollama_max_loaded_models
         resident_after = await self.vram.get_loaded_models()
-        if len(resident_after) > max_loaded:
+        if resident_after is not None and len(resident_after) > max_loaded:
             excess = [
                 m for m in resident_after
                 if m.name != candidate.model
                 and not (
-                    self.config.models.get(m.name)
-                    and self.config.models[m.name].always_allowed
+                    (info := registry_lookup(self.config.models, m.name))
+                    and info.always_allowed
                 )
                 and not (
                     self._reservation_check_fn
@@ -591,10 +633,20 @@ class Scheduler:
 
         # Dispatch the request (blocking -- swap path)
         # Use load semaphore if VRAMManager is available to serialize GPU I/O
+        #
+        # Tier-0 dead-metric activation (spec 5.4): capture the swap-I/O start
+        # BEFORE the if/else split (set on both branches) and record the
+        # duration AFTER _dispatch_for_model returns in EACH branch. Capturing
+        # here — not before the _load_semaphore acquisition inside the branch —
+        # avoids folding in semaphore-contention wait (already metered by
+        # cooldown_waits_total) into the swap duration, and instrumenting both
+        # branches keeps the no-VRAMManager path from silently under-counting.
+        swap_start = time.monotonic()
         if self.vram_manager is not None and reservation is not None:
             async with self.vram_manager._load_semaphore:
                 try:
                     result = await self._dispatch_for_model(candidate.model, needs_swap=True)
+                    record_model_swap_duration(candidate.model, time.monotonic() - swap_start)
                     if result:
                         await self.vram_manager.commit(reservation)
                     else:
@@ -604,7 +656,9 @@ class Scheduler:
                     await self.vram_manager.release(reservation)
                     raise
         else:
-            return await self._dispatch_for_model(candidate.model, needs_swap=True)
+            result = await self._dispatch_for_model(candidate.model, needs_swap=True)
+            record_model_swap_duration(candidate.model, time.monotonic() - swap_start)
+            return result
 
     async def _evict_for_model(self, candidate: QueuedRequest) -> bool:
         """Evict resident models to make VRAM space for a candidate model.
@@ -616,10 +670,22 @@ class Scheduler:
         Returns True if enough VRAM was freed, False otherwise.
         """
         resident = await self.vram.get_loaded_models()
+        if resident is None:
+            logger.warning(
+                "_evict_for_model: tracker state unknown for '%s' — refusing to "
+                "evict on unknown state; caller will retry",
+                candidate.model,
+            )
+            return False
         evictable = [
             m for m in resident
             if m.name != candidate.model
-            and not (self.config.models.get(m.name) and self.config.models[m.name].always_allowed)
+            # Tag-aware: an always_allowed model resident as 'name:latest'
+            # must not become evictable because the registry key is untagged.
+            and not (
+                (info := registry_lookup(self.config.models, m.name))
+                and info.always_allowed
+            )
             and not (self._reservation_check_fn and self._reservation_check_fn(m.name))
             and not self._has_inflight_fn(m.name)  # Never evict in-flight models
         ]
@@ -628,7 +694,12 @@ class Scheduler:
 
         evicted_count = 0
         for model_to_evict in evictable:
-            await self._unload_model(model_to_evict.name)
+            if not await self._unload_model(model_to_evict.name):
+                # Failed/deferred unload — no VRAM freed, so skip the
+                # convergence wait and the can_load_model retry. Try the
+                # next candidate. Avoids counting a no-op as eviction
+                # progress (KNOWN_ISSUES, resolved in v0.4.1).
+                continue
             evicted_count += 1
 
             # Wait for VRAM to stabilize after unload
@@ -641,6 +712,17 @@ class Scheduler:
             if can_load:
                 self._eviction_stuck_streak.pop(candidate.model, None)
                 return True
+            if vram_reason == VRAM_STATE_UNKNOWN_REASON:
+                # Tracker state became unknown mid-eviction: further unloads
+                # cannot make can_load_model pass and would tear down
+                # residents pointlessly during an Ollama transition. Stop;
+                # the caller retries when state is known again.
+                logger.warning(
+                    "_evict_for_model: tracker state unknown mid-eviction for "
+                    "'%s' (after %d eviction(s)) — stopping eviction loop",
+                    candidate.model, evicted_count,
+                )
+                return False
 
         # T3.2: suppress per-tick spam.  Log loudly the first time, then a
         # heartbeat every ~10s (100 ticks at 0.1s loop_interval) while stuck;
@@ -705,21 +787,30 @@ class Scheduler:
 
     # ── Model management helpers ───────────────────────────────────
 
-    async def _unload_model(self, model: str) -> None:
+    async def _unload_model(self, model: str) -> bool:
         """Unload a model from VRAM with logging.
 
         Checks for active A2A reservations and in-flight requests before unloading.
         Releases VRAMManager allocation so the ledger stays in sync with reality.
+
+        Returns
+        -------
+        bool
+            True only when VRAM was actually freed (Ollama confirmed unload
+            and the ledger was updated). False for deferred evictions (active
+            reservation, in-flight request) and for unload failures. Callers
+            in the eviction loop must check this so a failed unload is not
+            counted as progress — see KNOWN_ISSUES (resolved in v0.4.1).
         """
         # Check if model has an active reservation (A2A integration)
         if self._reservation_check_fn and self._reservation_check_fn(model):
             logger.info("Deferring eviction of '%s' — active A2A reservation", model)
-            return
+            return False
 
         # Check if model has in-flight inference requests
         if self._has_inflight_fn(model):
             logger.info("Deferring eviction of '%s' — in-flight inference request", model)
-            return
+            return False
 
         logger.info("Unloading model '%s' to free VRAM", model)
         success = await self.vram.unload_model(model)
@@ -739,8 +830,9 @@ class Scheduler:
             if self.vram_manager is not None:
                 await self.vram_manager.release_model(model)
                 await self.vram_manager.wait_for_vram_convergence()
-        else:
-            logger.warning("Failed to unload model '%s'", model)
+            return True
+        logger.warning("Failed to unload model '%s'", model)
+        return False
 
     async def unload_model_admin(self, model: str) -> tuple[str, dict]:
         """Operator-driven unload with safety checks and ledger release.

@@ -25,13 +25,16 @@ via ``client.app.state.stubs``.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
+import bastion.server as server_mod
 from bastion.models import AuthConfig, BrokerConfig
 from bastion.server import create_app
+from tests.conftest import make_request
 
 # ---------------------------------------------------------------------------
 # /broker/status
@@ -713,3 +716,64 @@ class TestRootAndAgentCard:
         assert "name" in body
         assert "version" in body
         assert "skills" in body
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /broker/status — VRAM state-unknown coercion + indicator (S130)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestBrokerStatusVramState:
+    def test_vram_state_ok_on_live_read(self, app_with_stub_scheduler) -> None:
+        data = app_with_stub_scheduler.get("/broker/status").json()
+        assert data["vram_state"] == "ok"
+
+    def test_none_sentinel_coerces_to_empty_list_with_unknown_state(
+        self, app_with_stub_scheduler
+    ) -> None:
+        """During an Ollama outage the status contract (loaded_models: list)
+        holds, and vram_state='unknown' marks the list as a placeholder."""
+        from unittest.mock import AsyncMock
+
+        client = app_with_stub_scheduler
+        client.app.state.stubs.vram_tracker.get_loaded_models = AsyncMock(
+            return_value=None
+        )
+        resp = client.get("/broker/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["loaded_models"] == []
+        assert data["vram_state"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# _release_swept_request (queue sweep marks grant as rejection)
+# ---------------------------------------------------------------------------
+
+
+class TestReleaseSweptRequest:
+    """The sweep loop must mark grant events ``swept`` before setting them.
+
+    An event set without the marker is indistinguishable from a real
+    scheduler grant, so the waiting proxy handler would forward the swept
+    request to Ollama (proxy side pinned by TestSweptRequests in
+    test_proxy.py).
+    """
+
+    def test_marks_grant_event_swept_and_sets_both_events(self) -> None:
+        req = make_request()
+        grant_evt = asyncio.Event()
+        completion_evt = asyncio.Event()
+        server_mod._pending_grants[req.id] = grant_evt
+        server_mod._pending_completions[req.id] = completion_evt
+        try:
+            server_mod._release_swept_request(req)
+
+            assert grant_evt.is_set()
+            assert getattr(grant_evt, "swept", False) is True
+            assert completion_evt.is_set()
+            assert req.id not in server_mod._pending_grants
+            assert req.id not in server_mod._pending_completions
+        finally:
+            server_mod._pending_grants.pop(req.id, None)
+            server_mod._pending_completions.pop(req.id, None)

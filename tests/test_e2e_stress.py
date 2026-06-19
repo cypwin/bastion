@@ -6,11 +6,15 @@ concurrent load, verifying VRAM budget enforcement, queue ordering, model swap
 coordination, and streaming correctness.
 
 Not run in CI — intended for manual pre-release validation on a GPU machine.
-Skips automatically if BASTION is not reachable.
+
+Gated behind ``BASTION_E2E=1``: these tests evict every loaded model from the
+broker they target, so an accidental run against a production instance is
+destructive. Without the opt-in the whole module skips at collection time.
+Also skips automatically if BASTION is not reachable.
 
 Usage:
-    python -m pytest tests/test_e2e_stress.py -v -s
-    python -m pytest -m e2e -v -s
+    BASTION_E2E=1 python -m pytest tests/test_e2e_stress.py -v -s
+    BASTION_E2E=1 python -m pytest -m e2e -v -s
 
 Forensic log written to /tmp/bastion-stress-test.jsonl (JSONL, one event per line).
 """
@@ -20,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import sys
 import time
 import traceback
@@ -28,6 +33,14 @@ from pathlib import Path
 
 import httpx
 import pytest
+
+# Destructive against the broker it targets (evicts all loaded models) —
+# require an explicit opt-in so a plain `pytest tests/` can never hit a
+# production instance.
+pytestmark = pytest.mark.skipif(
+    os.environ.get("BASTION_E2E") != "1",
+    reason="e2e stress suite is opt-in: set BASTION_E2E=1 to run",
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1730,6 +1743,9 @@ class TestCouncilConcurrentDispatch:
     ]
     _REQUESTS_PER_MODEL: int = 3
     _SHORT_PROMPT: str = "Reply with exactly one word: yes"
+    # Reload canary: a one-word warm answer takes 0.1-4s on these models; a
+    # cold reload of a 4-8 GB model takes well over 10s on this hardware.
+    _COLD_LOAD_LATENCY_S: float = 10.0
 
     async def test_council_parallel_no_swaps(
         self,
@@ -1765,6 +1781,12 @@ class TestCouncilConcurrentDispatch:
                     assert model in loaded, f"{model} not loaded after preload: {loaded}"
                 stress_log.log("all_council_resident", {"loaded": loaded})
 
+                # Baseline for the no-swap assertion: the broker's own swap
+                # counter (authoritative — incremented on every swap the
+                # scheduler performs, unlike sampled /api/ps views).
+                status_resp = await admin.get(f"{bastion_url}/broker/status")
+                swaps_before = status_resp.json().get("total_model_swaps", 0)
+
             # Phase 2: Fire concurrent requests to all 3 models
             async with VRAMMonitor(bastion_url, stress_log, poll_interval=0.5) as monitor:
                 client = StressClient(bastion_url, stress_log, client_id="council")
@@ -1791,21 +1813,41 @@ class TestCouncilConcurrentDispatch:
                 client.assert_all_succeeded()
                 client.assert_no_timeouts()
 
-                # No swaps should have occurred — all models were co-resident
-                [
-                    s for s in monitor.samples
-                    if set(council).issubset({n for n in s.get("loaded_models", [])})
+                # No swaps should have occurred — all models were co-resident.
+                #
+                # NOTE on the signal: /api/ps polling is NOT used as the
+                # eviction detector. Under concurrent inference it returns
+                # partial views — observed 2026-06-12: models missing from
+                # 1-2 consecutive 0.5s polls (and vram_used_gb oscillating
+                # 12-26 GB) while every request to the "missing" model
+                # completed warm (0.08-2.6s). The VRAMMonitor samples remain
+                # as diagnostics only. Two authoritative signals instead:
+                #
+                # 1. The broker's own swap counter — incremented on every
+                #    swap the scheduler performs. Delta must be zero.
+                # 2. A cold-reload latency canary — a real eviction forces a
+                #    multi-second model reload on the next request; warm
+                #    answers to one-word prompts stay far under this.
+                async with httpx.AsyncClient(timeout=10.0) as admin_after:
+                    status_resp = await admin_after.get(
+                        f"{bastion_url}/broker/status"
+                    )
+                swaps_after = status_resp.json().get("total_model_swaps", 0)
+                assert swaps_after == swaps_before, (
+                    f"Broker performed {swaps_after - swaps_before} model "
+                    f"swap(s) during the council burst — all three models "
+                    f"should have stayed co-resident."
+                )
+
+                latencies_all = [
+                    r["latency_s"] for r in results if r.get("latency_s")
                 ]
-                # If VRAMMonitor detected a model swap (loaded_models changed),
-                # it logged a "model_swap_detected" event. Check that council
-                # models were never removed.
-                for sample in monitor.samples:
-                    sample_models = set(sample.get("loaded_models", []))
-                    for model in council:
-                        assert model in sample_models, (
-                            f"Council model {model} disappeared during inference — "
-                            f"unexpected swap detected. Loaded: {sample_models}"
-                        )
+                worst_latency = max(latencies_all, default=0.0)
+                assert worst_latency < self._COLD_LOAD_LATENCY_S, (
+                    f"Slowest council request took {worst_latency:.1f}s — "
+                    f"reload-scale latency indicates a model was evicted and "
+                    f"reloaded mid-burst."
+                )
 
                 # Wall time should indicate concurrency.
                 # With 3 models × 3 requests each = 9 requests.

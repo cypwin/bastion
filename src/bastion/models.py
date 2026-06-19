@@ -5,9 +5,10 @@ from __future__ import annotations
 import time
 import uuid
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, PrivateAttr, computed_field
 
 # ---------------------------------------------------------------------------
 # Configuration models
@@ -189,11 +190,17 @@ class RequestOverrides(BaseModel):
 class ComplexityRoutingConfig(BaseModel):
     """Complexity-based model routing configuration (M58).
 
-    When enabled, reads X-Task-Complexity header and overrides the
-    client-requested model with the configured route model.
+    When enabled, reads X-Task-Complexity header and routes the request
+    to the configured route model.
+
+    When ``override_explicit`` is False (default), an explicit ``model``
+    in the request body wins and the route only fills in for requests
+    that omit the model. Set True to restore the original M58
+    force-route behavior (route model replaces the client's choice).
     """
     enabled: bool = True
     routes: dict[str, str] = Field(default_factory=dict)  # "simple" -> model name
+    override_explicit: bool = False  # honor explicit client model by default
     complex_action: str = "reject"  # always "reject" -> HTTP 422
 
 
@@ -201,7 +208,10 @@ class ThrashingDetectionConfig(BaseModel):
     """Per-agent swap thrashing detection (M58).
 
     Tracks swap patterns per agent and warns or halts when swap ratio
-    exceeds thresholds. Thresholds derived from RTX 5090 crash data.
+    exceeds thresholds. Conservative defaults based on consumer-GPU crash
+    forensics; server-GPU operators (A100/H100) should tune halt_swap_ratio
+    and swap_rate_critical_threshold down to reflect their swap-stress
+    profiles.
     """
     enabled: bool = True
     mode: str = "warn"  # "warn" or "strict"
@@ -210,6 +220,86 @@ class ThrashingDetectionConfig(BaseModel):
     halt_swap_ratio: float = 0.75  # ~6 swaps/min (matches global critical)
     cooloff_seconds: int = 30
     min_requests_before_eval: int = 6
+
+
+# ---------------------------------------------------------------------------
+# Observability configuration (spec 4.8 — the `observability:` block)
+# ---------------------------------------------------------------------------
+
+class CorrelationConfig(BaseModel):
+    """Correlation-engine thresholds and weights (spec 4.8).
+
+    Nested under ``observability.correlation:``.  Every threshold is a
+    documented config key so server-GPU operators and slow-IO/container hosts
+    can tune the contention legs and the RiskIndex weights without code
+    changes.  The block-device write threshold governs **all** discovered base
+    devices (``nvme*/sd*/vd*/mmcblk*``), not NVMe specifically.
+    """
+    ring_maxlen: int = 512  # Correlation ring capacity
+    ring_tail_in_snapshot: int = 32  # Last-N ring events embedded in /broker/snapshot
+    # Block-device write-throughput contention threshold (MB/s). Device-dependent:
+    # tune to ~50-70% of the drive's observed sustained write rate. Startup INFO
+    # logs the active value; dynamic idle-calibration is the long-term default.
+    contention_block_write_mb_s_threshold: float = 200.0
+    contention_psi_threshold: float = 20.0  # mem_psi_some_avg10 threshold
+    contention_cpu_psi_threshold: float = 60.0  # cpu_psi_some_avg10 threshold
+    contention_hysteresis_ticks: int = 2  # ticks above threshold before emitting
+    # CPU thermal ceiling for the headroom formula (6.5). Fallback that differs
+    # by CPU (Ryzen 7000 Tjmax 95, EPYC 90, Cortex-A 105); startup INFO logs it.
+    cpu_safe_ceiling_c: float = 85.0
+    # GPU thermal ceiling for the headroom formula. None => use
+    # gpu.max_temperature_c (itself auto-detected from tlimit/shutdown); if that
+    # is unset/0 (no-GPU) the GPU headroom term is skipped (CPU-only headroom).
+    gpu_safe_ceiling_c: float | None = None
+    # Per-component RiskIndex weights (spec 6.4): VRAM headroom 25%, thermal
+    # headroom 20%, swap-rate 25%, thrashing 20%, memory-PSI 10% (sum 1.0).
+    risk_weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "vram_headroom": 0.25,
+            "thermal_headroom": 0.20,
+            "swap_rate": 0.25,
+            "thrashing": 0.20,
+            "memory_psi": 0.10,
+        }
+    )
+
+
+class ObservabilityConfig(BaseModel):
+    """The ``observability:`` config block (spec 4.8).
+
+    Greenfield block in ``broker.yaml``; optional on ``BrokerConfig`` via a
+    default factory, so an absent block produces working defaults.  Sources
+    that the device/host can report (CPU sensor, RAPL domain, block devices,
+    disk mounts) are auto-discovered when the corresponding key is ``None``;
+    pinning a key overrides discovery.  See the spec table for the full
+    discovery strategy per key.
+    """
+    # Fast-tick cadence (seconds) for the broker-side _machine_snapshot_loop
+    # (spec 4.9). Monotonic-anchored: a slow nvidia-smi does not compound drift.
+    snapshot_interval_s: float = 2.0
+    # Slow-tick cadence (seconds) for subprocess-heavy / rarely-changing GPU
+    # signals — throttle reasons, PCIe tx/rx, Xid scan (spec 4.9 slow path).
+    # The loop derives an integer tick-modulo from
+    # round(slow_tick_interval_s / snapshot_interval_s); the most recent slow
+    # result is cached and reused on the intervening fast ticks so the 2s fast
+    # path is never blocked by 30s-stale subprocess work.
+    slow_tick_interval_s: float = 30.0
+    # Whether GET /broker/snapshot/stream serves the SSE push surface (spec
+    # 5.6). Default on: the stream supersedes the older 2026-03-13
+    # /broker/status/stream and is a first-class external surface. When False
+    # the endpoint returns 501 (the TUI never depends on it — it polls).
+    snapshot_stream_enabled: bool = True
+    # List of process names or `pid:NNN` always shown in the attribution panel.
+    process_watchlist: list[str] = Field(default_factory=list)
+    churn_threshold: int = 5  # New-PID count per slow tick that fires a churn event
+    ecc_enabled: bool = False  # Opt-in slow-poll of GPU ECC counters (Tier 4)
+    cpu_sensor_name: str | None = None  # Pin a hwmon `name`; None => discover
+    rapl_domain_path: str | None = None  # Pin a RAPL energy path; None => probe
+    storage_device_filter: list[str] | None = None  # Allow-list base devices; None => regex
+    disk_mount_labels: dict[str, str] | None = None  # mount->label; None => discover
+    psi_io_full_warn_pct: float = 5.0  # PSI io_full avg10 TUI warn threshold
+    psi_io_full_crit_pct: float = 25.0  # PSI io_full avg10 TUI critical threshold
+    correlation: CorrelationConfig = Field(default_factory=CorrelationConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +376,19 @@ class BrokerConfig(BaseModel):
     request_overrides: RequestOverrides = Field(default_factory=RequestOverrides)
     complexity_routing: ComplexityRoutingConfig = Field(default_factory=ComplexityRoutingConfig)
     thrashing_detection: ThrashingDetectionConfig = Field(default_factory=ThrashingDetectionConfig)
+    observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+
+    # Resolved path of the broker.yaml that loaded this config. Set by
+    # ``bastion.config.load_config`` post-construction. ``None`` when the
+    # config was built from defaults (no file found) or in tests that
+    # bypass ``load_config``. Exposed via ``/broker/catalog`` as a string;
+    # callers should use ``str(cfg.loaded_from) if cfg.loaded_from else "<unknown>"``.
+    _loaded_from: Path | None = PrivateAttr(default=None)
+
+    @property
+    def loaded_from(self) -> Path | None:
+        """Resolved path of the source broker.yaml, or ``None``."""
+        return self._loaded_from
 
 
 # ---------------------------------------------------------------------------
@@ -460,12 +563,35 @@ class IntentResponse(BaseModel):
 
 
 class GPUStatus(BaseModel):
-    """Current GPU hardware state."""
+    """Current GPU hardware state.
+
+    The eleven optional ``*_pct`` / ``*_clock_mhz`` / ``pcie_link_*`` fields and
+    ``memory_junction_temp_c`` are fast-path signals populated by the
+    ``GPUBackend`` extended status query (``NvidiaBackend`` from one
+    ``nvidia-smi`` call; ``StubBackend`` leaves them ``None``).  They are all
+    ``Optional``/``None``-default so non-NVIDIA / no-GPU hosts (and pre-Ampere
+    cards for ``memory_junction_temp_c``, fanless server GPUs for
+    ``fan_speed_pct``) yield ``None`` as the *correct complete* value, never a
+    misleading ``0``.  See observability spec Section 4.2.
+    """
     temperature_c: int | None = None
     vram_used_mb: int | None = None
     vram_free_mb: int | None = None
     vram_total_mb: int | None = None
     power_draw_watts: float | None = None
+    # --- Observability fast-path extensions (spec 4.2) ----------------------
+    gpu_index: int = 0  # which GPU this row describes (multi-GPU seam)
+    compute_utilization_pct: int | None = None  # utilization.gpu (NvidiaBackend)
+    memory_bandwidth_utilization_pct: int | None = None  # utilization.memory
+    sm_clock_mhz: int | None = None  # clocks.sm
+    gr_clock_mhz: int | None = None  # clocks.gr
+    mem_clock_mhz: int | None = None  # clocks.mem
+    fan_speed_pct: int | None = None  # fan.speed (READ; distinct from write-path)
+    memory_junction_temp_c: int | None = None  # temperature.memory (GDDR junction)
+    pcie_link_gen_current: int | None = None
+    pcie_link_gen_max: int | None = None
+    pcie_link_width_current: int | None = None
+    pcie_link_width_max: int | None = None
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -478,6 +604,31 @@ class GPUStatus(BaseModel):
         if self.vram_used_mb and self.vram_total_mb:
             return (self.vram_used_mb / self.vram_total_mb) * 100
         return None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def pcie_downgraded(self) -> bool:
+        """True iff the PCIe link is running below its negotiated maximum.
+
+        Returns ``True`` only when **all four** link fields are non-``None``
+        (partial-data guard) **and** the current generation or width is below
+        the maximum.  On partial data and on all non-NVIDIA / no-GPU hardware
+        (where the fields are ``None``) it returns ``False`` — never a false
+        "downgraded" alarm on hardware that does not expose PCIe link state.
+        See observability spec Section 4.2.
+        """
+        fields = (
+            self.pcie_link_gen_current,
+            self.pcie_link_gen_max,
+            self.pcie_link_width_current,
+            self.pcie_link_width_max,
+        )
+        if any(f is None for f in fields):
+            return False
+        return (
+            self.pcie_link_gen_current < self.pcie_link_gen_max  # type: ignore[operator]
+            or self.pcie_link_width_current < self.pcie_link_width_max  # type: ignore[operator]
+        )
 
     def is_safe(self, gpu_config: GPUConfig | None = None) -> bool:
         """Check temperature and VRAM within safe limits.
@@ -506,6 +657,14 @@ class BrokerStatus(BaseModel):
     total_requests_served: int = 0
     total_model_swaps: int = 0
     state: str = "running"  # running, draining, stopped
+    vram_state: str = Field(
+        default="ok",
+        description=(
+            "'ok' when loaded_models reflects a live /api/ps read; 'unknown' "
+            "when Ollama was unreachable and loaded_models is an empty "
+            "placeholder, not a verified empty"
+        ),
+    )
     vram_ledger: dict[str, Any] | None = Field(
         default=None,
         description="VRAM ledger status from VRAMManager (if available)",
@@ -524,6 +683,225 @@ class BrokerStatus(BaseModel):
     a2a_tasks: list[dict] = Field(default_factory=list)
     active_leases: list[dict] = Field(default_factory=list)
     recent_audit_events: list[dict] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Unified observability data model — MachineSnapshot (spec Section 4)
+#
+# One canonical, surface-independent Pydantic container populated per
+# collection tick.  All new fields are Optional/None-default for backward
+# compatibility; a partial snapshot with None fields is valid and still
+# emitted (graceful degradation).  GPU sub-data is empty/None on
+# StubBackend / non-NVIDIA hosts — the correct complete value there, never a
+# misleading 0.
+# ---------------------------------------------------------------------------
+
+class XidEvent(BaseModel):
+    """A single GPU device error event (spec 4.3).
+
+    ``xid_code`` is an NVIDIA Xid code today but documented as a *generic
+    device error-code* field, so a future AMD backend can map amdgpu reset
+    events onto the same structure without a schema change.
+    """
+    timestamp: str
+    xid_code: int
+    raw_message: str
+
+
+class GPUExtendedStatus(BaseModel):
+    """Slow-path GPU signals (spec 4.3).
+
+    Not embedded in ``BrokerStatus`` to keep the 2s fast path free of 30s-stale
+    data.  Every field is populated by ``NvidiaBackend`` slow-path methods and
+    is empty/``None`` from ``StubBackend``; on non-NVIDIA hardware the empty
+    lists are the *correct complete* value.
+    """
+    throttle_reasons: list[str] = Field(default_factory=list)
+    pcie_tx_kb_s: int | None = None
+    pcie_rx_kb_s: int | None = None
+    recent_xids: list[XidEvent] = Field(default_factory=list)  # bounded maxlen=20 at collection
+    xid_count_since_start: int = 0
+    last_polled_at: float = 0.0
+
+
+class BlockDeviceIOStats(BaseModel):
+    """Per-device block-IO stats (spec 4.4).
+
+    ``device`` carries a discovered base device name (``nvme0n1`` / ``sda`` /
+    ``vdb`` / ``mmcblk0``), never a partition.  Covers ``nvme*/sd*/vd*/mmcblk*``,
+    not NVMe only.
+    """
+    device: str
+    util_pct: float  # busy_time delta / elapsed (the canonical device util%)
+    read_await_ms: float | None = None
+    write_await_ms: float | None = None
+    read_rate_mb_s: float
+    write_rate_mb_s: float
+
+
+class ContentionSnapshot(BaseModel):
+    """Host pressure snapshot (spec 4.4).
+
+    PSI fields are ``None`` on kernels without CONFIG_PSI (< 4.20 / many
+    containers); ``cpu_package_watts`` is host RAPL (Intel **or** AMD) and
+    ``None`` without powercap; ``gpu_board_watts`` is backend-provided and
+    stays ``None`` until a non-NVIDIA backend fills it (NVIDIA fills
+    ``GPUStatus.power_draw_watts`` instead).  No degradation path emits a
+    misleading ``0``.
+    """
+    psi_cpu_some_avg10: float | None = None
+    psi_cpu_full_avg10: float | None = None
+    psi_mem_some_avg10: float | None = None
+    psi_mem_full_avg10: float | None = None
+    psi_io_some_avg10: float | None = None
+    psi_io_full_avg10: float | None = None
+    swap_in_rate_mb_s: float | None = None
+    swap_out_rate_mb_s: float | None = None
+    block_devices: list[BlockDeviceIOStats] = Field(default_factory=list)
+    cpu_package_watts: float | None = None  # host RAPL — Intel OR AMD source
+    gpu_board_watts: float | None = None  # Tier-4: backend-provided; None until filled
+    oom_kill_total: int | None = None
+    oom_kill_rate: float | None = None
+    sampled_at: float = Field(default_factory=time.time)
+
+
+class ProcessGPURow(BaseModel):
+    """Per-process GPU utilization row (spec 4.5, pmon-derived)."""
+    pid: int
+    name: str
+    vram_mb: int | None = None
+    sm_pct: int | None = None
+    mem_pct: int | None = None
+    enc_pct: int | None = None
+    dec_pct: int | None = None
+    is_inference_owned: bool = False
+    role: str | None = None
+
+
+class ProcessRow(BaseModel):
+    """Per-process attribution row (spec 4.5; TUI + JSON only, never a label)."""
+    pid: int
+    name: str
+    cpu_pct: float | None = None
+    rss_mb: float | None = None
+    io_read_bytes_s: float | None = None
+    io_write_bytes_s: float | None = None
+    is_inference_owned: bool = False
+    role: str | None = None
+    watchlisted: bool = False
+    gpu_row: ProcessGPURow | None = None
+
+
+class ProcessChurnEvent(BaseModel):
+    """A burst of process creation/exit between slow ticks (spec 4.5)."""
+    timestamp: float
+    new_count: int
+    exited_count: int
+    new_names: list[str]
+
+
+class ProcessSnapshot(BaseModel):
+    """Per-process attribution (spec 4.5; TUI + JSON only, never Prometheus labels).
+
+    ``gpu_processes`` is populated through the ``GPUBackend`` and is **empty on
+    ``StubBackend``** — on non-NVIDIA / no-GPU hosts the panel shows
+    CPU/IO/watchlist/churn but no GPU rows, with no error.
+    """
+    top_processes: list[ProcessRow] = Field(default_factory=list)
+    gpu_processes: list[ProcessGPURow] = Field(default_factory=list)
+    own_pids: dict[int, str] = Field(default_factory=dict)  # pid -> role ('bastion'|'ollama')
+    watchlist_hits: list[ProcessRow] = Field(default_factory=list)
+    recent_churn_events: list[ProcessChurnEvent] = Field(default_factory=list)
+    collected_at: float
+    gpu_collected_at: float | None = None  # slow-tick GPU sub-data age
+
+
+class InferenceThroughputState(BaseModel):
+    """Stream-tapped LLM throughput aggregate (spec 4.6).
+
+    Model-agnostic: reads whatever model name and token accounting Ollama emits
+    for any model the user runs.  Divide-by-zero on cache-hit yields ``None``.
+    """
+    decode_tps_p50: float | None = None
+    prefill_tps_p50: float | None = None
+    ttft_p50_s: float | None = None
+    ctx_utilization_p50: float | None = None
+    last_model: str | None = None
+    sampled_at: float = Field(default_factory=time.time)
+
+
+class RiskIndexResult(BaseModel):
+    """Composite forward-looking risk gauge output (spec 6.4)."""
+    score: float  # [0, 1]
+    level: Literal["nominal", "elevated", "high", "critical"]
+    component_scores: dict[str, float] = Field(default_factory=dict)
+    dominant_factor: str
+
+
+class ThermalCoupling(BaseModel):
+    """CPU<->GPU thermal coupling (spec 6.5).
+
+    All inputs are ``None``-tolerant: ``gpu_temp_c``/``fan_speed_pct`` are
+    ``None`` on non-NVIDIA / no-GPU / fanless-server-GPU hosts; ``cpu_temp_c``
+    is ``None`` when no CPU sensor is discovered.  A missing input yields a
+    partial value (present terms only), never an exception and never a
+    misleading ``0``.
+    """
+    cpu_temp_c: float | None = None
+    gpu_temp_c: float | None = None
+    fan_speed_pct: int | None = None
+    coupling_active: bool = False
+    thermal_headroom_min_c: float | None = None
+
+
+class CorrelationEvent(BaseModel):
+    """One event on the correlation ring (spec 6.1)."""
+    ts_monotonic: float
+    ts_wall: float
+    domain: Literal["gpu", "system", "inference", "scheduler"]
+    kind: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class ContentionEvent(CorrelationEvent):
+    """A discrete contention event joined to an inference stall (spec 6.3).
+
+    Extends ``CorrelationEvent`` with attribution + the simultaneous-stall
+    confirmation that is the correlation moat.
+    """
+    attribution: str
+    inference_was_stalled: bool = False
+    stall_reason_at_time: str | None = None
+    latency_spike_ratio: float | None = None
+
+
+class CorrelationState(BaseModel):
+    """Correlation-engine outputs surfaced per snapshot (spec 4.7)."""
+    risk_index: RiskIndexResult | None = None
+    thermal_coupling: ThermalCoupling | None = None
+    recent_contentions: list[ContentionEvent] = Field(default_factory=list)
+    enriched_stall_reason: str | None = None
+    ring_size: int = 0
+    recent_ring_events: list[CorrelationEvent] = Field(default_factory=list)  # bounded tail
+
+
+class MachineSnapshot(BaseModel):
+    """Unified, fully-correlated per-tick container (spec 4.1).
+
+    ``model_dump()`` round-trips through JSON identically to ``BrokerStatus``
+    and is the payload of ``GET /broker/snapshot``.  ``gpu`` is a single
+    ``GPUStatus`` reporting the configured GPU (single-GPU now, list-extensible
+    later via ``GPUStatus.gpu_index``).  Every sub-model field is optional so a
+    partial snapshot with ``None`` fields is valid and still emitted.
+    """
+    snapshot_ts: float  # time.time() at collection
+    broker: BrokerStatus | None = None  # existing model, promoted in
+    gpu: GPUStatus = Field(default_factory=GPUStatus)  # existing model, EXTENDED (4.2)
+    gpu_extended: GPUExtendedStatus | None = None  # slow-path GPU signals (4.3)
+    contention: ContentionSnapshot | None = None  # host pressure (4.4)
+    process: ProcessSnapshot | None = None  # per-process attribution (4.5)
+    inference: InferenceThroughputState | None = None  # stream-tapped LLM rates (4.6)
+    correlation: CorrelationState | None = None  # engine outputs (4.7)
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +946,123 @@ class BrokerThrashing(BaseModel):
 
     detector_state: ThrashingVerdictLabel
     agents: list[BrokerThrashingAgent]
+
+
+# ---------------------------------------------------------------------------
+# WT-C-A-06: Latency endpoint
+# ---------------------------------------------------------------------------
+
+
+class LatencyBucket(BaseModel):
+    """Latency percentiles for one model over the rolling window.
+
+    ``sample_count`` is the number of in-window requests counted toward this
+    bucket. Percentile fields are ``None`` only when ``sample_count == 0``;
+    callers should treat ``None`` as "no signal" rather than "zero latency".
+    """
+
+    model: str
+    sample_count: int = Field(
+        ge=0,
+        description="Number of samples in the window for this model",
+    )
+    p50_s: float | None = Field(
+        default=None,
+        description="50th percentile end-to-end duration in seconds; null if sample_count == 0",
+    )
+    p95_s: float | None = None
+    p99_s: float | None = None
+    queue_wait_p50_s: float | None = Field(
+        default=None,
+        description="Queue-wait p50 (time from request arrival to dispatch)",
+    )
+    queue_wait_p95_s: float | None = None
+    error_count: int = 0
+    error_rate: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="error_count / sample_count, 0.0 when sample_count == 0",
+    )
+
+
+class BrokerLatency(BaseModel):
+    """Response body for GET /broker/latency.
+
+    ``window_s`` reflects the actual age of the oldest sample considered,
+    NOT the requested window. If fewer than ``min_samples_per_model`` are
+    present for a model, that model's bucket is omitted from ``per_model``.
+    """
+
+    window_s: float = Field(
+        ge=0.0,
+        description="Actual time span of samples in the window, in seconds",
+    )
+    requested_window_s: float = Field(
+        description="The ?window_s query param that was applied (default 300)",
+    )
+    sample_total: int = Field(ge=0)
+    per_model: list[LatencyBucket] = Field(default_factory=list)
+    overall: LatencyBucket | None = Field(
+        default=None,
+        description="Aggregate bucket across all models (model='__overall__')",
+    )
+
+
+# ---------------------------------------------------------------------------
+# WT-C-A-07: Catalog endpoint
+# ---------------------------------------------------------------------------
+
+
+class CatalogEntry(BaseModel):
+    """One model from broker.yaml's models registry, enriched with runtime state."""
+
+    name: str
+    vram_gb: float = Field(
+        description="Declared VRAM footprint in GB from broker.yaml",
+    )
+    default_num_ctx: int = 4096
+    tags: list[str] = Field(default_factory=list)
+    always_allowed: bool = False
+    currently_loaded: bool = Field(
+        description="True if VRAMTracker reports this model in Ollama right now",
+    )
+    actual_vram_gb: float | None = Field(
+        default=None,
+        description="Measured VRAM at last residency snapshot; null if not loaded",
+    )
+    is_evictable: bool = Field(
+        description=(
+            "True if model is loaded AND not currently the scheduler's "
+            "current_model AND not always_allowed"
+        ),
+    )
+
+
+class BrokerCatalog(BaseModel):
+    """Response body for GET /broker/catalog."""
+
+    models: list[CatalogEntry] = Field(default_factory=list)
+    total: int = Field(ge=0)
+    loaded_count: int = Field(ge=0)
+    evictable_count: int = Field(ge=0)
+    registry_source: str = Field(
+        description=(
+            "Path to the broker.yaml that sourced this registry "
+            "(home directory redacted to '~')"
+        ),
+    )
+    snapshot_age_s: float = Field(
+        ge=0.0,
+        description="Seconds since the VRAM tracker's last residency snapshot",
+    )
+    residency_state: str = Field(
+        default="ok",
+        description=(
+            "'ok' when residency fields reflect a live /api/ps read; "
+            "'unknown' when Ollama was unreachable and currently_loaded/"
+            "loaded_count collapsed to not-loaded placeholders"
+        ),
+    )
 
 
 class BatchInferRequest(BaseModel):

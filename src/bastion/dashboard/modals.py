@@ -12,7 +12,10 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Label
 
-from bastion.dashboard.collectors import SystemDataCollector
+# Re-exported as a patch seam: tests patch ``modals.SystemDataCollector`` to verify
+# the GPU-process modal reads the cached snapshot without spawning a subprocess
+# (the modal itself no longer references it after the T1 refactor).
+from bastion.dashboard.collectors import SystemDataCollector  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # Fan control constants and helper
@@ -284,9 +287,13 @@ class FanControlModal(ModalScreen[str]):
     def compose(self) -> ComposeResult:
         available = fan_control_available()
         auto_fan = getattr(self.app, "_auto_fan_enabled", False)
-        auto_state = getattr(self.app, "_auto_fan_state", "idle")
+        auto_speed = getattr(self.app, "_auto_fan_speed", None)
         auto_status = "ON" if auto_fan else "OFF"
-        auto_detail = f" (80C -> 90%, {auto_state})" if auto_fan else ""
+        applied = f"{auto_speed}%" if auto_speed else "auto"
+        auto_detail = (
+            f" (CPU 60→30 70→50 80→90 85+→100, GPU-safe floor; now {applied})"
+            if auto_fan else ""
+        )
 
         with Vertical(id="fan-dialog"):
             yield Label("GPU Fan Control", id="fan-title")
@@ -368,8 +375,46 @@ class GPUProcessListModal(ModalScreen[str]):
         super().__init__(**kwargs)
         self._procs: list[dict[str, str]] = []
 
+    @staticmethod
+    def _rows_from_snapshot(snapshot: Any) -> list[dict[str, str]]:
+        """Normalize ``ProcessSnapshot.gpu_processes`` to the modal's row shape.
+
+        Reads the cached snapshot (a ``model_dump()`` dict the broker's 10s slow
+        tick maintains) and returns one ``{pid, name, vram_mb}`` string-keyed row
+        per GPU process — the shape ``compose`` / ``on_button_pressed`` and the
+        kill confirmation flow already consume. A missing snapshot, a missing
+        ``gpu_processes`` key, or a malformed row degrades to ``[]`` (no GPU rows,
+        no crash — StubBackend / no-GPU host).
+        """
+        if not snapshot:
+            return []
+        gpu_rows = snapshot.get("gpu_processes") if isinstance(snapshot, dict) else None
+        if not gpu_rows:
+            return []
+        out: list[dict[str, str]] = []
+        for row in gpu_rows:
+            try:
+                pid = row.get("pid")
+                if pid is None:
+                    continue
+                vram = row.get("vram_mb")
+                out.append({
+                    "pid": str(pid),
+                    "name": str(row.get("name") or ""),
+                    "vram_mb": str(vram) if vram is not None else "?",
+                })
+            except AttributeError:
+                continue
+        return out
+
     def compose(self) -> ComposeResult:
-        self._procs = SystemDataCollector.query_gpu_processes()
+        # Read the broker-maintained cached snapshot instead of spawning an
+        # nvidia-smi subprocess on open (spec 5.3 — moves the modal off the
+        # UI-thread subprocess; the always-on ProcessAttributionPanel owns
+        # collection now). ``app._last_process_snapshot`` may be absent on a
+        # host app that does not poll /broker/processes -> empty (graceful).
+        snapshot = getattr(self.app, "_last_process_snapshot", None)
+        self._procs = self._rows_from_snapshot(snapshot)
         with Vertical(id="gpuproc-dialog"):
             yield Label("GPU Processes", id="gpuproc-title")
             if self._procs:

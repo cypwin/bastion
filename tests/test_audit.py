@@ -267,14 +267,53 @@ class TestGlobalAuditLogger:
         lines = log_file.read_text().strip().split("\n")
         assert len(lines) == 1
 
-    def test_emit_before_init_does_nothing(self, tmp_path: Path):
-        """emit() should be a no-op if logger not initialized."""
-        # Reset global logger
+    def test_emit_before_init_buffers_and_warns(
+        self, tmp_path: Path, caplog
+    ):
+        """Pre-init emit() must not vanish silently: it warns and buffers.
+
+        Previously a silent no-op — startup-ordering bugs were invisible.
+        Now the event is held in a ring buffer and flushed on init.
+        """
         import bastion.audit
         bastion.audit._audit_logger = None
+        bastion.audit._preinit_events.clear()
 
-        # Should not raise
-        emit("test", {"data": "value"})
+        with caplog.at_level(logging.WARNING):
+            emit("preinit_event", {"data": "value"})
+
+        assert any(
+            "preinit_event" in r.getMessage()
+            and "init_audit_logger" in r.getMessage()
+            for r in caplog.records
+        ), "pre-init emit must log a WARNING naming the event"
+
+        # Flush on init: the buffered event lands in the log file
+        log_file = tmp_path / "preinit-audit.jsonl"
+        init_audit_logger(log_path=str(log_file))
+        lines = log_file.read_text().strip().split("\n")
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        assert record["event"] == "preinit_event"
+        assert record["details"] == {"data": "value"}
+
+    def test_preinit_buffer_is_bounded(self, tmp_path: Path):
+        """The pre-init ring buffer keeps only the most recent events."""
+        import bastion.audit
+        bastion.audit._audit_logger = None
+        bastion.audit._preinit_events.clear()
+        cap = bastion.audit._PREINIT_BUFFER_MAX
+
+        for i in range(cap + 50):
+            emit(f"event_{i}", {})
+
+        log_file = tmp_path / "bounded-audit.jsonl"
+        init_audit_logger(log_path=str(log_file))
+        lines = log_file.read_text().strip().split("\n")
+        assert len(lines) == cap
+        # Oldest events were dropped; the most recent survive
+        assert json.loads(lines[0])["event"] == "event_50"
+        assert json.loads(lines[-1])["event"] == f"event_{cap + 49}"
 
     def test_emit_convenience_function(self, tmp_path: Path):
         """emit() convenience function should work like logger.emit()."""

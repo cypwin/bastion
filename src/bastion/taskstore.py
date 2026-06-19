@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -94,6 +95,14 @@ _VALID_TRANSITIONS: dict[A2ATaskState, set[A2ATaskState]] = {
 class TaskStore:
     """Hardened in-memory task store with dual-store architecture.
 
+    Concurrency contract: **asyncio single-loop only.** Mutations never
+    cross an ``await`` boundary, so they are atomic under cooperative
+    scheduling — but there is no lock, so calls from other threads
+    (anyio thread pool, executor offload) would race on ``_active`` and
+    ``_active_timestamps``. ``create`` enforces this with a thread-affinity
+    guard: the first call binds the owner thread, and any later call from
+    a different thread raises ``RuntimeError``.
+
     Parameters
     ----------
     maxsize : int
@@ -142,13 +151,29 @@ class TaskStore:
         self._cleanup_tasks: set[asyncio.Task] = set()
         self._cleanup_running = False
 
+        # Thread-affinity guard (see class docstring) — bound on first create
+        self._owner_thread_ident: int | None = None
+
     # --- Public API ---
 
     def create(self, record: A2ATaskRecord) -> str:
         """Add a new task to the active store.
 
         Raises TaskStoreFullError if at capacity (overloaded).
+        Raises RuntimeError if called from a thread other than the one
+        that first used this store (asyncio-single-loop contract).
         """
+        ident = threading.get_ident()
+        if self._owner_thread_ident is None:
+            self._owner_thread_ident = ident
+        elif ident != self._owner_thread_ident:
+            raise RuntimeError(
+                "TaskStore is asyncio-single-loop only: create() called from "
+                f"thread {ident}, but the store is bound to thread "
+                f"{self._owner_thread_ident}. Threaded callers race on the "
+                "unlocked active store — dispatch back onto the event loop."
+            )
+
         # Check backpressure
         self._update_pressure_level()
         if self._pressure_level == BackpressureLevel.OVERLOADED:
