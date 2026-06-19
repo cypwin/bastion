@@ -247,6 +247,53 @@ VRAM_LEDGER_DRIFT_MB = Gauge(
 )
 
 # ---------------------------------------------------------------------------
+# Correlation-engine metrics (observability expansion, spec 6.4/6.3/6.5 / 7)
+# ---------------------------------------------------------------------------
+
+# CARDINALITY DISCIPLINE (Constraint #2): the correlation engine is fed by
+# per-process attribution data, but NONE of that may become a Prometheus label.
+# These five metrics use ONLY bounded labels — ``factor`` (5 RiskIndex component
+# names) and ``kind`` (4 contention kinds) — or no labels at all. Process names,
+# PIDs, device VALUES, etc. stay on the TUI/JSON surfaces only.
+
+# Composite forward-looking RiskIndex (spec 6.4). Pure gauge, NO labels.
+RISK_INDEX = Gauge(
+    "bastion_risk_index",
+    "Composite forward-looking risk score in [0, 1] (higher = closer to a "
+    "VRAM/thermal/swap/thrashing crash)",
+)
+
+# Rising-edge counter for the dominant RiskIndex factor each tick. The single
+# bounded label is the component NAME (5 fixed enum values), matching the
+# thrashing-counter convention — never a per-PID/per-model label.
+RISK_DOMINANT_FACTOR_TOTAL = Counter(
+    "bastion_risk_dominant_factor_total",
+    "Count of ticks each RiskIndex component was the dominant risk factor",
+    labelnames=["factor"],
+)
+
+# Discrete contention-event counter (spec 6.3). Bounded ``kind`` enum:
+# nvme_burst / mem_pressure / cpu_contention / combined. The human-readable
+# attribution string (which may name a device/process) is JSON-only — never a
+# label.
+CONTENTION_EVENTS_TOTAL = Counter(
+    "bastion_contention_events_total",
+    "Discrete host-contention events joined to an inference stall, by kind",
+    labelnames=["kind"],
+)
+
+# CPU<->GPU thermal coupling (spec 6.5). Both gauges are LABEL-LESS.
+THERMAL_COUPLING_ACTIVE = Gauge(
+    "bastion_thermal_coupling_active",
+    "1 when CPU heat is driving the shared cooling (fan curve engaged), else 0",
+)
+
+THERMAL_HEADROOM_CELSIUS = Gauge(
+    "bastion_thermal_headroom_celsius",
+    "Minimum thermal headroom (C) over the computable CPU/GPU ceiling terms",
+)
+
+# ---------------------------------------------------------------------------
 # A2A task lifecycle metrics
 # ---------------------------------------------------------------------------
 
@@ -546,6 +593,59 @@ def update_vram_ledger_drift(gpu_index: str, mb: float) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Correlation-engine helpers (observability expansion, spec 6.4/6.3/6.5)
+# ---------------------------------------------------------------------------
+
+def update_risk_index(score: float) -> None:
+    """Set the composite RiskIndex gauge (spec 6.4).
+
+    Parameters
+    ----------
+    score : float
+        Composite risk in [0, 1]. The caller already clamps; this is a pure set.
+    """
+    RISK_INDEX.set(score)
+
+
+def record_risk_dominant_factor(factor: str) -> None:
+    """Increment the dominant-factor counter for this tick (spec 6.4).
+
+    ``factor`` is always one of the five bounded RiskIndex component names
+    (``vram_headroom``/``thermal_headroom``/``swap_rate``/``thrashing``/
+    ``memory_psi``), so the label cardinality is fixed. Never a per-PID/model
+    label.
+    """
+    RISK_DOMINANT_FACTOR_TOTAL.labels(factor=factor).inc()
+
+
+def record_contention_event(kind: str) -> None:
+    """Increment the discrete-contention-event counter by kind (spec 6.3).
+
+    ``kind`` is one of the bounded enum values
+    (``nvme_burst``/``mem_pressure``/``cpu_contention``/``combined``). The event's
+    human-readable attribution (which may name a device) is JSON-only — it never
+    becomes a label.
+    """
+    CONTENTION_EVENTS_TOTAL.labels(kind=kind).inc()
+
+
+def update_thermal_coupling_active(active: bool) -> None:
+    """Set the thermal-coupling gauge to 1 (engaged) or 0 (spec 6.5)."""
+    THERMAL_COUPLING_ACTIVE.set(1.0 if active else 0.0)
+
+
+def update_thermal_headroom_celsius(headroom_c: float) -> None:
+    """Set the minimum-thermal-headroom gauge in C (spec 6.5).
+
+    The caller MUST skip this entirely when no headroom term is computable
+    (``thermal_headroom_min_c is None`` on a no-GPU + no-CPU-sensor host) —
+    publishing ``0`` would falsely claim zero headroom on a host that simply
+    cannot read either temperature.
+    """
+    THERMAL_HEADROOM_CELSIUS.set(headroom_c)
+
+
+# ---------------------------------------------------------------------------
 # A2A emit helpers
 # ---------------------------------------------------------------------------
 
@@ -706,6 +806,12 @@ __all__ = [
     "record_vram_reconcile_stale",
     "record_vram_reconcile_import",
     "update_vram_ledger_drift",
+    # Correlation-engine helpers (observability expansion, spec 6.3/6.4/6.5)
+    "update_risk_index",
+    "record_risk_dominant_factor",
+    "record_contention_event",
+    "update_thermal_coupling_active",
+    "update_thermal_headroom_celsius",
     # Vision C schema-frozen helpers
     "update_vram_used_mb",
     "record_thrashing_verdict",
