@@ -3,7 +3,7 @@
 **Status:** Accepted (long-horizon; v0.5+ instrumentation, deprecation no earlier than v0.7)
 **Date:** 2026-05-19
 **Deciders:** S122 maintainer with reference to S122 plan-C design review
-**Related:** ADR-005 (BastionPanel contract — TUI lock-in for v0.4), ADR-007 (MCP adapter — first non-TUI surface), `_archive/sessions/S122/vision-A-E-retro-20260519-1519/round_4_synthesis/FINAL_RECOMMENDATION.md` Step 4
+**Related:** ADR-005 (BastionPanel contract — TUI lock-in for v0.4), ADR-007 (MCP adapter — first non-TUI surface); S122 plan-C vision-council retro Step 4 (internal artifact, archived)
 
 ## Context
 
@@ -40,7 +40,7 @@ Three candidate signals:
 
 Specifically:
 
-1. **Signal (a) — TUI session count.** v0.5's TUI logs one `tui_session_start` audit_event per launch (anonymous; just session-start + duration + version). Aggregated via `bastion audit --type tui_session_start --since 90d | jq 'count'`. **Threshold:** TUI sessions per operator-week falls below 0.5 (i.e., fewer than 1 TUI launch every 2 weeks on average) AND MCP sessions per operator-week exceeds 5.0.
+1. **Signal (a) — TUI session count.** v0.5's TUI logs one `tui_session_start` audit_event per launch (anonymous; just session-start + duration + version). Aggregated via a planned `bastion audit` subcommand (e.g. `bastion audit --type tui_session_start --since 90d | jq 'count'`). **Threshold:** TUI sessions per operator-week falls below 0.5 (i.e., fewer than 1 TUI launch every 2 weeks on average) AND MCP sessions per operator-week exceeds 5.0.
 
 2. **Signal (b) — Issue-tracker velocity.** No instrumentation required; manually tallied at each minor release from GitHub issues with `tui` vs. `mcp` labels. **Threshold:** MCP-labeled merged PR count exceeds TUI-labeled by 3× over the prior minor-release cycle, AND TUI-tagged issues older than 90 days are >30% of open TUI issues (= maintenance debt accumulating without resolution).
 
@@ -53,7 +53,7 @@ Specifically:
 6. **Deprecation process when triggered.**
    - v0.X release notes announce planned deprecation in v0.(X+2).
    - v0.(X+1) prints a launch-time warning when the TUI starts: *"BASTION TUI scheduled for removal in v0.(X+2). MCP adapter and Grafana remain. See <link>."*
-   - v0.(X+2) removes the TUI package; `bastion dashboard` returns a clear "removed; see <link>" message.
+   - v0.(X+2) removes the TUI package; `bastion-dashboard` returns a clear "removed; see <link>" message.
 
 7. **Earliest possible deprecation: v0.7.** v0.5 ships instrumentation. v0.6 collects first full release cycle. v0.7 could in principle trigger if (a) AND (b/c) hold AND v0.5 also showed the trend. This is intentionally slow — TUI removal is a one-way door.
 
@@ -102,7 +102,7 @@ Code changes in v0.5:
 
 GitHub label conventions for signal (b): `area:tui`, `area:mcp` (or `area:adapter`). Existing labels are insufficient — add at v0.5 ship.
 
-Privacy: `tui_session_start` events stay local in BASTION's audit log. No telemetry is sent off-host. Operators read their own aggregates via `bastion audit`.
+Privacy: `tui_session_start` events stay local in BASTION's audit log. No telemetry is sent off-host. Operators read their own aggregates via a planned `bastion audit` subcommand.
 
 ## References
 

@@ -1,6 +1,6 @@
 # bastion-client
 
-Python client library for the [BASTION](https://github.com/cia-labs/BASTION) GPU/LLM broker.
+Python client library for the [BASTION](https://github.com/cypwin/bastion) GPU/LLM broker.
 
 ## Installation
 
@@ -8,8 +8,9 @@ Python client library for the [BASTION](https://github.com/cia-labs/BASTION) GPU
 > ```
 > cd clients/bastion-client && pip install -e .
 > ```
-> Examples in the top-level `examples/` directory use `httpx` directly to avoid
-> this local-install step.
+> The Python examples in the top-level `examples/` directory
+> (`python-client/`, `priority-tiers/`) `import bastion_client`, so they
+> require this local `pip install -e .` step.
 
 ## Quick start
 
@@ -32,4 +33,4 @@ asyncio.run(main())
 ## Requirements
 
 - Python 3.11+
-- BASTION running on `http://127.0.0.1:11434` (or set `BASTION_URL`)
+- BASTION running on `http://127.0.0.1:11434`

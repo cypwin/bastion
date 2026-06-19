@@ -8,7 +8,8 @@ This directory contains `.example` templates for running BASTION as a systemd se
 
    | Placeholder           | Description                              | Example                                    |
    |-----------------------|------------------------------------------|--------------------------------------------|
-   | `<USER>`              | Linux user running BASTION               | `john`                                     |
+   | `<RUN_USER>`          | Linux user the bastion.service unit runs as | `john`                                  |
+   | `<USER>`              | Linux user granted sudoers systemctl access | `john`                                  |
    | `<BASTION_DIR>`       | Absolute path to BASTION project root    | `/home/john/bastion`                       |
    | `<PYTHON_PATH>`       | Absolute path to Python binary           | `/home/john/miniconda3/envs/ml/bin/python` |
    | `<POWER_LIMIT_WATTS>` | GPU power cap in watts                   | `425`                                      |

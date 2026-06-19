@@ -109,11 +109,13 @@ BASTION uses a multi-layer VRAM management strategy to prevent overcommit and cr
 
 ```
 Total VRAM:     32 GB (example — adjust for your GPU)
-Headroom:       -8 GB (OS, display, CUDA overhead, KV cache)
+Headroom:       -3.5 GB (OS, display, CUDA overhead, KV cache)
                 ------
-Usable budget:  24 GB (gpu.max_vram_gb = total - headroom)
+Usable budget:  28.5 GB (max_vram_gb, computed = total - headroom)
 Safety margin:  10% of total (VRAMManager)
 ```
+
+`max_vram_gb` is a computed property (`total_vram_gb - headroom_gb`), not a settable config key — tune the budget via `gpu.total_vram_gb` and `gpu.headroom_gb`. The values above match the shipped `config/broker.yaml` (`headroom_gb: 3.5`); the model-level default headroom is 6.0 GB (→ 26 GB usable).
 
 ### Data Sources
 

@@ -1,7 +1,7 @@
 # Implementation Plan: BASTION Observability-First Enhancement
 
 **Design Spec**: `docs/design/specs/2026-03-13-observability-first-design.md`
-**Audit Source**: `docs/audit/SYNTHESIS.md`
+**Audit Source**: internal audit (source not committed)
 **Workflow**: Implement -> Test -> Commit -> Q&A -> Plan next -> Context clear -> Repeat
 
 ---

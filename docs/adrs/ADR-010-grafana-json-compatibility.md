@@ -3,7 +3,7 @@
 **Status:** Accepted (v0.5 ship-blocker for any `dashboards/grafana/*.json`)
 **Date:** 2026-05-19
 **Deciders:** S122 maintainer with reference to S122 plan-C design review
-**Related:** `_archive/sessions/S122/vision-A-E-retro-20260519-1519/round_4_synthesis/FINAL_RECOMMENDATION.md` Step 5 + adversarial-failure-mode-auditor dissent
+**Related:** S122 plan-C vision-council retro Step 5 + adversarial-failure-mode-auditor dissent (internal artifact, archived)
 
 ## Context
 

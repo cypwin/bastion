@@ -112,7 +112,7 @@ curl http://localhost:11434/broker/status
 **Response:**
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.5.0a1",
   "uptime_seconds": 3600.0,
   "queue_depth": 2,
   "queue_by_model": {"model-a": 1, "model-b": 1},
@@ -379,7 +379,7 @@ curl http://localhost:11434/broker/version
 **Response:**
 ```json
 {
-  "version": "0.4.0",
+  "version": "0.5.0a1",
   "git_sha": "a93d40ad94f30523c9c92337decaaee3de32c83a",
   "boot_time_unix": 1780300800.0,
   "boot_time_iso": "2026-06-11T20:00:00+00:00"
@@ -618,11 +618,16 @@ curl http://localhost:11434/.well-known/agent-card.json
 {
   "name": "BASTION GPU Inference Broker",
   "description": "GPU inference broker with scheduling, batching, and model management",
-  "version": "0.1.0",
+  "version": "0.5.0a1",
   "serviceEndpoint": "http://localhost:11434/a2a",
   "protocolVersion": "0.1",
   "capabilities": {"streaming": true, "pushNotifications": false},
-  "skills": ["text-generation", "embeddings"],
+  "skills": [
+    {"id": "infer", "name": "Single Prompt Inference"},
+    {"id": "batch_infer", "name": "Batch Inference"},
+    {"id": "preload", "name": "Preload Model"},
+    {"id": "status", "name": "Broker Status"}
+  ],
   "securitySchemes": {
     "BearerToken": {"type": "http", "scheme": "bearer"}
   },

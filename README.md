@@ -125,7 +125,7 @@ ollama run llama3.1:8b "Hello, world!"    # Transparent proxy
   unchanged. Cooldown periods between model transitions and swap-rate limiting
   provide additional protection.
 
-- **17-panel TUI dashboard** -- real-time Textual dashboard showing GPU
+- **19-panel TUI dashboard** -- real-time Textual dashboard showing GPU
   thermals, VRAM usage, queue depth, scheduler state, A2A tasks, leases, audit
   events, and more.
 

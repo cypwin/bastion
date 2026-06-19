@@ -15,8 +15,8 @@ Severity legend:
   matters but doesn't crash anything.
 - **Minor** — debuggability, hygiene, or undocumented invariant.
 
-Fixes for the **Critical** items below should land in v0.4.1; the
-remainder can be folded into v0.5 work.
+The Critical items below shipped in v0.4.1; remaining work folded into
+the v0.5.0a1 pre-release.
 
 ---
 
@@ -62,7 +62,7 @@ _(none open — see "Resolved in v0.4.1" below)_
 
 ### `_dispatch_error_cleanup` sets grant events without distinguishing failure from grant
 
-- **Location:** `src/bastion/server.py:351-363`
+- **Location:** `src/bastion/server.py:1279-1291`
 - **Problem:** Same bug class as the swept-request issue resolved in v0.5
   (see below): when dispatch fails, `_dispatch_error_cleanup` pops and sets
   the grant event with no marker, so the waiting proxy handler treats the
@@ -106,10 +106,9 @@ _(none open — see "Resolved in v0.4.1" below)_
 
 ---
 
-## Resolved in v0.5 (unreleased)
+## Resolved in v0.5.0a1
 
-> Fixed on main after the v0.4.1 tag; these items live under `[Unreleased]`
-> in `CHANGELOG.md` until v0.5 is cut.
+> Shipped in the [0.5.0a1] pre-release (2026-06-19); see `CHANGELOG.md`.
 
 ### `_queue_sweep_loop` grants events for swept requests without distinguishing them
 
@@ -195,12 +194,11 @@ _(none open — see "Resolved in v0.4.1" below)_
 
 ## Resolved in v0.4.1
 
-> v0.4.1 is the upcoming release: these items live under `[Unreleased]`
-> in `CHANGELOG.md` until it is tagged.
+> Shipped in v0.4.1 (tagged 2026-06-12); see the [0.4.1] section of `CHANGELOG.md`.
 
 ### `VRAMTracker.get_loaded_models()` returns `[]` indistinguishable from "no models loaded"
 
-- **Was:** `src/bastion/vram.py:133-135` returned `[]` on any HTTP exception,
+- **Was:** `get_loaded_models()` previously returned `[]` on any HTTP exception,
   so every downstream consumer treated transient `/api/ps` failures as "VRAM
   is free" — exactly the misclassification that approved a second 31B load on
   top of an unflushed one during a rapid redeploy burst and crashed the

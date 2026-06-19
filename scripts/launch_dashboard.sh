@@ -51,9 +51,7 @@ if ! command -v python &>/dev/null; then
     for _py_candidate in \
         "$HOME/miniforge3/envs/bastion/bin/python" \
         "$HOME/miniconda3/envs/bastion/bin/python" \
-        "$HOME/anaconda3/envs/bastion/bin/python" \
-        "$HOME/miniforge3/envs/bastion/bin/python" \
-        "$HOME/miniconda3/envs/bastion/bin/python"; do
+        "$HOME/anaconda3/envs/bastion/bin/python"; do
         if [ -x "$_py_candidate" ]; then
             export PATH="$(dirname "$_py_candidate"):$PATH"
             echo "[..] Using Python: $_py_candidate"

@@ -3,7 +3,7 @@
 **Status:** Accepted (gates `bastion/mcp_adapter.py` v0.5 ship)
 **Date:** 2026-05-19
 **Deciders:** S122 maintainer with reference to S122 plan-C design review
-**Related:** ADR-006 (auth), ADR-005 (BastionPanel contract), `_archive/sessions/S122/vision-A-E-retro-20260519-1519/round_4_synthesis/FINAL_RECOMMENDATION.md` Step 3
+**Related:** ADR-006 (auth), ADR-005 (BastionPanel contract); S122 plan-C vision-council retro Step 3 (internal artifact, archived)
 
 ## Context
 
@@ -98,7 +98,7 @@ Code surfaces (v0.5):
 - `src/bastion/mcp_adapter/schemas/broker_status_v1.json` — JSON Schema files committed to repo.
 - `tests/mcp_adapter/test_*.py` — for each tool: roundtrip against a fake broker; schema validation; missing-broker error path; auth failure path.
 
-Adapter packaging: separate optional install `bastion[mcp]` so the base broker install doesn't pull `mcp` SDK. Documented in `docs/getting-started.md` Vision-D section.
+Adapter packaging: separate optional install `bastion[mcp]` so the base broker install doesn't pull `mcp` SDK. The adapter is a not-yet-shipped v0.5 proposal, to be documented in `docs/getting-started.md` when the adapter ships.
 
 Adapter startup: refuses to start without a bearer token (per ADR-006). Loopback-only by default; non-loopback bind requires auth-gated.
 
@@ -121,6 +121,6 @@ Naming: `broker_<resource>_v<N>` snake-case. Tool description always carries `(v
 ## References
 
 - S122 plan-C council Step 3 — MCP tool manifest.
-- `_archive/sessions/S122/vision-A-E-retro-20260519-1519/round_4_synthesis/FINAL_RECOMMENDATION.md` Step 3.
+- S122 plan-C vision-council retro Step 3 (internal artifact, archived).
 - ADR-006 (auth) — adapter uses the same bearer token; no separate auth surface.
 - MCP spec — tool definition format (JSON Schema for input/output, name uniqueness).

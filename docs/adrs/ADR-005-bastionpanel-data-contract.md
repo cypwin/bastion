@@ -3,7 +3,7 @@
 **Status:** Accepted (v0.3 scope)
 **Date:** 2026-05-14
 **Deciders:** S122 maintainer with reference to S121 design review
-**Related:** `docs/design/specs/2026-05-14-dashboard-v0.4-vision-c.md`, `_archive/sessions/S121/vision-council/round_4_synthesis/FINAL_RECOMMENDATION.md` §4 (Synthesizer dissent)
+**Related:** `docs/design/specs/2026-05-14-dashboard-v0.4-vision-c.md`; design-council synthesizer dissent §4 (internal artifact, archived)
 
 ## Context
 

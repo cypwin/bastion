@@ -4,7 +4,7 @@
 **Status**: Draft (post-review revision 1)
 **Reviewed by**: Spec reviewer agent (Opus 4.6) — 3 CRITICAL, 5 HIGH findings addressed below
 **Origin**: Comprehensive audit by 11 specialist agents (3 scouts + 8 analysts)
-**Synthesis**: `docs/audit/SYNTHESIS.md` (164 findings, 633 lines)
+**Synthesis**: internal audit (164 findings; source not committed)
 
 ---
 

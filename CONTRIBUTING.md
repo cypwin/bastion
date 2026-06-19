@@ -151,7 +151,7 @@ src/bastion/
 ├── auth.py           # API key + bearer token auth
 ├── circuitbreaker.py # Three-state circuit breaker
 ├── config.py         # YAML config loader
-├── dashboard.py      # Textual TUI dashboard
+├── dashboard/         # Textual TUI dashboard package (app, client, collectors, panels_*, modals, statusbar, widgets)
 ├── health.py         # GPU health queries (nvidia-smi)
 ├── metrics.py        # Prometheus metrics (no-op fallback)
 ├── middleware.py      # FastAPI request metrics middleware

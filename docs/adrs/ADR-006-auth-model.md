@@ -3,7 +3,7 @@
 **Status:** Accepted (v0.5 milestone gate)
 **Date:** 2026-05-19
 **Deciders:** S122 maintainer with reference to S122 plan-C design review
-**Related:** `_archive/sessions/S122/vision-A-E-retro-20260519-1519/round_4_synthesis/FINAL_RECOMMENDATION.md` Step 2 + dissent log (security-deployment-reviewer); `docs/security.md`; planned `bastion/mcp_adapter.py` (ADR-007)
+**Related:** S122 plan-C vision-council retro Step 2 + dissent log (security-deployment-reviewer) (internal artifact, archived); `docs/security.md`; planned `bastion/mcp_adapter.py` (ADR-007)
 
 ## Context
 
@@ -11,9 +11,9 @@ The S122 plan-C design review (2026-05-19) declared auth-on-by-default a **v0.5 
 
 BASTION today:
 
-- `verify_admin` and `verify_a2a` exist in `src/bastion/auth.py` and are wired into the FastAPI routers (`server.py:787`, `:1573`) via `Depends(...)`.
+- `make_admin_key_dependency`/`make_a2a_token_dependency` in `src/bastion/auth.py` produce the `verify_admin`/`verify_a2a` dependencies wired into the FastAPI routers in `server.py` via `Depends(...)`.
 - The default config disables auth (`auth.enabled: false`). Operators must explicitly enable it.
-- `action_service_restart` (`dashboard/app.py:880`) shells out to `sudo -n systemctl restart bastion.service` — bypassing the auth layer entirely.
+- `action_service_restart` (`dashboard/app.py:997`) shells out to `sudo -n systemctl restart bastion.service` — bypassing the auth layer entirely.
 - Vision D (MCP adapter, planned per S122 council Step 3) will expose `/broker/control/*` over an MCP transport that may or may not run on localhost.
 
 The decision: what auth model gates v0.5? Three credible options:
@@ -86,7 +86,7 @@ Code surfaces touched in v0.5:
 - `src/bastion/auth.py` — extend `verify_admin`/`verify_a2a` to read `Authorization: Bearer` first.
 - `src/bastion/__main__.py` — add `init` subcommand; refuse non-loopback bind without auth.
 - `src/bastion/paths.py` — new helper `token_path()` returning `${XDG_CONFIG_HOME:-~/.config}/bastion/token`.
-- `src/bastion/dashboard/app.py:880` — `action_service_restart` rewritten to POST `/broker/control/restart` (or invoke DBus, depending on systemd implementation). Sudo path deleted.
+- `src/bastion/dashboard/app.py:997` — `action_service_restart` rewritten to POST `/broker/control/restart` (or invoke DBus, depending on systemd implementation). Sudo path deleted.
 - `src/bastion/server.py` — new `POST /broker/control/restart` endpoint (Call-7 from S121 design review); admin-auth-gated; auditable; returns `202 Accepted`.
 - `config/broker.yaml` — `auth.enabled: false` default unchanged; new `auth.token_path:` defaults to `${XDG_CONFIG_HOME:-~/.config}/bastion/token`; new `auth.lockout:` block.
 - `docs/security.md` — full rewrite of auth section to reflect new defaults.

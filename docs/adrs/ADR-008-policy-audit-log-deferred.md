@@ -3,7 +3,7 @@
 **Status:** Proposed → Deferred (no v0.5 implementation)
 **Date:** 2026-05-19
 **Deciders:** S122 maintainer with reference to S122 plan-C design review
-**Related:** ADR-007 (MCP adapter — Vision A "emerges as AI-client behavior"); `_archive/sessions/S122/vision-A-E-retro-20260519-1519/round_4_synthesis/FINAL_RECOMMENDATION.md` Step 3 + adversarial-failure-mode-auditor dissent
+**Related:** ADR-007 (MCP adapter — Vision A "emerges as AI-client behavior"); S122 plan-C vision-council retro Step 3 + adversarial-failure-mode-auditor dissent (internal artifact, archived)
 
 ## Context
 
@@ -49,7 +49,7 @@ Concretely:
 - No `policy.py` module is built in v0.5. The council's recommendation (Vision A as AI-client behavior) is honored without additional infrastructure.
 - The audit subsystem gains one optional `source` field and one optional `mcp_caller_id` field. Backwards-compatible; existing audit consumers ignore unknown fields.
 - A Vision-A-style "decision log" UI is implementable today by filtering `audit_event` where `source == "mcp_adapter"` — no new event type needed.
-- Operators wanting "show me what the AI client decided this hour" run `bastion audit --source mcp_adapter --since 1h` (new CLI flag in v0.5).
+- Operators wanting "show me what the AI client decided this hour" would run a planned `bastion audit --source mcp_adapter --since 1h` subcommand (proposed for v0.5; not yet implemented).
 
 **Rejected risk:**
 
@@ -79,7 +79,7 @@ Code changes in v0.5:
 
 - `src/bastion/audit.py` — add optional `source: str` and `mcp_caller_id: str` fields to `audit_event`. Existing constructors continue to work; new fields default to `None`.
 - `src/bastion/mcp_adapter/__init__.py` — when handling a tool call, write an `audit_event` with `source="mcp_adapter"` before invoking the broker HTTP API and again after (success/failure).
-- `src/bastion/__main__.py` — `bastion audit` subcommand gains `--source` filter.
+- `src/bastion/__main__.py` — a planned `bastion audit` subcommand gains a `--source` filter.
 - Test: ADR-006-style flow (init token → MCP client → tool call) produces exactly one audit entry with the expected source.
 
 No schema versioning needed since the change is purely additive.

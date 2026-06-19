@@ -39,15 +39,15 @@ BASTION addresses GPU crash prevention through four complementary layers:
 
 ### 1. use_mmap:false Injection
 
-Every request that passes through BASTION has `use_mmap: false` injected into the `options` dictionary, regardless of what the client specified. This is implemented in the proxy layer and applies to all Ollama API calls (`/api/generate`, `/api/chat`, `/api/embed`).
+A request that does not already specify `use_mmap` gets `use_mmap: false` injected into the `options` dictionary (when the shipped `request_overrides.use_mmap=false` default applies); a client that explicitly sets `use_mmap` is left as-is. This is implemented in the proxy layer and applies to all Ollama API calls (`/api/generate`, `/api/chat`, `/api/embed`).
 
 This eliminates the PCIe DMA power transients that are the primary crash trigger. With mmap disabled, model loading uses sequential reads instead of demand-paged DMA, producing a smooth and predictable power draw.
 
-Clients do not need to cooperate -- the injection is transparent and unconditional.
+Clients do not need to cooperate -- the injection is transparent for any request that does not already set `use_mmap`.
 
 ### 2. VRAM Budget Enforcement
 
-BASTION maintains a VRAM budget (configurable via `gpu.max_vram_gb`) that reserves headroom for OS overhead, display, CUDA runtime, and KV cache growth. The VRAMManager uses an assume/confirm/forget pattern to eliminate TOCTOU races:
+BASTION maintains a VRAM budget (derived from `gpu.total_vram_gb` minus `gpu.headroom_gb`) that reserves headroom for OS overhead, display, CUDA runtime, and KV cache growth. The VRAMManager uses an assume/confirm/forget pattern to eliminate TOCTOU races:
 
 - **Reserve**: Deduct estimated VRAM atomically before starting an async model load
 - **Confirm**: Mark the reservation as allocated after successful load

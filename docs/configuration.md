@@ -239,11 +239,16 @@ session up front:
 ```yaml
 session_profiles:
   council_run:
-    models: ["llama3.1:8b", "qwen2.5:7b", "gemma2:9b"]
-    total_requests: 30
-    peak_concurrency: 3
-    duration_seconds: 600
+    model_sequence: ["llama3.1:8b", "qwen2.5:7b", "gemma2:9b"]
+    default_priority: "interactive"
+    description: "Multi-model council deliberation"
 ```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `model_sequence` | list[str] | required | Ordered list of models used in this pipeline |
+| `default_priority` | PriorityTier | `agent` | Priority tier for requests in this profile (`interactive` / `agent` / `pipeline` / `background`) |
+| `description` | str | `""` | Human-readable description |
 
 See `docs/api.md` (`POST /broker/intent`) for runtime usage.
 

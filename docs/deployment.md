@@ -95,10 +95,24 @@ dashboard, automatically starting Ollama and BASTION if needed.
 
 4. **Install the desktop shortcut:**
 
+   Create a `.desktop` entry that launches the dashboard via
+   `scripts/launch_dashboard.sh`:
+
    ```bash
-   cp ~/BASTION/scripts/bastion-dashboard.desktop ~/Desktop/
-   # Or for all users:
-   cp ~/BASTION/scripts/bastion-dashboard.desktop ~/.local/share/applications/
+   cat > ~/.local/share/applications/bastion-dashboard.desktop <<EOF
+   [Desktop Entry]
+   Type=Application
+   Name=BASTION Dashboard
+   Exec=bash $HOME/BASTION/scripts/launch_dashboard.sh
+   Terminal=true
+   Categories=Utility;
+   EOF
+   ```
+
+   Or skip the entry and launch the dashboard directly:
+
+   ```bash
+   bash ~/BASTION/scripts/launch_dashboard.sh
    ```
 
 5. **(Optional) Passwordless sudo** for fully hands-off launches after reboot:

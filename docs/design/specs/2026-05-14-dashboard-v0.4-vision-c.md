@@ -2,10 +2,8 @@
 
 **Date:** 2026-05-14 (amended 2026-05-15 with council corrections from plan review)
 **Status:** Draft (codifies WT-D-01 council pick)
-**Origin:** multi-lens design council design review, 2026-05-14 — 8 lenses × R0/R1/R4. Final recommendation archived at `_archive/sessions/S121/vision-council/round_4_synthesis/FINAL_RECOMMENDATION.md`.
-**Companion:** `_archive/sessions/S121/vision-council/round_4_synthesis/decision_dag.json` (17 decision nodes).
+**Origin:** multi-lens design council, 2026-05-14.
 **Supersedes:** §4 vision-pick decision in `tmp_S121_PLAN.md`. Does not modify Phase A/B/C of that plan.
-**Implementation plan:** `docs/design/plans/2026-05-15-dashboard-v0.4-vision-c.md` (4-lens plan review, 2026-05-15).
 
 ---
 
@@ -133,7 +131,7 @@ Re-validation criteria for the vision pick after v0.4 ships.
 
 ## Dissent Log
 
-Recorded for posterity; see `_archive/sessions/S121/vision-council/round_4_synthesis/FINAL_RECOMMENDATION.md` §4 for the full quotes.
+Recorded for posterity.
 
 - **CC** would ship Vision B as primary; argues C is a free dividend of B's API surface.
 - **SYN** would ship E-scoped (headless refactor + B); flags BastionPanel subscriber pattern as the pivot.

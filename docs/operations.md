@@ -131,10 +131,10 @@ curl -X POST http://localhost:11434/broker/drain
 curl -s http://localhost:11434/broker/status | python -m json.tool | grep state
 
 # Exit drain mode (resume accepting requests)
-curl -X POST http://localhost:11434/broker/drain
+curl -X POST http://localhost:11434/broker/resume
 ```
 
-Drain mode is a toggle -- POST again to exit.
+To exit drain mode, POST to `/broker/resume` (drain is not a toggle).
 
 ### Preloading Models
 
