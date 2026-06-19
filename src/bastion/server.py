@@ -18,6 +18,7 @@ Scheduler integration:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -40,10 +41,22 @@ from bastion.auth import make_a2a_token_dependency, make_admin_key_dependency
 from bastion.circuitbreaker import CircuitBreakerTransport
 from bastion.health import check_gpu_safe, query_gpu_status
 from bastion.latency_aggregator import aggregate_latency
+from bastion.correlation import (
+    ContentionEventDetector,
+    CorrelationEngine,
+    build_thermal_coupling,
+    compute_risk_index,
+    enrich_stall_reason,
+)
 from bastion.metrics import (
     CONTENT_TYPE_LATEST,
     PROMETHEUS_AVAILABLE,
     get_metrics_text,
+    record_contention_event,
+    record_risk_dominant_factor,
+    update_risk_index,
+    update_thermal_coupling_active,
+    update_thermal_headroom_celsius,
     update_vram_ledger_drift,
 )
 from bastion.middleware import MetricsMiddleware
@@ -58,6 +71,7 @@ from bastion.models import (
     BlockDeviceIOStats,
     CatalogEntry,
     ContentionSnapshot,
+    CorrelationState,
     GPUExtendedStatus,
     GPUStatus,
     InferenceThroughputState,
@@ -231,6 +245,16 @@ _system_collector: Any | None = None
 # only the latest assembled ProcessSnapshot for the endpoint. TUI + JSON only —
 # never a Prometheus label. None until the first tick runs.
 _process_snapshot_latest: ProcessSnapshot | None = None
+# Correlation engine + discrete-contention detector (observability spec Section 6).
+# Both are in-memory + bounded (ring maxlen=512, contention deque maxlen=50). The
+# engine is PASSIVE: it consumes the MachineSnapshot the loop already assembled
+# (pull, never push) and owns no background task — its tick() runs at the end of
+# each _collect_machine_snapshot pass. Instantiated in lifespan AFTER
+# scheduler/vram_tracker/vram_manager are built and BEFORE the snapshot loop
+# starts; deps are scheduler/vram only (NOT _a2a_handler, so A2A-disabled
+# deployments are fully functional, spec 6.6).
+_correlation_engine: CorrelationEngine | None = None
+_contention_detector: ContentionEventDetector | None = None
 
 
 def _get_system_collector() -> Any:
@@ -473,8 +497,10 @@ async def _collect_machine_snapshot(tick: int) -> MachineSnapshot:
     ``gpu_extended`` leg (throttle/PCIe/Xid via the backend) and the VRAM
     ledger-drift gauge; the most recent ``gpu_extended`` is cached in
     ``_gpu_extended_latest`` and reattached on the intervening fast ticks, so
-    the 2s path never blocks on 30s-stale subprocess work. ``process`` and
-    ``correlation`` remain ``None`` (wired in later phases).
+    the 2s path never blocks on 30s-stale subprocess work. After assembly the
+    correlation engine ticks on the snapshot (spec 6.6) and the synthesized
+    ``correlation`` leg (RiskIndex / thermal coupling / contention events /
+    enriched stall / ring tail) is folded back in.
     """
     global _gpu_extended_latest, _process_snapshot_latest
     snapshot_ts = time.time()
@@ -511,7 +537,7 @@ async def _collect_machine_snapshot(tick: int) -> MachineSnapshot:
         # non-NVIDIA) or no VRAMManager is configured.
         await _emit_vram_ledger_drift(gpu)
 
-    return MachineSnapshot(
+    snapshot = MachineSnapshot(
         snapshot_ts=snapshot_ts,
         broker=broker,
         gpu=gpu,
@@ -521,6 +547,217 @@ async def _collect_machine_snapshot(tick: int) -> MachineSnapshot:
         inference=inference,
         correlation=None,
     )
+
+    # Tick the correlation engine on the just-assembled snapshot (pull, never
+    # push — spec 6.6: tick at the END of the iteration, consuming the snapshot
+    # the loop built) and fold the synthesized CorrelationState back in. Wrapped
+    # so a correlation failure never kills the snapshot tick (Constraint #4).
+    try:
+        snapshot.correlation = await _collect_correlation_state(snapshot)
+    except Exception:
+        logger.debug("correlation leg failed; leaving correlation=None", exc_info=True)
+
+    return snapshot
+
+
+def _correlation_config():
+    """Return the active ``CorrelationConfig`` (defaults when unconfigured)."""
+    if _config is not None:
+        return _config.observability.correlation
+    from bastion.models import CorrelationConfig
+
+    return CorrelationConfig()
+
+
+async def _vram_utilization_pct() -> float | None:
+    """VRAM used as a percentage of the budget, or ``None`` (RiskIndex input).
+
+    Reads the in-memory ledger (``allocated + reserved`` over ``total``). Returns
+    ``None`` — never a misleading ``0`` — when no ``VRAMManager`` is configured or
+    the ledger reports a non-positive total, so the RiskIndex term is *absent*
+    rather than reading zero-risk for an unmeasured budget.
+    """
+    if _vram_manager is None:
+        return None
+    try:
+        status = await _vram_manager.status()
+    except Exception:
+        return None
+    total = status.get("total_bytes") or 0
+    if total <= 0:
+        return None
+    used = (status.get("allocated_bytes") or 0) + (status.get("reserved_bytes") or 0)
+    return max(0.0, min(100.0, (used / total) * 100.0))
+
+
+def _worst_thrashing_verdict() -> str | None:
+    """The worst verdict label across tracked agents, or ``None`` (RiskIndex input).
+
+    ``None`` when no detector is configured or no agent is tracked yet — the
+    thrashing risk term is then *absent*, not a misleading zero-risk reading.
+    """
+    if _thrashing_detector is None:
+        return None
+    try:
+        snaps = _thrashing_detector.snapshot()
+    except Exception:
+        return None
+    if not snaps:
+        return None
+    # Rank OK < WARNED < HALTED; return the worst label seen.
+    order = {"OK": 0, "WARNED": 1, "HALTED": 2}
+    worst = max(snaps, key=lambda s: order.get(str(s.verdict), 0))
+    return str(worst.verdict)
+
+
+def _read_cpu_temp_for_correlation() -> float | None:
+    """Best-effort host CPU temperature for the thermal-coupling derivation.
+
+    Sourced from the broker-side ``SystemDataCollector`` (portable hwmon
+    discovery; ``None`` when no CPU sensor exists). Never raises — a missing
+    sensor degrades the coupling to its GPU-only / present-terms-only form.
+    """
+    try:
+        collector = _get_system_collector()
+        return collector.read_cpu_temp()
+    except Exception:
+        return None
+
+
+async def _collect_correlation_state(
+    snapshot: MachineSnapshot,
+) -> CorrelationState | None:
+    """Tick the engine on ``snapshot`` and assemble the ``CorrelationState`` (6.6).
+
+    This is the single integration point (spec 6.6): it (1) ticks the passive
+    :class:`CorrelationEngine` on the already-assembled snapshot so the ring
+    ingests the four pull sources, (2) feeds the discrete
+    :class:`ContentionEventDetector` with the live stall state, (3) derives the
+    composite RiskIndex + thermal coupling from inputs already in hand, (4)
+    enriches the scheduler stall reason with live host context, and (5) emits the
+    bounded-label Prometheus metrics. Every step is individually guarded so a
+    single failure never blocks the snapshot tick (Constraint #4); a partial
+    ``CorrelationState`` (e.g. no thermal coupling on a no-GPU host) is valid.
+
+    Returns ``None`` only when the engine was never constructed (e.g. an
+    out-of-lifespan on-demand collect in a degenerate test path); the snapshot is
+    still valid with ``correlation=None``.
+    """
+    engine = _correlation_engine
+    if engine is None:
+        return None
+    cfg = _correlation_config()
+
+    # (1) Tick the engine (audit/inference cursor pulls + system/GPU/throttle
+    # edge emitters). Guarded inside tick(), but belt-and-suspenders here too.
+    try:
+        engine.tick(snapshot)
+    except Exception:
+        logger.debug("engine.tick failed", exc_info=True)
+
+    # Live scheduler stall state (the coincidence-join input + enrichment base).
+    stall_reason_base = _scheduler.stall_reason if _scheduler else ""
+    inference_stalled = bool(stall_reason_base)
+
+    # (2) Discrete contention detector — fire only on a pressure crossing that
+    # COINCIDES with a real inference stall (the moat). Emits the bounded-kind
+    # Prometheus counter on a fired event (attribution stays JSON-only).
+    if _contention_detector is not None:
+        try:
+            fired = _contention_detector.feed(
+                snapshot,
+                inference_stalled=inference_stalled,
+                stall_reason=stall_reason_base or None,
+            )
+            if fired is not None:
+                with contextlib.suppress(Exception):
+                    record_contention_event(fired.kind)
+        except Exception:
+            logger.debug("contention detector feed failed", exc_info=True)
+
+    # (3a) Thermal coupling (CPU/GPU temps, fan, headroom). All inputs None-
+    # tolerant; a no-GPU host yields the CPU-only / present-terms form.
+    thermal = None
+    try:
+        gpu_max = _config.gpu.max_temperature_c if _config is not None else None
+        thermal = build_thermal_coupling(
+            cpu_temp_c=_read_cpu_temp_for_correlation(),
+            gpu_temp_c=snapshot.gpu.temperature_c if snapshot.gpu else None,
+            fan_speed_pct=snapshot.gpu.fan_speed_pct if snapshot.gpu else None,
+            gpu_max_temperature_c=gpu_max,
+            config=cfg,
+        )
+    except Exception:
+        logger.debug("thermal coupling build failed", exc_info=True)
+
+    # (3b) Composite RiskIndex — each component degrades independently (None =
+    # absent term, never a misleading zero-risk).
+    risk = None
+    try:
+        mem_psi = (
+            snapshot.contention.psi_mem_some_avg10
+            if snapshot.contention is not None
+            else None
+        )
+        risk = compute_risk_index(
+            vram_utilization_pct=await _vram_utilization_pct(),
+            thermal_headroom_c=(
+                thermal.thermal_headroom_min_c if thermal is not None else None
+            ),
+            swap_rate_level=_scheduler._swap_rate_level if _scheduler else None,
+            thrashing_verdict=_worst_thrashing_verdict(),
+            memory_psi=mem_psi,
+            config=cfg,
+        )
+    except Exception:
+        logger.debug("risk index compute failed", exc_info=True)
+
+    # (4) Enrich the stall reason with live host context (additive; None-omitting).
+    enriched_stall = enrich_stall_reason(stall_reason_base or None, snapshot)
+
+    # (5) Emit the bounded-label Prometheus metrics. Each guarded; the thermal-
+    # headroom gauge is SKIPPED (never 0) when no headroom term is computable.
+    _emit_correlation_metrics(risk, thermal)
+
+    detector = _contention_detector
+    recent_contentions = (
+        list(detector.recent_contentions) if detector is not None else []
+    )
+    tail_n = getattr(cfg, "ring_tail_in_snapshot", 32)
+    return CorrelationState(
+        risk_index=risk,
+        thermal_coupling=thermal,
+        recent_contentions=recent_contentions,
+        enriched_stall_reason=enriched_stall,
+        ring_size=len(engine.ring),
+        recent_ring_events=engine.ring.tail(tail_n),
+    )
+
+
+def _emit_correlation_metrics(risk, thermal) -> None:
+    """Publish the five bounded-label correlation metrics (spec 6.3/6.4/6.5 / 7).
+
+    Bounded labels only (Constraint #2): the risk gauge + thermal gauges are
+    label-less; the dominant-factor counter uses the 5-name ``factor`` enum.
+    Process attribution never reaches Prometheus. Guarded individually; the
+    thermal-headroom gauge is SKIPPED — never set to ``0`` — when no headroom
+    term is computable, so a no-GPU + no-CPU-sensor host does not falsely report
+    zero headroom.
+    """
+    try:
+        if risk is not None:
+            update_risk_index(risk.score)
+            if risk.dominant_factor:
+                record_risk_dominant_factor(risk.dominant_factor)
+    except Exception:
+        logger.debug("risk metric emit failed", exc_info=True)
+    try:
+        if thermal is not None:
+            update_thermal_coupling_active(bool(thermal.coupling_active))
+            if thermal.thermal_headroom_min_c is not None:
+                update_thermal_headroom_celsius(thermal.thermal_headroom_min_c)
+    except Exception:
+        logger.debug("thermal metric emit failed", exc_info=True)
 
 
 async def _emit_vram_ledger_drift(gpu: GPUStatus) -> None:
@@ -589,7 +826,9 @@ async def _handle_snapshot(request: Request) -> Any:
     the collection loop has not produced one yet (e.g. immediately after
     startup), it collects one on demand so the endpoint never 404s or returns
     an empty body before the first tick. ``?history=N`` returns the last N
-    snapshots (newest first), capped at the deque length.
+    snapshots (newest first), capped at the deque length. ``?include_ring=true``
+    expands the full correlation ring into ``correlation.recent_ring_events``
+    (debug surface, spec 6.1) instead of the default bounded tail.
     """
     history_raw = request.query_params.get("history")
     if history_raw is not None:
@@ -603,11 +842,40 @@ async def _handle_snapshot(request: Request) -> Any:
             items = [(await _collect_machine_snapshot(0)).model_dump()]
         return JSONResponse({"snapshots": items, "count": len(items)})
 
+    include_ring = request.query_params.get("include_ring", "").lower() in (
+        "1", "true", "yes",
+    )
     if _machine_snapshot_deque:
-        return JSONResponse(_machine_snapshot_deque[0])
-    # No tick has landed yet — collect one on demand.
-    snap = await _collect_machine_snapshot(0)
-    return JSONResponse(snap.model_dump())
+        body = _machine_snapshot_deque[0]
+    else:
+        # No tick has landed yet — collect one on demand.
+        body = (await _collect_machine_snapshot(0)).model_dump()
+    if include_ring:
+        body = _expand_full_ring(body)
+    return JSONResponse(body)
+
+
+def _expand_full_ring(body: dict) -> dict:
+    """Return a copy of ``body`` with the FULL correlation ring (6.1 debug).
+
+    The snapshot deque stores only the bounded ring tail; ``?include_ring=true``
+    swaps in the entire ring from the live engine. Degrades to the unchanged body
+    when the engine is absent or the correlation leg is missing — never an error.
+    """
+    engine = _correlation_engine
+    corr = body.get("correlation")
+    if engine is None or not isinstance(corr, dict):
+        return body
+    try:
+        full = [ev.model_dump() for ev in engine.ring]
+    except Exception:
+        return body
+    out = dict(body)
+    out_corr = dict(corr)
+    out_corr["recent_ring_events"] = full
+    out_corr["ring_size"] = len(full)
+    out["correlation"] = out_corr
+    return out
 
 
 async def _handle_contention(request: Request) -> Any:
@@ -666,6 +934,57 @@ async def _handle_processes(request: Request) -> Any:
     if snap is None:
         return JSONResponse(ProcessSnapshot(collected_at=time.time()).model_dump())
     return JSONResponse(snap.model_dump())
+
+
+def _latest_correlation_dict() -> dict | None:
+    """Return the ``correlation`` leg of the most recent snapshot, or ``None``."""
+    if _machine_snapshot_deque:
+        corr = _machine_snapshot_deque[0].get("correlation")
+        if corr is not None:
+            return corr
+    return None
+
+
+async def _handle_correlation_risk(request: Request) -> Any:
+    """Standalone handler for ``GET /broker/correlation/risk`` (dual-registered).
+
+    Surfaces the composite RiskIndex + CPU<->GPU thermal coupling (spec 6.4/6.5)
+    from the correlation leg of the most recent ``MachineSnapshot``. If no tick
+    has produced one yet it collects a snapshot on demand so the endpoint never
+    404s before the first collection. Both inner fields may legitimately be
+    ``None`` (no GPU / no recent risk inputs) — a partial body, never an error.
+    """
+    corr = _latest_correlation_dict()
+    if corr is None:
+        # No tick has landed yet — collect one on demand (also ticks the engine).
+        with contextlib.suppress(Exception):
+            snap = await _collect_machine_snapshot(0)
+            corr = snap.correlation.model_dump() if snap.correlation else None
+    if corr is None:
+        # Engine not constructed (out-of-lifespan): empty, not a 500.
+        return JSONResponse({"risk_index": None, "thermal_coupling": None})
+    return JSONResponse(
+        {
+            "risk_index": corr.get("risk_index"),
+            "thermal_coupling": corr.get("thermal_coupling"),
+        }
+    )
+
+
+async def _handle_correlation_contentions(request: Request) -> Any:
+    """Standalone handler for ``GET /broker/correlation/contentions`` (dual-reg).
+
+    Returns the last-N discrete contention events (spec 6.3) from the detector's
+    dedicated bounded ``deque(maxlen=50)`` — kept separate from the snapshot body
+    because contention events are not in the snapshot. Returns an **empty list,
+    not a 404**, before the first coincidence fires. Attribution stays
+    category-level (it may name a device, never a process — JSON-only).
+    """
+    detector = _contention_detector
+    if detector is None:
+        return JSONResponse({"contentions": [], "count": 0})
+    events = [ev.model_dump() for ev in detector.recent_contentions]
+    return JSONResponse({"contentions": events, "count": len(events)})
 
 
 def record_recent_request(
@@ -1246,6 +1565,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         _queue_sweep_loop(ttl), name="bastion-queue-sweep"
     )
     logger.info("Queue sweep started (TTL=%.0fs, interval=60s)", ttl)
+
+    # Construct the correlation engine + discrete-contention detector AFTER the
+    # scheduler/vram_tracker/vram_manager are built and BEFORE the snapshot loop
+    # starts (spec 6.6). Deps are scheduler/vram only — NOT _a2a_handler, so an
+    # A2A-disabled deployment is fully functional. The engine is PASSIVE: its
+    # tick() runs inside _collect_machine_snapshot on the snapshot the loop
+    # already assembled (pull, never push) and it owns no background task. The
+    # inference emitter PULLS _recent_requests via this provider callable, so the
+    # record site (record_recent_request) never imports the engine.
+    global _correlation_engine, _contention_detector
+    _corr_cfg = config.observability.correlation
+    _correlation_engine = CorrelationEngine(
+        recent_requests_provider=lambda: list(_recent_requests),
+        config=_corr_cfg,
+    )
+    _contention_detector = ContentionEventDetector(config=_corr_cfg)
+    logger.info(
+        "Correlation engine started (ring maxlen=%d, contention maxlen=%d)",
+        _correlation_engine.ring.maxlen,
+        _contention_detector.recent_contentions.maxlen,
+    )
 
     # Start the broker-side machine-snapshot collection loop (observability
     # spec 4.9). The broker owns collection so /broker/snapshot works headless;
@@ -1873,6 +2213,17 @@ def create_app(config: BrokerConfig) -> FastAPI:
         "/gpu/extended", _handle_gpu_extended, methods=["GET"]
     )
     broker_router.add_api_route("/processes", _handle_processes, methods=["GET"])
+    # Correlation engine surfaces (spec 6.4/6.3/7). Ring + enriched stall are
+    # FOLDED into /broker/snapshot (no /ring or /stall endpoints); only the
+    # composite-risk and discrete-contention surfaces get their own routes.
+    broker_router.add_api_route(
+        "/correlation/risk", _handle_correlation_risk, methods=["GET"]
+    )
+    broker_router.add_api_route(
+        "/correlation/contentions",
+        _handle_correlation_contentions,
+        methods=["GET"],
+    )
 
     # ── A2A Interface Routes ────────────────────────────────────────
 
@@ -2696,6 +3047,17 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
         "/gpu/extended", _handle_gpu_extended, methods=["GET"]
     )
     broker_router.add_api_route("/processes", _handle_processes, methods=["GET"])
+    # Correlation engine surfaces (spec 6.4/6.3/7). Ring + enriched stall are
+    # FOLDED into /broker/snapshot (no /ring or /stall endpoints); only the
+    # composite-risk and discrete-contention surfaces get their own routes.
+    broker_router.add_api_route(
+        "/correlation/risk", _handle_correlation_risk, methods=["GET"]
+    )
+    broker_router.add_api_route(
+        "/correlation/contentions",
+        _handle_correlation_contentions,
+        methods=["GET"],
+    )
 
     # ── A2A Interface Routes ────────────────────────────────────────
 

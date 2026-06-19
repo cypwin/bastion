@@ -34,6 +34,7 @@ from bastion.dashboard.panels_broker import (
     ThrashingPanel,
     WatchdogPanel,
 )
+from bastion.dashboard.panels_correlation import CorrelationPanel
 from bastion.dashboard.panels_gpu import GPUPanel, ModelsPanel, VRAMLedgerPanel
 from bastion.dashboard.panels_processes import ProcessAttributionPanel
 from bastion.dashboard.panels_secondary import (
@@ -197,10 +198,17 @@ class BastionDashboard(App):
                 yield CircuitBreakerPanel(id="circuit-breaker")
                 yield ThrashingPanel(id="thrashing")
                 yield TracePanel(id="trace")
-                yield A2ATaskPanel(id="a2a-tasks")
-                yield LeasePanel(id="leases")
-                yield AuditStreamPanel(id="audit-stream")
-                yield ProcessAttributionPanel(id="processes")
+                # Secondary toggle group (spec 7.1): five panels rendered as a
+                # 3+2 two-column sub-grid so the column does not grow too tall.
+                # Shown only when [t] toggles _show_secondary in full layout.
+                with Horizontal(id="secondary-grid"):
+                    with VerticalScroll(id="secondary-col-a"):
+                        yield A2ATaskPanel(id="a2a-tasks")
+                        yield LeasePanel(id="leases")
+                        yield AuditStreamPanel(id="audit-stream")
+                    with VerticalScroll(id="secondary-col-b"):
+                        yield ProcessAttributionPanel(id="processes")
+                        yield CorrelationPanel(id="correlation")
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -228,8 +236,13 @@ class BastionDashboard(App):
         right_col = self.query_one("#right-col")
         third_col = self.query_one("#third-col")
 
-        # Secondary panels: hidden by default, shown with [t] toggle
-        secondary_ids = {"a2a-tasks", "leases", "audit-stream", "processes"}
+        # Secondary panels: hidden by default, shown with [t] toggle. Grew from
+        # 3 to 5 (spec 7.1) — `processes` + `correlation` joined — and now render
+        # as a 3+2 two-column sub-grid (`#secondary-grid`) so the third column
+        # does not become too tall.
+        secondary_ids = {
+            "a2a-tasks", "leases", "audit-stream", "processes", "correlation",
+        }
         # Always visible in full mode (trace is request history — essential)
         non_secondary_ids = {"scheduler", "watchdog", "circuit-breaker", "thrashing", "trace"}
 
@@ -244,7 +257,11 @@ class BastionDashboard(App):
             right_col.display = True
             third_col.display = True
 
-            # Toggle secondary vs non-secondary panels within third-col
+            # Toggle secondary vs non-secondary panels within third-col. The
+            # wrapping sub-grid container is toggled too so it occupies no space
+            # when the secondaries are hidden.
+            with contextlib.suppress(Exception):
+                self.query_one("#secondary-grid").display = self._show_secondary
             for panel_id in secondary_ids:
                 with contextlib.suppress(Exception):
                     self.query_one(f"#{panel_id}").display = self._show_secondary
@@ -348,7 +365,7 @@ class BastionDashboard(App):
         # Fetch supplemental data in parallel
         (
             health_data, vram_ledger, watchdog_data, queue_diag, recent,
-            counters, thrashing, processes,
+            counters, thrashing, processes, snapshot,
         ) = (
             await asyncio.gather(
                 self._client.get_health(),
@@ -359,6 +376,7 @@ class BastionDashboard(App):
                 self._client.get_counters(),
                 self._client.get_thrashing(),
                 self._client.get_processes(),
+                self._client.get_snapshot(),
                 return_exceptions=True,
             )
         )
@@ -380,6 +398,10 @@ class BastionDashboard(App):
             thrashing = {}
         if isinstance(processes, BaseException) or not processes:
             processes = self._last_process_snapshot or {}
+        # Snapshot carries the correlation leg (RiskIndex / thermal / contention
+        # / enriched stall / ring tail) — direct-accessor dict for the panel.
+        if isinstance(snapshot, BaseException) or not isinstance(snapshot, dict):
+            snapshot = {}
         # Cache the process-attribution snapshot so the ProcessAttributionPanel
         # and the GPUProcessListModal (which now reads app._last_process_snapshot
         # instead of spawning a subprocess, spec 5.3) share one fetch.
@@ -554,6 +576,17 @@ class BastionDashboard(App):
             proc_panel = self.query_one("#processes", ProcessAttributionPanel)
             proc_panel.update(
                 proc_panel.render_data(self._last_process_snapshot)
+            )
+
+        # Correlation (spec 6.x) — dict-accessor panel fed the `correlation` leg
+        # of GET /broker/snapshot (RiskIndex / thermal / contention / stall /
+        # ring tail). Tolerates an empty leg (no engine yet / no risk inputs).
+        with contextlib.suppress(Exception):
+            corr_panel = self.query_one("#correlation", CorrelationPanel)
+            corr_panel.update(
+                corr_panel.render_data(
+                    snapshot.get("correlation") if isinstance(snapshot, dict) else None
+                )
             )
 
     # ------------------------------------------------------------------
