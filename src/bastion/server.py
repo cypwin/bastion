@@ -64,6 +64,7 @@ from bastion.models import (
     IntentDeclaration,
     IntentResponse,
     MachineSnapshot,
+    ProcessSnapshot,
     XidEvent,
     PriorityTier,
     QueuedRequest,
@@ -224,6 +225,12 @@ _gpu_extended_latest: GPUExtendedStatus | None = None
 # independent cadence (spec 4.9). Instantiated lazily so the import stays cheap
 # and tests that never touch the snapshot path pay nothing.
 _system_collector: Any | None = None
+# Most-recent process-attribution snapshot (spec 5.3 / 4.5). Owned by the
+# broker-side slow tick so GET /broker/processes works headless (no TUI). The
+# collector instance holds the per-process IO / churn delta state; this caches
+# only the latest assembled ProcessSnapshot for the endpoint. TUI + JSON only —
+# never a Prometheus label. None until the first tick runs.
+_process_snapshot_latest: ProcessSnapshot | None = None
 
 
 def _get_system_collector() -> Any:
@@ -326,6 +333,26 @@ async def _collect_gpu_extended() -> GPUExtendedStatus | None:
         xid_count_since_start=xid_count,
         last_polled_at=time.time(),
     )
+
+
+async def _collect_process_snapshot(slow_tick: bool) -> ProcessSnapshot | None:
+    """Assemble the per-process attribution leg (spec 5.3 / 4.5).
+
+    Delegates to the broker-side ``SystemDataCollector.collect_process_snapshot``
+    (which owns the per-process IO/churn delta state). The collector is fully
+    graceful — a missing ``psutil`` or a wholesale scan failure yields a valid
+    (empty) ``ProcessSnapshot`` — so this only guards the call itself and the
+    config read. The GPU sub-data join (compute-apps VRAM + pmon) runs only on
+    the slow tick through the async ``GPUBackend`` seam and is empty on a
+    ``StubBackend`` / no-GPU host (no error). This data is **TUI + JSON only** —
+    never a Prometheus label (Constraint #2).
+    """
+    try:
+        collector = _get_system_collector()
+        return await collector.collect_process_snapshot(_config, slow_tick=slow_tick)
+    except Exception:
+        logger.exception("process snapshot leg failed; emitting None leg")
+        return None
 
 
 def _collect_inference_throughput() -> InferenceThroughputState | None:
@@ -449,7 +476,7 @@ async def _collect_machine_snapshot(tick: int) -> MachineSnapshot:
     the 2s path never blocks on 30s-stale subprocess work. ``process`` and
     ``correlation`` remain ``None`` (wired in later phases).
     """
-    global _gpu_extended_latest
+    global _gpu_extended_latest, _process_snapshot_latest
     snapshot_ts = time.time()
 
     try:
@@ -463,6 +490,14 @@ async def _collect_machine_snapshot(tick: int) -> MachineSnapshot:
     inference = _collect_inference_throughput()
 
     slow = _slow_tick_divisor()
+    # Process attribution: the cheap top-N / IO / watchlist legs run every fast
+    # tick; the subprocess-heavy churn + GPU-join legs run only on the slow tick
+    # (gated inside the collector by ``slow_tick``). The assembled snapshot is
+    # cached for GET /broker/processes so the endpoint works headless.
+    process = await _collect_process_snapshot(slow_tick=(tick % slow == 0))
+    if process is not None:
+        _process_snapshot_latest = process
+
     if tick % slow == 0:
         # Slow tick: refresh the subprocess-heavy GPU extended leg and cache it
         # so fast ticks reuse the latest value without re-polling.
@@ -482,7 +517,7 @@ async def _collect_machine_snapshot(tick: int) -> MachineSnapshot:
         gpu=gpu,
         gpu_extended=_gpu_extended_latest,
         contention=contention,
-        process=None,
+        process=process,
         inference=inference,
         correlation=None,
     )
@@ -613,6 +648,24 @@ async def _handle_gpu_extended(request: Request) -> Any:
     if ext is None:
         return JSONResponse(GPUExtendedStatus().model_dump())
     return JSONResponse(ext.model_dump())
+
+
+async def _handle_processes(request: Request) -> Any:
+    """Standalone handler for ``GET /broker/processes`` (dual-registered, 4.10).
+
+    Returns the most-recent ``ProcessSnapshot`` (spec 4.5) the slow tick
+    maintains. If no tick has run yet it collects one on demand (fast legs only)
+    so the endpoint returns **empty lists, not a 404**, before the first run. On
+    a ``StubBackend`` / no-GPU host ``gpu_processes`` is the correct complete
+    empty list. This is the JSON surface for the attribution data, which is
+    **TUI + JSON only** — never a Prometheus label (Constraint #2).
+    """
+    if _process_snapshot_latest is not None:
+        return JSONResponse(_process_snapshot_latest.model_dump())
+    snap = await _collect_process_snapshot(slow_tick=False)
+    if snap is None:
+        return JSONResponse(ProcessSnapshot(collected_at=time.time()).model_dump())
+    return JSONResponse(snap.model_dump())
 
 
 def record_recent_request(
@@ -1819,6 +1872,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
     broker_router.add_api_route(
         "/gpu/extended", _handle_gpu_extended, methods=["GET"]
     )
+    broker_router.add_api_route("/processes", _handle_processes, methods=["GET"])
 
     # ── A2A Interface Routes ────────────────────────────────────────
 
@@ -2641,6 +2695,7 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
     broker_router.add_api_route(
         "/gpu/extended", _handle_gpu_extended, methods=["GET"]
     )
+    broker_router.add_api_route("/processes", _handle_processes, methods=["GET"])
 
     # ── A2A Interface Routes ────────────────────────────────────────
 

@@ -108,6 +108,15 @@ class BastionClient:
         """Fetch /broker/contention for the host-pressure leg (spec 5.6)."""
         return await self._get_safe("/broker/contention", {})
 
+    async def get_processes(self) -> dict:
+        """Fetch /broker/processes for the per-process attribution (spec 5.3).
+
+        Returns the ``ProcessSnapshot`` ``model_dump()`` dict (TUI + JSON only —
+        never a Prometheus label). Follows the ``_get_safe`` pattern: returns
+        ``{}`` on any failure so the dashboard renders an empty panel.
+        """
+        return await self._get_safe("/broker/processes", {})
+
     async def post_preload(self, model: str) -> dict:
         """Preload a model via /broker/preload."""
         resp = await self._client.post(

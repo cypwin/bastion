@@ -35,6 +35,7 @@ from bastion.dashboard.panels_broker import (
     WatchdogPanel,
 )
 from bastion.dashboard.panels_gpu import GPUPanel, ModelsPanel, VRAMLedgerPanel
+from bastion.dashboard.panels_processes import ProcessAttributionPanel
 from bastion.dashboard.panels_secondary import (
     A2ATaskPanel,
     AuditStreamPanel,
@@ -167,6 +168,11 @@ class BastionDashboard(App):
         self._consecutive_failures: int = 0
         self._last_ok_time: str | None = None
         self._last_data: dict[str, Any] | None = None
+        # Cached per-process attribution snapshot (spec 5.3). Populated by
+        # refresh_data from GET /broker/processes; consumed by the
+        # ProcessAttributionPanel and read by GPUProcessListModal on open
+        # (no UI-thread subprocess). None until the first poll lands.
+        self._last_process_snapshot: dict[str, Any] | None = None
         self._backoff_until: float = 0.0
 
         # Auto-fan state
@@ -208,6 +214,7 @@ class BastionDashboard(App):
                 yield A2ATaskPanel(id="a2a-tasks")
                 yield LeasePanel(id="leases")
                 yield AuditStreamPanel(id="audit-stream")
+                yield ProcessAttributionPanel(id="processes")
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -236,7 +243,7 @@ class BastionDashboard(App):
         third_col = self.query_one("#third-col")
 
         # Secondary panels: hidden by default, shown with [t] toggle
-        secondary_ids = {"a2a-tasks", "leases", "audit-stream"}
+        secondary_ids = {"a2a-tasks", "leases", "audit-stream", "processes"}
         # Always visible in full mode (trace is request history — essential)
         non_secondary_ids = {"scheduler", "watchdog", "circuit-breaker", "thrashing", "trace"}
 
@@ -353,7 +360,10 @@ class BastionDashboard(App):
         alerts = self._evaluate_alerts(data)
 
         # Fetch supplemental data in parallel
-        health_data, vram_ledger, watchdog_data, queue_diag, recent, counters, thrashing = (
+        (
+            health_data, vram_ledger, watchdog_data, queue_diag, recent,
+            counters, thrashing, processes,
+        ) = (
             await asyncio.gather(
                 self._client.get_health(),
                 self._client.get_vram_ledger(),
@@ -362,6 +372,7 @@ class BastionDashboard(App):
                 self._client.get_recent(),
                 self._client.get_counters(),
                 self._client.get_thrashing(),
+                self._client.get_processes(),
                 return_exceptions=True,
             )
         )
@@ -381,6 +392,12 @@ class BastionDashboard(App):
             counters = {}
         if isinstance(thrashing, BaseException):
             thrashing = {}
+        if isinstance(processes, BaseException) or not processes:
+            processes = self._last_process_snapshot or {}
+        # Cache the process-attribution snapshot so the ProcessAttributionPanel
+        # and the GPUProcessListModal (which now reads app._last_process_snapshot
+        # instead of spawning a subprocess, spec 5.3) share one fetch.
+        self._last_process_snapshot = cast(dict[str, Any], processes)
 
         # Cast to concrete types after exception normalization above
         health_data = cast(dict[str, Any], health_data)
@@ -544,6 +561,14 @@ class BastionDashboard(App):
         audit_panel = self.query_one("#audit-stream", AuditStreamPanel)
         audit_events = data.get("recent_audit_events", [])
         audit_panel.update(audit_panel.render_data(audit_events))
+
+        # Process attribution (spec 5.3) — dict-accessor panel fed the cached
+        # ProcessSnapshot from GET /broker/processes (TUI + JSON only).
+        with contextlib.suppress(Exception):
+            proc_panel = self.query_one("#processes", ProcessAttributionPanel)
+            proc_panel.update(
+                proc_panel.render_data(self._last_process_snapshot)
+            )
 
     # ------------------------------------------------------------------
     # Alert evaluation
@@ -801,12 +826,23 @@ class BastionDashboard(App):
         def _handle_process_select(pid: str) -> None:
             if not pid:
                 return
-            # Find process details for confirmation
-            procs = SystemDataCollector.query_gpu_processes()
-            proc = next((p for p in procs if p["pid"] == pid), None)
+            # Find process details for confirmation from the cached snapshot
+            # (spec 5.3 — no UI-thread subprocess; the modal and this lookup both
+            # read app._last_process_snapshot, which refresh_data keeps current).
+            snapshot = self._last_process_snapshot or {}
+            gpu_rows = snapshot.get("gpu_processes") or []
+            proc = next(
+                (p for p in gpu_rows if str(p.get("pid")) == pid), None
+            )
             if proc is None:
                 self.notify(f"Process {pid} no longer exists", severity="warning")
                 return
+            vram = proc.get("vram_mb")
+            proc = {
+                "pid": str(proc.get("pid")),
+                "name": str(proc.get("name") or ""),
+                "vram_mb": str(vram) if vram is not None else "?",
+            }
 
             def _handle_kill_confirm(action: str) -> None:
                 if not action:
