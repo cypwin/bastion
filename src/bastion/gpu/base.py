@@ -44,10 +44,35 @@ class GPUBackend(Protocol):
         """Return free VRAM in GB, or ``None`` if unavailable."""
         ...
 
-    def query_processes(self) -> list[dict[str, str]]:
-        """List GPU compute processes (synchronous).
+    async def query_processes(self) -> list[dict[str, str]]:
+        """List GPU compute processes (async, slow path ~10s cadence).
 
         Returns a list of dicts with keys ``pid``, ``name``, ``vram_mb``.
+
+        Async-converted (observability spec 5.3 — breaking protocol change, see
+        CHANGELOG): :class:`NvidiaBackend` issues ``asyncio.create_subprocess_exec``
+        (matching :meth:`query_status`) so it never blocks the event loop on a
+        synchronous ``subprocess.run`` when called from ``_machine_snapshot_loop``.
+        :class:`StubBackend` (non-NVIDIA / no-GPU) returns ``[]`` — the *correct
+        complete* value.  Any failure (non-zero exit, timeout, missing binary)
+        degrades to ``[]``.
+        """
+        ...
+
+    async def query_process_utilization(self) -> list[dict]:
+        """Return per-PID GPU utilization rows (slow path, ~10s cadence).
+
+        :class:`NvidiaBackend` runs ``nvidia-smi pmon -s u -c 1`` (driver 358+)
+        and returns one dict per process with keys ``pid`` (int), ``name`` (str),
+        and ``sm_pct``/``mem_pct``/``enc_pct``/``dec_pct`` (int | None).  SM%
+        says who is *burning compute now* (distinct from compute-apps VRAM, which
+        says who *holds* memory).  Older/headless drivers omit the ``enc``/``dec``
+        columns and idle GPUs report ``-``/``[N/A]`` cells — both degrade **per
+        field** to ``None``, never a misleading ``0``.  ``pmon`` unsupported on
+        old drivers (non-zero exit), timeout, or a missing binary degrade to
+        ``[]``.  :class:`StubBackend` (non-NVIDIA / no-GPU) returns ``[]`` — the
+        *correct complete* value.  The ``pmon`` column layout lives only inside
+        :class:`NvidiaBackend` (Constraint #7c).
         """
         ...
 
