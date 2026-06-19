@@ -42,6 +42,9 @@ plans/
 logs/
 *.log
 config/broker.yaml
+# editor / tooling backups — never let these reach the sdist tarball
+*.bak
+*.bak.*
 .deepeval/
 
 # Shell dotfiles (should not be in project)
