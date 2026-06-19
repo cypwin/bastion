@@ -18,7 +18,11 @@ class StubBackend:
     async def get_vram_free_gb(self) -> float | None:
         return None
 
-    def query_processes(self) -> list[dict[str, str]]:
+    async def query_processes(self, timeout_seconds: int = 5) -> list[dict[str, str]]:
+        return []
+
+    async def query_process_utilization(self, timeout_seconds: int = 5) -> list[dict]:
+        # pmon is an NVIDIA concept; [] is the correct complete value here.
         return []
 
     async def query_throttle_reasons(self) -> list[str]:

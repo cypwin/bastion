@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import subprocess
 from collections import deque
 
 from bastion.models import GPUStatus
@@ -134,26 +133,47 @@ class NvidiaBackend:
             return status.vram_free_mb / 1024.0
         return None
 
-    def query_processes(self) -> list[dict[str, str]]:
-        """List GPU compute processes via nvidia-smi."""
+    async def query_processes(self, timeout_seconds: int = 5) -> list[dict[str, str]]:
+        """List GPU compute processes via nvidia-smi (async).
+
+        Async-converted (observability spec 5.3): uses
+        ``asyncio.create_subprocess_exec`` exactly like :meth:`query_status` so
+        the 10s slow tick of ``_machine_snapshot_loop`` never blocks the event
+        loop for up to 5s on a synchronous ``subprocess.run``.  Returns one dict
+        per compute process with keys ``pid``, ``name``, ``vram_mb`` (string
+        values, mirroring the prior contract).  Any failure (non-zero exit,
+        timeout, missing binary) degrades to ``[]``.
+        """
         try:
-            result = subprocess.run(
-                [
-                    "nvidia-smi",
-                    "--query-compute-apps=pid,process_name,used_memory",
-                    "--format=csv,noheader,nounits",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=5,
+            proc = await asyncio.create_subprocess_exec(
+                "nvidia-smi",
+                "--query-compute-apps=pid,process_name,used_memory",
+                "--format=csv,noheader,nounits",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            if result.returncode != 0:
+            try:
+                stdout, _stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout_seconds,
+                )
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.debug("nvidia-smi compute-apps query timed out")
                 return []
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+
+            if proc.returncode != 0:
+                logger.debug(
+                    "nvidia-smi compute-apps query returned no data (rc=%s)",
+                    proc.returncode,
+                )
+                return []
+        except FileNotFoundError:
+            logger.debug("nvidia-smi not found (compute-apps query)")
             return []
 
         processes: list[dict[str, str]] = []
-        for line in result.stdout.strip().splitlines():
+        for line in stdout.decode(errors="replace").strip().splitlines():
             parts = [p.strip() for p in line.split(",")]
             if len(parts) >= 3:
                 processes.append({
@@ -162,6 +182,50 @@ class NvidiaBackend:
                     "vram_mb": parts[2],
                 })
         return processes
+
+    async def query_process_utilization(self, timeout_seconds: int = 5) -> list[dict]:
+        """Per-PID GPU utilization via ``nvidia-smi pmon -s u -c 1`` (async, 10s).
+
+        Returns one dict per process with keys ``pid`` (int), ``name`` (str),
+        and ``sm_pct``/``mem_pct``/``enc_pct``/``dec_pct`` (int | None).  ``pmon``
+        emits two ``#``-prefixed header lines then one space-delimited row per
+        process: ``gpu_idx pid type sm mem enc dec command``.  Older/headless
+        drivers may omit the ``enc``/``dec`` columns, and an idle GPU reports
+        ``-``/``[N/A]`` cells — both degrade **per field** to ``None`` (never a
+        misleading ``0``); the row is still returned with whatever it has.
+
+        Graceful degradation (Constraint #4): ``pmon`` unsupported on old drivers
+        (non-zero exit), timeout, or a missing binary all yield ``[]``.  The
+        ``pmon`` column layout lives only here inside ``NvidiaBackend``
+        (Constraint #7c).
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "nvidia-smi", "pmon", "-s", "u", "-c", "1",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, _stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout_seconds,
+                )
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.debug("nvidia-smi pmon query timed out")
+                return []
+
+            if proc.returncode != 0 or not stdout.strip():
+                logger.debug(
+                    "nvidia-smi pmon query returned no data (rc=%s)",
+                    proc.returncode,
+                )
+                return []
+        except FileNotFoundError:
+            logger.debug("nvidia-smi not found (pmon query)")
+            return []
+
+        return _parse_pmon(stdout.decode(errors="replace"))
 
     async def check_gpu_responsive(self, timeout_seconds: float = 5.0) -> bool | None:
         """Check if nvidia-smi responds within timeout.
@@ -377,6 +441,48 @@ def _safe_float(s: str) -> float | None:
         return float(s.strip())
     except (ValueError, AttributeError):
         return None
+
+
+def _parse_pmon(output: str) -> list[dict]:
+    """Parse ``nvidia-smi pmon -s u -c 1`` text into per-PID utilization dicts.
+
+    Skips the ``#``-prefixed header lines and parses each whitespace-delimited
+    row as ``gpu_idx pid type sm mem [enc dec] command``.  ``sm``/``mem`` are at
+    fixed offsets 3/4; ``enc``/``dec`` (offsets 5/6) are absent on older/headless
+    drivers, in which case those fields are ``None``.  Non-numeric cells (``-`` /
+    ``[N/A]`` on an idle GPU) degrade per field to ``None``.  The trailing
+    command token is the process name; a row with no parseable integer PID is
+    skipped.
+    """
+    rows: list[dict] = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        cols = stripped.split()
+        if len(cols) < 4:
+            continue
+        pid = _safe_int(cols[1])
+        if pid is None:
+            continue
+        sm = _safe_int(cols[3]) if len(cols) > 3 else None
+        mem = _safe_int(cols[4]) if len(cols) > 4 else None
+        # enc/dec exist only when the row carries the full 8-column layout
+        # (gpu pid type sm mem enc dec command); a 6-column row (…sm mem command)
+        # has the name in cols[5], so enc/dec must stay None.
+        has_enc_dec = len(cols) >= 8
+        enc = _safe_int(cols[5]) if has_enc_dec else None
+        dec = _safe_int(cols[6]) if has_enc_dec else None
+        name = cols[-1]
+        rows.append({
+            "pid": pid,
+            "name": name,
+            "sm_pct": sm,
+            "mem_pct": mem,
+            "enc_pct": enc,
+            "dec_pct": dec,
+        })
+    return rows
 
 
 def _dmesg_timestamp(line: str) -> str:

@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`GPUBackend.query_processes()` is now `async`** (breaking protocol change). It was synchronous (`subprocess.run`); it now uses `asyncio.create_subprocess_exec` like `query_status` so it never blocks the asyncio event loop for up to 5s when polled from the machine-snapshot loop. Custom `GPUBackend` implementations must update the signature to `async def query_processes(self) -> list[dict[str, str]]`. A new async `query_process_utilization()` (per-PID `nvidia-smi pmon` sm/mem/enc/dec util) is added to the protocol; `StubBackend` returns `[]`. The Textual `SystemDataCollector.query_gpu_processes()` wrapper keeps its synchronous call contract by driving the coroutine to completion.
 - `DELETE /a2a/tasks/{id}` on an already-terminal task now returns **409 Conflict** instead of 404 — 404 is reserved for tasks that never existed (or whose state was evicted). Client retry logic can now distinguish the two.
 - A2A invalid live-task state transitions are logged at WARNING (was DEBUG); the already-compacted case stays at DEBUG.
 - `audit.emit()` before `init_audit_logger()` buffers events in a bounded ring (256) with a WARNING and flushes them on init, instead of silently dropping them.

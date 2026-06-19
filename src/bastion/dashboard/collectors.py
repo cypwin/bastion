@@ -1,8 +1,10 @@
 """System metrics collector — CPU, memory, network, disk, GPU processes."""
 from __future__ import annotations
 
+import asyncio
 import os
 import re
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -692,10 +694,53 @@ class SystemDataCollector:
 
     @staticmethod
     def query_gpu_processes() -> list[dict[str, str]]:
-        """Query GPU compute processes via the configured GPU backend."""
+        """Query GPU compute processes via the configured GPU backend (sync bridge).
+
+        The backend's ``query_processes`` is **async** (observability spec 5.3) so
+        it never blocks the asyncio event loop when polled by the snapshot loop.
+        This wrapper preserves the *synchronous* contract its Textual call sites
+        rely on (``GPUProcessListModal.compose()`` and the ``action_gpu_kill``
+        screen callback cannot ``await``) by driving the coroutine to completion:
+
+        * No running loop in this thread → ``asyncio.run`` the coroutine.
+        * A loop already running in this thread (e.g. called inline from a
+          Textual handler) → run the coroutine on a throwaway loop in a worker
+          thread and block for its result, so we neither raise
+          ``RuntimeError("...from a running event loop")`` nor re-enter the live
+          loop.
+
+        Any failure degrades to ``[]`` (the backend already returns ``[]`` on a
+        missing GPU / nvidia-smi error; this guards the bridge itself).
+        """
         from bastion.gpu import get_backend
 
-        return get_backend().query_processes()
+        async def _run() -> list[dict[str, str]]:
+            return await get_backend().query_processes()
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop running in this thread — safe to own one for the call.
+            try:
+                return asyncio.run(_run())
+            except Exception:
+                return []
+
+        # A loop is already running here; hand the coroutine to a worker thread
+        # with its own event loop and wait synchronously for the result.
+        result: list[dict[str, str]] = []
+
+        def _worker() -> None:
+            nonlocal result
+            try:
+                result = asyncio.run(_run())
+            except Exception:
+                result = []
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        thread.join()
+        return result
 
     # ------------------------------------------------------------------
     # Top processes
