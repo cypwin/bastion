@@ -212,6 +212,41 @@ MODEL_SWAP_DURATION = Histogram(
 )
 
 # ---------------------------------------------------------------------------
+# VRAM ledger reconciliation / drift (observability expansion, spec 5.4)
+# ---------------------------------------------------------------------------
+
+# NET-NEW objects (NOT Tier-0 activations). The reconcile() path in vram.py
+# emits audit events for stale-removal and import; these counters meter the
+# same events for Prometheus. Both are deliberately LABEL-LESS: the natural
+# discriminator would be the model name, which is unbounded (any model a user
+# runs) — Section 3 rule #2 forbids that cardinality. The aggregate rate is
+# what matters operationally (how often Ollama auto-unloads / clients bypass
+# the broker), not a per-model breakdown.
+VRAM_RECONCILE_STALE_TOTAL = Counter(
+    "bastion_vram_reconcile_stale_total",
+    "Ledger allocations dropped because Ollama no longer reports the model "
+    "(stale-removal during reconcile)",
+)
+
+VRAM_RECONCILE_IMPORT_TOTAL = Counter(
+    "bastion_vram_reconcile_import_total",
+    "Resident-but-untracked models imported into the ledger during reconcile "
+    "(loaded outside a BASTION swap)",
+)
+
+# Signed gauge: measured VRAM (backend) minus tracked VRAM (allocated+reserved).
+# Growing positive = the ledger under-counts actual residency (unsafe). The
+# single bounded label is gpu_index so multi-GPU is a non-breaking future
+# extension; single-GPU deployments emit gpu_index="0". Emitted on the SLOW
+# snapshot tick only (it needs a backend VRAM read) and SKIPPED — never set to
+# 0 — when the backend returns None (StubBackend / non-NVIDIA).
+VRAM_LEDGER_DRIFT_MB = Gauge(
+    "bastion_vram_ledger_drift_mb",
+    "Signed drift: measured VRAM (backend) − tracked VRAM (allocated+reserved), MB",
+    labelnames=["gpu_index"],
+)
+
+# ---------------------------------------------------------------------------
 # A2A task lifecycle metrics
 # ---------------------------------------------------------------------------
 
@@ -461,6 +496,55 @@ def record_model_swap_duration(model: str, duration: float) -> None:
     MODEL_SWAP_DURATION.labels(model=model).observe(duration)
 
 
+def record_vram_reconcile_stale(count: int = 1) -> None:
+    """Count stale ledger allocations dropped during ``reconcile()``.
+
+    Called at the stale-removal site in :meth:`VRAMManager.reconcile` when one
+    or more model allocations are released because Ollama no longer reports
+    them. Label-less by design (model name = unbounded cardinality).
+
+    Parameters
+    ----------
+    count : int
+        Number of stale models removed in this reconcile pass (default 1).
+    """
+    VRAM_RECONCILE_STALE_TOTAL.inc(count)
+
+
+def record_vram_reconcile_import(count: int = 1) -> None:
+    """Count resident-but-untracked models imported during ``reconcile()``.
+
+    Called at the import site in :meth:`VRAMManager.reconcile` when one or more
+    models present in Ollama ``/api/ps`` but absent from the ledger are
+    accounted into the budget. Label-less by design (model name = unbounded).
+
+    Parameters
+    ----------
+    count : int
+        Number of models imported in this reconcile pass (default 1).
+    """
+    VRAM_RECONCILE_IMPORT_TOTAL.inc(count)
+
+
+def update_vram_ledger_drift(gpu_index: str, mb: float) -> None:
+    """Publish the signed VRAM ledger-drift gauge for a GPU.
+
+    ``mb`` is measured VRAM (backend ``query_status``) minus tracked VRAM
+    (``allocated + reserved`` from the ledger). The caller (the slow snapshot
+    tick) MUST skip this call entirely when the backend reports no measured
+    value — publishing ``0`` would falsely claim the ledger is perfectly in
+    sync on a host that simply cannot read VRAM (StubBackend / non-NVIDIA).
+
+    Parameters
+    ----------
+    gpu_index : str
+        GPU identifier (string form so it round-trips through Prometheus labels).
+    mb : float
+        Signed drift in megabytes (positive = ledger under-counts residency).
+    """
+    VRAM_LEDGER_DRIFT_MB.labels(gpu_index=gpu_index).set(mb)
+
+
 # ---------------------------------------------------------------------------
 # A2A emit helpers
 # ---------------------------------------------------------------------------
@@ -592,6 +676,10 @@ __all__ = [
     "COOLDOWN_WAITS_TOTAL",
     "VRAM_USED_BYTES",
     "GPU_TEMPERATURE",
+    # VRAM reconcile / ledger-drift (observability expansion, spec 5.4)
+    "VRAM_RECONCILE_STALE_TOTAL",
+    "VRAM_RECONCILE_IMPORT_TOTAL",
+    "VRAM_LEDGER_DRIFT_MB",
     # Vision C schema-frozen metrics (do not rename — public contract)
     "REQUEST_QUEUE_WAIT",
     "VRAM_USED_MB",
@@ -614,6 +702,10 @@ __all__ = [
     "record_cooldown_wait",
     "update_vram_usage",
     "update_gpu_temperature",
+    # VRAM reconcile / ledger-drift helpers (observability expansion, spec 5.4)
+    "record_vram_reconcile_stale",
+    "record_vram_reconcile_import",
+    "update_vram_ledger_drift",
     # Vision C schema-frozen helpers
     "update_vram_used_mb",
     "record_thrashing_verdict",
