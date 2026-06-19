@@ -20,3 +20,14 @@ class StubBackend:
 
     def query_processes(self) -> list[dict[str, str]]:
         return []
+
+    async def query_throttle_reasons(self) -> list[str]:
+        # NVIDIA concept; the empty list is the correct complete value here.
+        return []
+
+    async def query_pcie_throughput(self) -> tuple[int | None, int | None]:
+        return (None, None)
+
+    async def query_xid_errors(self) -> list[dict]:
+        # Xid is an NVIDIA kernel-module concept; [] is correct and complete.
+        return []

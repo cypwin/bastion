@@ -9,15 +9,44 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import subprocess
+from collections import deque
 
 from bastion.models import GPUStatus
 
 logger = logging.getLogger(__name__)
 
+# Fixed throttle-reason vocabulary (spec 5.1).  The ``clocks_throttle_reasons.*``
+# boolean columns are queried in this order; the Prometheus counter stays bounded
+# because any future backend maps its vendor reasons onto this same set.
+_THROTTLE_REASONS: tuple[str, ...] = (
+    "sw_thermal_slowdown",   # clocks_throttle_reasons.sw_thermal_slowdown
+    "hw_thermal_slowdown",   # clocks_throttle_reasons.hw_thermal_slowdown
+    "hw_power_brake_slowdown",  # clocks_throttle_reasons.hw_power_brake_slowdown
+    "sw_power_cap_slowdown",  # clocks_throttle_reasons.sw_power_cap
+    "gpu_idle",              # clocks_throttle_reasons.gpu_idle
+)
+
+# Matches a kernel ``NVRM: Xid (PCI:0000:01:00): 79, ...`` line.  The Xid literal
+# lives only inside this backend (Constraint #7c).  Group 1 is the device tag,
+# group 2 the numeric code.
+_XID_RE = re.compile(r"NVRM:\s*Xid\s*\(([^)]*)\)\s*:?\s*(\d+)")
+
+# Bound on the rising-edge dedup memory (spec 4.3 / constraint #1): the dedup set
+# derives from this bounded deque so long uptime cannot grow it.
+_RECENT_XIDS_MAXLEN = 20
+
 
 class NvidiaBackend:
     """GPU backend using nvidia-smi."""
+
+    def __init__(self) -> None:
+        # Bounded ring of recently-seen Xid ``(timestamp, code)`` keys.  The
+        # rising-edge dedup set is *derived* from this deque (never an unbounded
+        # set), so it cannot grow across long uptime (spec constraint #1).
+        self._recent_xids: deque[tuple[str, int]] = deque(maxlen=_RECENT_XIDS_MAXLEN)
+        self.xid_count_since_start: int = 0
 
     async def query_status(self, timeout_seconds: int = 5) -> GPUStatus:
         """Query all GPU metrics in a single nvidia-smi call.
@@ -162,6 +191,175 @@ class NvidiaBackend:
         except FileNotFoundError:
             return None
 
+    # ------------------------------------------------------------------
+    # Slow-path signals (spec 5.1: throttle reasons 10s, PCIe tx/rx 10s,
+    # Xid dmesg scan 30s).  Each is individually try/except-wrapped and
+    # degrades to an empty/None value, never an exception (Constraint #4).
+    # ------------------------------------------------------------------
+
+    async def query_throttle_reasons(self, timeout_seconds: int = 5) -> list[str]:
+        """Parse active ``clocks_throttle_reasons.*`` columns (second call).
+
+        Issues a *separate* ``nvidia-smi`` query (boolean throttle columns
+        mis-align with the numeric :meth:`query_status` fields in one CSV pass)
+        and collapses the ``Active`` columns into :data:`_THROTTLE_REASONS`.
+        Any failure (non-zero exit, timeout, missing binary, ``[N/A]``) yields
+        ``[]``.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "nvidia-smi",
+                (
+                    "--query-gpu="
+                    "clocks_throttle_reasons.sw_thermal_slowdown,"
+                    "clocks_throttle_reasons.hw_thermal_slowdown,"
+                    "clocks_throttle_reasons.hw_power_brake_slowdown,"
+                    "clocks_throttle_reasons.sw_power_cap,"
+                    "clocks_throttle_reasons.gpu_idle"
+                ),
+                "--format=csv,noheader,nounits",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, _stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout_seconds,
+                )
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.debug("nvidia-smi throttle query timed out")
+                return []
+
+            if proc.returncode != 0 or not stdout.strip():
+                logger.debug(
+                    "nvidia-smi throttle query returned no data (rc=%s)",
+                    proc.returncode,
+                )
+                return []
+
+            # Single-GPU shipped path: first line only.
+            first = stdout.decode().strip().split("\n")[0]
+            cols = [c.strip() for c in first.split(",")]
+            reasons: list[str] = []
+            for i, name in enumerate(_THROTTLE_REASONS):
+                if i < len(cols) and cols[i].lower() == "active":
+                    reasons.append(name)
+            return reasons
+        except FileNotFoundError:
+            logger.debug("nvidia-smi not found (throttle query)")
+            return []
+
+    async def query_pcie_throughput(
+        self, timeout_seconds: int = 5,
+    ) -> tuple[int | None, int | None]:
+        """Return ``(pcie_tx_kb_s, pcie_rx_kb_s)`` from ``pcie.tx/rx_util``.
+
+        ``[N/A]`` (pre-R418 / virtualized) and any failure degrade each element
+        to ``None`` — never a misleading ``0``.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "nvidia-smi",
+                "--query-gpu=pcie.tx_util,pcie.rx_util",
+                "--format=csv,noheader,nounits",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, _stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout_seconds,
+                )
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.debug("nvidia-smi pcie query timed out")
+                return (None, None)
+
+            if proc.returncode != 0 or not stdout.strip():
+                logger.debug(
+                    "nvidia-smi pcie query returned no data (rc=%s)",
+                    proc.returncode,
+                )
+                return (None, None)
+
+            first = stdout.decode().strip().split("\n")[0]
+            cols = [c.strip() for c in first.split(",")]
+            tx = _safe_int(cols[0]) if len(cols) > 0 else None
+            rx = _safe_int(cols[1]) if len(cols) > 1 else None
+            return (tx, rx)
+        except FileNotFoundError:
+            logger.debug("nvidia-smi not found (pcie query)")
+            return (None, None)
+
+    async def query_xid_errors(self, timeout_seconds: int = 5) -> list[dict]:
+        """Scan ``dmesg`` for new ``NVRM: Xid`` lines (rising-edge, bounded).
+
+        Returns one dict per *newly-seen* ``(timestamp, xid_code)`` with keys
+        ``timestamp``, ``xid_code``, ``raw_message``.  The dedup memory is the
+        bounded :attr:`_recent_xids` deque (maxlen 20), so it cannot grow across
+        long uptime.  ``dmesg_restrict=1`` (``PermissionError``) and ``rc=1`` +
+        empty stdout both degrade to ``[]`` (the most likely paths).
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "dmesg",
+                "--time-format", "iso",
+                "--since", "30 seconds ago",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, _stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout_seconds,
+                )
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.debug("dmesg Xid scan timed out")
+                return []
+
+            # rc=1 with empty stdout (rotated logs / unreadable kmsg) -> [].
+            # Non-zero rc with data still gets parsed (some dmesg builds exit 1
+            # on --since with older util-linux); empty output -> [].
+            if not stdout.strip():
+                logger.debug("dmesg Xid scan returned no data (rc=%s)", proc.returncode)
+                return []
+
+            return self._parse_xid_lines(stdout.decode(errors="replace"))
+        except FileNotFoundError:
+            logger.debug("dmesg not found (Xid scan)")
+            return []
+        except PermissionError:
+            # dmesg_restrict=1 — the most likely path; [] is the tested default.
+            logger.debug("dmesg denied (dmesg_restrict=1) — Xid scan -> []")
+            return []
+
+    def _parse_xid_lines(self, output: str) -> list[dict]:
+        """Extract new Xid events from dmesg text, with bounded rising-edge dedup."""
+        seen = set(self._recent_xids)
+        new_events: list[dict] = []
+        for line in output.splitlines():
+            m = _XID_RE.search(line)
+            if not m:
+                continue
+            code = _safe_int(m.group(2))
+            if code is None:
+                continue
+            timestamp = _dmesg_timestamp(line)
+            key = (timestamp, code)
+            if key in seen:
+                continue
+            seen.add(key)
+            self._recent_xids.append(key)
+            self.xid_count_since_start += 1
+            new_events.append({
+                "timestamp": timestamp,
+                "xid_code": code,
+                "raw_message": line.strip(),
+            })
+        return new_events
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -179,3 +377,18 @@ def _safe_float(s: str) -> float | None:
         return float(s.strip())
     except (ValueError, AttributeError):
         return None
+
+
+def _dmesg_timestamp(line: str) -> str:
+    """Extract the leading ISO timestamp from a ``dmesg --time-format iso`` line.
+
+    Such lines begin with e.g. ``2026-06-19T14:32:07,000000+00:00 host ...``.
+    The first whitespace-delimited token is the timestamp; if the line is not
+    iso-prefixed (older util-linux without ``--since``, ``[  123.456]`` clock
+    format) the raw first token is still returned as a best-effort key — the
+    rising-edge dedup only needs a stable string, not a parsed datetime.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return ""
+    return stripped.split(maxsplit=1)[0]

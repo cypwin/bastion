@@ -50,3 +50,51 @@ class GPUBackend(Protocol):
         Returns a list of dicts with keys ``pid``, ``name``, ``vram_mb``.
         """
         ...
+
+    async def query_throttle_reasons(self) -> list[str]:
+        """Return active GPU clock-throttle reasons (slow path, ~10s cadence).
+
+        :class:`NvidiaBackend` issues a *second* ``nvidia-smi`` call parsing the
+        boolean ``clocks_throttle_reasons.*`` columns (they mis-align with the
+        numeric fields of :meth:`query_status` in one CSV pass) and collapses
+        the ``Active`` ones into the fixed reason vocabulary
+        ``{sw_thermal_slowdown, hw_thermal_slowdown, hw_power_brake_slowdown,
+        sw_power_cap_slowdown, gpu_idle}``.  A future ``AMDBackend`` would map
+        its vendor reasons onto the same fixed set so the Prometheus counter
+        stays bounded.  :class:`StubBackend` (non-NVIDIA / no-GPU) returns
+        ``[]`` — the *correct complete* value, never a crash.  Any failure
+        (non-zero exit, timeout, missing binary, ``[N/A]`` columns) degrades to
+        ``[]``.  The ``clocks_throttle_reasons.*`` field names live only inside
+        :class:`NvidiaBackend` (Constraint #7c).
+        """
+        ...
+
+    async def query_pcie_throughput(self) -> tuple[int | None, int | None]:
+        """Return ``(pcie_tx_kb_s, pcie_rx_kb_s)`` (slow path, ~10s cadence).
+
+        :class:`NvidiaBackend` parses ``pcie.tx_util``/``pcie.rx_util`` (KB/s,
+        R418+).  Older drivers / virtualized GPUs report ``[N/A]`` for these,
+        which degrades each element to ``None`` rather than a misleading ``0``.
+        :class:`StubBackend` returns ``(None, None)``.  Any failure degrades to
+        ``(None, None)``.
+        """
+        ...
+
+    async def query_xid_errors(self) -> list[dict]:
+        """Return newly-seen GPU device error events (slow path, ~30s cadence).
+
+        :class:`NvidiaBackend` scans ``dmesg`` for ``NVRM: Xid`` lines, with a
+        **rising-edge dedup** keyed on ``(timestamp, xid_code)`` sourced from a
+        bounded ``recent_xids`` deque (``maxlen=20``) so the dedup memory cannot
+        grow across long uptime.  Each returned dict carries the keys
+        ``timestamp``, ``xid_code`` and ``raw_message``.  ``xid_code`` is a
+        *generic device error-code* int (NVIDIA Xid today; a future
+        ``AMDBackend`` can map amdgpu reset events onto the same shape).
+        ``dmesg_restrict=1`` (``PermissionError``) and ``rc=1`` with empty
+        stdout both degrade to ``[]`` (the most likely paths), as does a
+        timeout or missing binary.  :class:`StubBackend` returns ``[]`` — Xid is
+        an NVIDIA kernel-module concept, so the empty list is the correct and
+        complete value on non-NVIDIA hardware.  The ``NVRM: Xid`` literal lives
+        only inside :class:`NvidiaBackend` (Constraint #7c).
+        """
+        ...
