@@ -31,9 +31,11 @@ dependencies.
 
 from __future__ import annotations
 
+import contextlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from bastion import metrics
 
@@ -171,7 +173,9 @@ class InferenceTapCollector:
         self._observe(model, decode, prefill, ctx)
 
         if record_fn is not None:
-            try:
+            # A record_fn predating the new kwargs (or a test double): the
+            # tap is best-effort and must not break the request finally.
+            with contextlib.suppress(TypeError):
                 record_fn(
                     prefill_tps=prefill,
                     decode_tps=decode,
@@ -180,10 +184,6 @@ class InferenceTapCollector:
                     eval_count=self.eval_count,
                     prompt_eval_count=self.prompt_eval_count,
                 )
-            except TypeError:
-                # A record_fn predating the new kwargs (or a test double): the
-                # tap is best-effort and must not break the request finally.
-                pass
 
     # ------------------------------------------------------------- internals
 
@@ -243,7 +243,5 @@ def _try_observe(helper_name: str, model: str, value: float) -> None:
     fn = getattr(metrics, helper_name, None)
     if fn is None:
         return
-    try:
+    with contextlib.suppress(Exception):  # metrics must never break the stream finally block.
         fn(model, value)
-    except Exception:  # metrics must never break the stream finally block.
-        pass

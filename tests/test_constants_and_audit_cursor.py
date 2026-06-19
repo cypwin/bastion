@@ -22,7 +22,6 @@ import sys
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # constants.py — shared fan curve, no app side effects
 # ---------------------------------------------------------------------------
@@ -159,7 +158,7 @@ def test_event_seq_strictly_monotonic_across_appends(fresh_audit) -> None:
         seqs.append(audit._event_seq)
     # Strictly increasing, one per append.
     assert seqs == [1, 2, 3, 4, 5]
-    assert all(b > a for a, b in zip(seqs, seqs[1:]))
+    assert all(b > a for a, b in zip(seqs, seqs[1:], strict=False))
 
 
 def test_get_events_since_stable_across_ring_wrap(fresh_audit) -> None:

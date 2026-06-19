@@ -16,7 +16,6 @@ it is never a Prometheus label (Constraint #2).
 from __future__ import annotations
 
 import time
-from typing import Any
 
 from rich.table import Table
 from rich.text import Text
@@ -61,8 +60,6 @@ class ProcessAttributionPanel(BastionPanel):
         if not snapshot:
             table.add_row(Text("(no data)", style="dim"), "")
             return table
-
-        own_pids = snapshot.get("own_pids") or {}
 
         self._render_gpu_section(table, snapshot)
         self._render_cpu_section(table, snapshot)
@@ -193,6 +190,6 @@ class ProcessAttributionPanel(BastionPanel):
             names = ev.get("new_names") or []
             names_str = ",".join(n[:10] for n in names[:3])
             table.add_row(
-                Text("  +%d/-%d" % (new_count, exited), style="magenta"),
+                Text(f"  +{new_count}/-{exited}", style="magenta"),
                 Text(names_str, style="dim"),
             )

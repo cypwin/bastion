@@ -41,10 +41,12 @@ Everything here is in-memory and bounded: the ring is a
 """
 from __future__ import annotations
 
+import functools
 import logging
 import time
 from collections import deque
-from typing import Callable, Literal
+from collections.abc import Callable
+from typing import Literal
 
 from bastion.constants import _fan_band
 from bastion.models import (
@@ -504,16 +506,18 @@ class CorrelationEngine:
             self._edge(
                 "mem_psi_high",
                 mem_psi is not None and mem_psi >= cfg.contention_psi_threshold,
-                lambda v=mem_psi: emit(
-                    "system", "mem_pressure", "mem_psi_high", {"psi_mem_some_avg10": v}
+                functools.partial(
+                    emit, "system", "mem_pressure", "mem_psi_high",
+                    {"psi_mem_some_avg10": mem_psi},
                 ),
             )
             cpu_psi = contention.psi_cpu_some_avg10
             self._edge(
                 "cpu_psi_high",
                 cpu_psi is not None and cpu_psi >= cfg.contention_cpu_psi_threshold,
-                lambda v=cpu_psi: emit(
-                    "system", "cpu_contention", "cpu_psi_high", {"psi_cpu_some_avg10": v}
+                functools.partial(
+                    emit, "system", "cpu_contention", "cpu_psi_high",
+                    {"psi_cpu_some_avg10": cpu_psi},
                 ),
             )
 
@@ -527,9 +531,9 @@ class CorrelationEngine:
                 self._edge(
                     "gpu_temp_high",
                     hot,
-                    lambda t=gpu.temperature_c, c=ceiling: emit(
-                        "gpu", "thermal", "gpu_temp_high",
-                        {"temperature_c": t, "ceiling_c": c},
+                    functools.partial(
+                        emit, "gpu", "thermal", "gpu_temp_high",
+                        {"temperature_c": gpu.temperature_c, "ceiling_c": ceiling},
                     ),
                 )
 
@@ -1030,9 +1034,8 @@ def build_thermal_coupling(
     # Resolve the GPU ceiling: explicit override wins, else the device-detected
     # GPUConfig.max_temperature_c. 0/None/<=0 means "no GPU ceiling known".
     gpu_ceiling: float | None = cfg.gpu_safe_ceiling_c
-    if gpu_ceiling is None:
-        if gpu_max_temperature_c is not None and gpu_max_temperature_c > 0:
-            gpu_ceiling = float(gpu_max_temperature_c)
+    if gpu_ceiling is None and gpu_max_temperature_c is not None and gpu_max_temperature_c > 0:
+        gpu_ceiling = float(gpu_max_temperature_c)
 
     headroom_terms: list[float] = []
     if gpu_ceiling is not None and gpu_ceiling > 0 and gpu_temp_c is not None:

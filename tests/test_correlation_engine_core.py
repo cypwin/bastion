@@ -37,7 +37,6 @@ from bastion.models import (
     MachineSnapshot,
 )
 
-
 # ---------------------------------------------------------------------------
 # Import hygiene — the engine must never reach into the TUI app
 # ---------------------------------------------------------------------------
@@ -188,7 +187,7 @@ def test_enrich_stall_reason_omits_none_clauses() -> None:
     assert out is not None
     assert out.startswith("swap_cooldown")
     # No NVMe / PSI / temp numbers fabricated from None inputs.
-    for token in ("None", "util", "PSI", "psi"):
+    for _token in ("None", "util", "PSI", "psi"):
         # Bracketed context may be entirely absent; if present it must not
         # contain a None-derived clause.
         pass
