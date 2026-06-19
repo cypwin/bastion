@@ -30,7 +30,7 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from bastion import audit
+from bastion import audit, metrics
 from bastion.circuitbreaker import CircuitBreaker
 from bastion.models import BrokerConfig, PriorityTier, QueuedRequest
 
@@ -388,7 +388,7 @@ class OllamaProxy:
                 result = await self._stream_response(
                     request, target_url, modified_body, model, path, tier,
                     done_fn=done_fn, routing_meta=routing_meta,
-                    record_fn=record_complete,
+                    record_fn=record_complete, dispatch_start=dispatch_start,
                 )
                 done_fn = None  # Generator owns done_fn now; prevent double-call in finally
             else:
@@ -549,6 +549,7 @@ class OllamaProxy:
         done_fn: Callable[[], None] | None = None,
         routing_meta: dict[str, str] | None = None,
         record_fn: Callable[[int], None] | None = None,
+        dispatch_start: float | None = None,
     ) -> StreamingResponse | JSONResponse:
         """Stream Ollama's NDJSON response back to the client.
 
@@ -588,10 +589,20 @@ class OllamaProxy:
                 {"error": f"Ollama backend unavailable: {e}"}, status_code=502,
             )
 
+        # TTFT tap: closure-captured flag, set on the first non-empty chunk.
+        # Semantic is "Ollama-receive -> first-token" (post-grant); the value is
+        # observed exactly once per streaming request. O(1) per chunk — the tap
+        # never buffers: each chunk is yielded immediately whether or not it is
+        # the first one. An empty keep-alive chunk does not count as a token.
         async def generate():
             outcome_status = resp.status_code
+            ttft_observed = False
             try:
                 async for chunk in resp.aiter_bytes():
+                    if not ttft_observed and chunk and dispatch_start is not None:
+                        ttft_observed = True
+                        with contextlib.suppress(Exception):
+                            metrics.observe_llm_ttft(model, time.time() - dispatch_start)
                     yield chunk
                 if cb:
                     # An upstream 5xx is a backend failure even though no
