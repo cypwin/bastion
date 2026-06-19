@@ -30,7 +30,6 @@ import pytest
 from bastion.models import BrokerConfig, ModelInfo
 from bastion.proxy import OllamaProxy
 
-
 # --------------------------------------------------------------------------- #
 # Unit: record_recent_request signature + dict shape (server.py)
 # --------------------------------------------------------------------------- #

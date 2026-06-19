@@ -20,7 +20,6 @@ import pytest
 import bastion.metrics as metrics
 from bastion.correlation import RISK_COMPONENT_NAMES
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Metric objects exist with the right (bounded) label names
 # ─────────────────────────────────────────────────────────────────────────────

@@ -12,8 +12,6 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Label
 
-from bastion.dashboard.collectors import SystemDataCollector
-
 # ---------------------------------------------------------------------------
 # Fan control constants and helper
 # ---------------------------------------------------------------------------

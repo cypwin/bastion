@@ -39,8 +39,6 @@ import bastion
 from bastion import audit
 from bastion.auth import make_a2a_token_dependency, make_admin_key_dependency
 from bastion.circuitbreaker import CircuitBreakerTransport
-from bastion.health import check_gpu_safe, query_gpu_status
-from bastion.latency_aggregator import aggregate_latency
 from bastion.correlation import (
     ContentionEventDetector,
     CorrelationEngine,
@@ -48,6 +46,8 @@ from bastion.correlation import (
     compute_risk_index,
     enrich_stall_reason,
 )
+from bastion.health import check_gpu_safe, query_gpu_status
+from bastion.latency_aggregator import aggregate_latency
 from bastion.metrics import (
     CONTENT_TYPE_LATEST,
     PROMETHEUS_AVAILABLE,
@@ -61,6 +61,7 @@ from bastion.metrics import (
 )
 from bastion.middleware import MetricsMiddleware
 from bastion.models import (
+    BlockDeviceIOStats,
     BrokerCatalog,
     BrokerConfig,
     BrokerCounters,
@@ -68,7 +69,6 @@ from bastion.models import (
     BrokerStatus,
     BrokerThrashing,
     BrokerThrashingAgent,
-    BlockDeviceIOStats,
     CatalogEntry,
     ContentionSnapshot,
     CorrelationState,
@@ -78,11 +78,11 @@ from bastion.models import (
     IntentDeclaration,
     IntentResponse,
     MachineSnapshot,
-    ProcessSnapshot,
-    XidEvent,
     PriorityTier,
+    ProcessSnapshot,
     QueuedRequest,
     ThrashingVerdictLabel,
+    XidEvent,
 )
 from bastion.proxy import OllamaProxy
 from bastion.queue import AffinityQueue

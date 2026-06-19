@@ -36,7 +36,6 @@ from bastion.queue import AffinityQueue
 from bastion.scheduler import Scheduler
 from bastion.vram import VRAMTracker
 
-
 # ── GPU temperature gauge (update_gpu_temperature) ─────────────────────────
 
 
