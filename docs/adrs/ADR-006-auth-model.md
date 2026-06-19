@@ -2,19 +2,19 @@
 
 **Status:** Accepted (v0.5 milestone gate)
 **Date:** 2026-05-19
-**Deciders:** S122 maintainer with reference to S122 plan-C design review
-**Related:** S122 plan-C vision-council retro Step 2 + dissent log (security-deployment-reviewer) (internal artifact, archived); `docs/security.md`; planned `bastion/mcp_adapter.py` (ADR-007)
+**Deciders:** BASTION maintainer
+**Related:** `docs/security.md`; planned `bastion/mcp_adapter.py` (ADR-007)
 
 ## Context
 
-The S122 plan-C design review (2026-05-19) declared auth-on-by-default a **v0.5 milestone gate** blocking ALL subsequent networked-surface work. The security-deployment-reviewer lens went further: *"Before any network-exposed control surface ships, [the sudo] path must be replaced with a systemd unit — no shell, no sudo, no ambient capability."* The parallel-merge lens called per-surface auth a "ship-trap under single-dev velocity."
+The design review (2026-05-19) concluded that auth-on-by-default is a **v0.5 milestone gate** blocking ALL subsequent networked-surface work. A security review noted: *"Before any network-exposed control surface ships, [the sudo] path must be replaced with a systemd unit — no shell, no sudo, no ambient capability."* From an operational view, per-surface auth is a "ship-trap under single-dev velocity."
 
 BASTION today:
 
 - `make_admin_key_dependency`/`make_a2a_token_dependency` in `src/bastion/auth.py` produce the `verify_admin`/`verify_a2a` dependencies wired into the FastAPI routers in `server.py` via `Depends(...)`.
 - The default config disables auth (`auth.enabled: false`). Operators must explicitly enable it.
 - `action_service_restart` (`dashboard/app.py:997`) shells out to `sudo -n systemctl restart bastion.service` — bypassing the auth layer entirely.
-- Vision D (MCP adapter, planned per S122 council Step 3) will expose `/broker/control/*` over an MCP transport that may or may not run on localhost.
+- Vision D (MCP adapter, planned) will expose `/broker/control/*` over an MCP transport that may or may not run on localhost.
 
 The decision: what auth model gates v0.5? Three credible options:
 
@@ -24,7 +24,7 @@ The decision: what auth model gates v0.5? Three credible options:
 
 **(c) OAuth/OIDC delegation.** Defer to an external IdP. Justified if BASTION integrates into a corporate auth fabric. Adds an external dependency in BASTION's most basic install path.
 
-The council's adversarial lens warned that Vision A (autonomous policy) introduces "prompt-injection via state data" — externally-writable inputs (queue depths, error strings, model names) can influence policy outputs. Auth boundaries matter because every networked surface that bypasses them adds attack surface.
+One design concern was that Vision A (autonomous policy) introduces "prompt-injection via state data" — externally-writable inputs (queue depths, error strings, model names) can influence policy outputs. Auth boundaries matter because every networked surface that bypasses them adds attack surface.
 
 ## Decision
 
@@ -73,9 +73,9 @@ This ADR is reopened — and mTLS or OIDC re-evaluated — when any of:
 
 **mTLS now (rejected — overkill for the target).** Generates broker-CA + per-client certificate provisioning friction that does not benefit the single-operator case. The work pays for itself only when there are 3+ operators or a network exposure that mTLS specifically addresses. Today's single-operator workstation is neither.
 
-**No-auth + firewall (rejected — defense-in-depth violation).** "Just rely on the firewall and bind to 127.0.0.1" is the status quo and is exactly what the council rejected. Single-bind-flag-flip from secure to insecure is too fragile a control.
+**No-auth + firewall (rejected — defense-in-depth violation).** "Just rely on the firewall and bind to 127.0.0.1" is the status quo and is exactly what the design review rejected. Single-bind-flag-flip from secure to insecure is too fragile a control.
 
-**Per-endpoint auth selection (rejected — ship-trap per council).** "Auth on /control/* only" splits the auth model into a per-surface decision. Council lens parallel-merge: *"Per-surface auth is a trap: single-dev velocity under deadline pressure produces 'I'll add auth next release' and it doesn't ship."*
+**Per-endpoint auth selection (rejected — ship-trap).** "Auth on /control/* only" splits the auth model into a per-surface decision. From an operational view: *"Per-surface auth is a trap: single-dev velocity under deadline pressure produces 'I'll add auth next release' and it doesn't ship."*
 
 **OAuth/OIDC delegation now (rejected — corporate-fabric dependency).** Adds a dependency on an external IdP that ~zero workstation users want. Deferred to ADR-006-B alongside mTLS.
 
@@ -87,7 +87,7 @@ Code surfaces touched in v0.5:
 - `src/bastion/__main__.py` — add `init` subcommand; refuse non-loopback bind without auth.
 - `src/bastion/paths.py` — new helper `token_path()` returning `${XDG_CONFIG_HOME:-~/.config}/bastion/token`.
 - `src/bastion/dashboard/app.py:997` — `action_service_restart` rewritten to POST `/broker/control/restart` (or invoke DBus, depending on systemd implementation). Sudo path deleted.
-- `src/bastion/server.py` — new `POST /broker/control/restart` endpoint (Call-7 from S121 design review); admin-auth-gated; auditable; returns `202 Accepted`.
+- `src/bastion/server.py` — new `POST /broker/control/restart` endpoint; admin-auth-gated; auditable; returns `202 Accepted`.
 - `config/broker.yaml` — `auth.enabled: false` default unchanged; new `auth.token_path:` defaults to `${XDG_CONFIG_HOME:-~/.config}/bastion/token`; new `auth.lockout:` block.
 - `docs/security.md` — full rewrite of auth section to reflect new defaults.
 - `docs/getting-started.md` — `bastion init` documented as first-run step (but not required on loopback).
@@ -99,8 +99,8 @@ Storage: file mode 0600 enforced on read (if other modes, refuse to start with a
 
 ## References
 
-- S122 plan-C council FINAL_RECOMMENDATION.md Step 2 — auth-as-milestone-gate framing.
-- security-deployment-reviewer lens dissent — sudo path = "load-bearing debt."
-- parallel-merge-safety-engineer lens — per-surface auth as ship-trap.
-- adversarial-failure-mode-auditor lens — prompt-injection via externally-writable broker state.
-- `tmp_S121_PLAN.md` §1 finding F2 → adjacent (broker.yaml hygiene reminder that config defaults matter).
+- Auth-as-milestone-gate framing.
+- Sudo path identified as "load-bearing debt."
+- Per-surface auth identified as a ship-trap.
+- Prompt-injection risk via externally-writable broker state.
+- Related finding: broker.yaml hygiene — config defaults matter.

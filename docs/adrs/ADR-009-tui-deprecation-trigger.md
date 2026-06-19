@@ -2,22 +2,22 @@
 
 **Status:** Accepted (long-horizon; v0.5+ instrumentation, deprecation no earlier than v0.7)
 **Date:** 2026-05-19
-**Deciders:** S122 maintainer with reference to S122 plan-C design review
-**Related:** ADR-005 (BastionPanel contract — TUI lock-in for v0.4), ADR-007 (MCP adapter — first non-TUI surface); S122 plan-C vision-council retro Step 4 (internal artifact, archived)
+**Deciders:** BASTION maintainer
+**Related:** ADR-005 (BastionPanel contract — TUI lock-in for v0.4), ADR-007 (MCP adapter — first non-TUI surface)
 
 ## Context
 
-The Textual TUI dashboard is the only operator surface today. The S122 plan-C council layered Vision D (MCP adapter) on top of Vision C (Grafana) and identified that TUI deprecation, if it happens, comes through *usage erosion* not *strategic deprecation*. The socratic-interrogator lens (council 2026-05-19):
+The Textual TUI dashboard is the only operator surface today. The design direction layers Vision D (MCP adapter) on top of Vision C (Grafana) and identifies that TUI deprecation, if it happens, comes through *usage erosion* not *strategic deprecation*. One design concern (2026-05-19) was:
 
 > *"None of the eight calls produces evidence from user research, issue trackers, or operator logs proving which pain is sharpest."*
 
-The sre-incident-operator-3am lens reinforced:
+From an operational view:
 
 > *"At 3am with a stalled embedding pipeline and a GPU thrashing into swap, I do not want a chat widget."*
 
 Combined message: the TUI has a durable niche (incident response, SSH-only contexts) that MCP adapter (Vision D) and Grafana (Vision C) do NOT replace. TUI deprecation is therefore a **future-state-conditional** decision, not a planned milestone.
 
-The council's Step 4 also triaged Phase C-D polish backlog items against TUI deprecation risk:
+The design review also triaged Phase C-D polish backlog items against TUI deprecation risk:
 
 - **Ship anyway:** env-var layer (C-D-04), deuteranopia theme (C-D-05) — these survive deprecation.
 - **Defer:** ConfirmActionModal (C-D-01), HelpModal glossary (C-D-02), --bell (C-D-06) — these sink with TUI deprecation.
@@ -76,11 +76,11 @@ This ADR is reopened when any of:
 
 1. The trigger holds for 2 consecutive minor releases — at that point, the action is "execute deprecation," not "reconsider the trigger." Reopen for the deprecation plan itself, not the threshold.
 2. Textual (the TUI framework) ships a breaking change that would require >2 weeks of broker-side maintenance — at that point, ADR-009-B reconsiders whether to accelerate deprecation, fork the TUI to a separate package, or absorb the maintenance.
-3. A SECOND non-TUI surface (beyond MCP and Grafana) is greenlit — at that point, "TUI as one of N" loses the "TUI is the durable incident surface" argument the SRE lens made.
+3. A SECOND non-TUI surface (beyond MCP and Grafana) is greenlit — at that point, "TUI as one of N" loses the "TUI is the durable incident surface" argument from the operational review.
 
 ## Alternatives Considered
 
-**No deprecation trigger — TUI is permanent (rejected — open-ended maintenance commitment).** Locks BASTION into supporting three surfaces forever. Council socratic dissent: "None of the calls produces evidence" — but the response is NOT "lock in everything"; it is "instrument and let evidence drive."
+**No deprecation trigger — TUI is permanent (rejected — open-ended maintenance commitment).** Locks BASTION into supporting three surfaces forever. The design review noted "None of the calls produces evidence" — but the response is NOT "lock in everything"; it is "instrument and let evidence drive."
 
 **Telemetry-only trigger (rejected — single-signal fragility).** TUI sessions could drop because of a transient outage in the AI-client landscape, or because the operator population shifts to a different workflow temporarily. Pairing telemetry with maintenance-debt OR operator-survey signal confirms the trend isn't an artifact.
 
@@ -106,9 +106,9 @@ Privacy: `tui_session_start` events stay local in BASTION's audit log. No teleme
 
 ## References
 
-- S122 plan-C council Step 4 — C-D triage rationale.
-- sre-incident-operator-3am lens — durable TUI niche argument.
-- socratic-interrogator lens — evidence-based decision pattern.
+- Phase C-D triage rationale — which polish items survive vs. sink with TUI deprecation (see Context).
+- The durable-TUI-niche argument (incident response, SSH-only contexts) — see Context.
+- The evidence-based decision pattern — instrument signals and let evidence drive deprecation.
 - ADR-005 (BastionPanel direct-accessor contract) — locks panel data shape during the TUI lifetime; ADR-005 gating event #1 ("third operational surface") aligns with this ADR's revisit trigger #3.
 - ADR-007 — MCP adapter ships in v0.5; instrumentation surface ratio starts then.
 

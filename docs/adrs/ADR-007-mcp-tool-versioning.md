@@ -2,16 +2,16 @@
 
 **Status:** Accepted (gates `bastion/mcp_adapter.py` v0.5 ship)
 **Date:** 2026-05-19
-**Deciders:** S122 maintainer with reference to S122 plan-C design review
-**Related:** ADR-006 (auth), ADR-005 (BastionPanel contract); S122 plan-C vision-council retro Step 3 (internal artifact, archived)
+**Deciders:** BASTION maintainer
+**Related:** ADR-006 (auth), ADR-005 (BastionPanel contract)
 
 ## Context
 
-The S122 plan-C council recommends Vision D — `bastion/mcp_adapter.py` exposing `/broker/*` and `/broker/control/*` as MCP tools — as v0.5's third step (after endpoint completeness and auth). The synthesizer lens framed it sharply:
+The design direction for v0.5 is Vision D — `bastion/mcp_adapter.py` exposing `/broker/*` and `/broker/control/*` as MCP tools — as the third step (after endpoint completeness and auth). One design observation framed it sharply:
 
 > *"Any AI client becomes a first-class dashboard with no UI build cost. Vision A emerges as AI-client behavior — no `policy.py` module required; autonomous decisions are AI-client-initiated tool calls with the operator confirmation prompt as the veto."*
 
-Minimum tool manifest from the council:
+Minimum tool manifest:
 
 ```
 broker_status, broker_latency, broker_catalog, broker_intents,
@@ -120,7 +120,6 @@ Naming: `broker_<resource>_v<N>` snake-case. Tool description always carries `(v
 
 ## References
 
-- S122 plan-C council Step 3 — MCP tool manifest.
-- S122 plan-C vision-council retro Step 3 (internal artifact, archived).
+- MCP tool manifest (the seven `broker_*` tools listed under Context).
 - ADR-006 (auth) — adapter uses the same bearer token; no separate auth surface.
 - MCP spec — tool definition format (JSON Schema for input/output, name uniqueness).

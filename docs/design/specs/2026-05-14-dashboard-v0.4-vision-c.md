@@ -1,9 +1,9 @@
 # BASTION v0.4 — Vision C: Grafana-Native Observability
 
-**Date:** 2026-05-14 (amended 2026-05-15 with council corrections from plan review)
-**Status:** Draft (codifies WT-D-01 council pick)
-**Origin:** multi-lens design council, 2026-05-14.
-**Supersedes:** §4 vision-pick decision in `tmp_S121_PLAN.md`. Does not modify Phase A/B/C of that plan.
+**Date:** 2026-05-14 (amended 2026-05-15 with corrections from plan review)
+**Status:** Draft (codifies the WT-D-01 design decision)
+**Origin:** multi-perspective design review, 2026-05-14.
+**Supersedes:** the §4 vision-pick decision from the prior planning round. Does not modify Phase A/B/C of that plan.
 
 ---
 
@@ -15,9 +15,9 @@ BASTION computes far more state than it surfaces, and the only consumer today is
 2. **Small team / dedicated server** — has an ops stack; needs Alertmanager paging integration for 3am incidents.
 3. **Multi-node future** — needs Prometheus federation.
 
-The TUI remains correct for SSH-only and headless boxes (AFM constraint: must never be the sole surface). The gap is an observability substrate that **exports** rather than **displays**.
+The TUI remains correct for SSH-only and headless boxes (failure-mode constraint: it must never be the sole surface). The gap is an observability substrate that **exports** rather than **displays**.
 
-This spec codifies the design review pick: **populate the already-stubbed `/metrics` and `telemetry.py`, ship in-tree Grafana dashboards + a turnkey docker-compose, wire one Alertmanager rule, keep the TUI permanent.**
+This spec codifies the design decision: **populate the already-stubbed `/metrics` and `telemetry.py`, ship in-tree Grafana dashboards + a turnkey docker-compose, wire one Alertmanager rule, keep the TUI permanent.**
 
 ## Design Goal
 
@@ -43,20 +43,20 @@ The TUI continues to work unchanged. Nothing in this spec deprecates, demotes, o
 
 ## Non-Goals
 
-1. **No TUI deprecation.** Permanent coexistence per AFM hard constraint. A failed Grafana container must not blind the operator.
+1. **No TUI deprecation.** Permanent coexistence is a hard constraint. A failed Grafana container must not blind the operator.
 2. **No Vision B work in v0.4.** Queued for v0.4.1, gated on three open ADRs (auth model, in-repo vs. separate package, asset-server crash isolation).
-3. **No new push protocol.** `/broker/stream` SSE remains deferred per the 8-call council; Prometheus scrape is sufficient.
+3. **No new push protocol.** `/broker/stream` SSE remains deferred per the design review; Prometheus scrape is sufficient.
 4. **No BastionPanel refactor as a precondition.** Subscriber pattern is captured in ADR-005 for the next-surface boundary, not v0.4.
 
-## Architectural Decisions (from `decision_dag.json`)
+## Architectural Decisions
 
 | Node | Decision | Choice | Rationale |
 |---|---|---|---|
 | n1 | Push mechanism | Polling (Prometheus scrape) | Zero new code; SSE/WebSocket deferred to Vision B. |
-| n3 | TUI coexistence | Permanent | AFM hard constraint; bounded blast radius. |
+| n3 | TUI coexistence | Permanent | Hard constraint; bounded blast radius. |
 | n4 | Vision primary | Vision C (Grafana) | Reuses existing `metrics.py` + `telemetry.py`; read-only attack surface; no new toolchain. |
 | n5 | Metric completeness | Full signal set | Enables Alertmanager on all three failure-mode signals. |
-| n6 | Docker-compose turnkey | Yes | Forecloses "Grafana burden" objection; SOC endorses. |
+| n6 | Docker-compose turnkey | Yes | Forecloses "Grafana burden" objection; endorsed on operability grounds. |
 | n7 | Grafana JSON location | In-tree at `dashboards/grafana/` | Single repo; versioned with broker. |
 | n8 | Alertmanager rules location | Docker-compose volume (`alerting/bastion.rules.yml`) | Turnkey with compose; available out of box. |
 | n10 | API schema freeze | At v0.3 tag | Clean hand-off; gates Vision B without touching v0.4 work. |
@@ -79,11 +79,11 @@ Each item is a single-purpose worktree. Branches under `feat/vision-c-*`.
 
 | WT | Title | Effort | Branch | Depends on |
 |---|---|---|---|---|
-| **WT-E1** | Schema-freeze the 5 metrics in `metrics.py` (cardinality bounds + emit sites) | Sonnet · 3 h | `feat/vision-c-metrics-schema` | v0.3 tag (or last v0.3 commit) |
-| **WT-E2** | Ship `dashboards/grafana/bastion-overview.json` | Sonnet · 2 h | `feat/vision-c-grafana-overview` | WT-E1 |
-| **WT-E3** | Ship `docker-compose.yml` + `prometheus/`, `grafana/`, `alerting/` config dirs | Sonnet · 2 h | `feat/vision-c-docker-compose` | WT-E2 |
-| **WT-E4** | Add Alertmanager rule `thrashing_detector_halt_total > 0` + wire `POST /broker/control/restart` webhook target | Sonnet · 1 h | `feat/vision-c-alertmanager-rule` | WT-E3, WT-C-Y (restart endpoint from Phase B) |
-| **WT-E5** | Enable OTLP export via `BASTION_OTLP_ENDPOINT` env + `telemetry.py` activation | Sonnet · 1 h | `feat/vision-c-otlp-export` | WT-E1 (file-touch overlap on `config/broker.yaml`) |
+| **WT-E1** | Schema-freeze the 5 metrics in `metrics.py` (cardinality bounds + emit sites) | ~3 h | `feat/vision-c-metrics-schema` | v0.3 tag (or last v0.3 commit) |
+| **WT-E2** | Ship `dashboards/grafana/bastion-overview.json` | ~2 h | `feat/vision-c-grafana-overview` | WT-E1 |
+| **WT-E3** | Ship `docker-compose.yml` + `prometheus/`, `grafana/`, `alerting/` config dirs | ~2 h | `feat/vision-c-docker-compose` | WT-E2 |
+| **WT-E4** | Add Alertmanager rule `thrashing_detector_halt_total > 0` + wire `POST /broker/control/restart` webhook target | ~1 h | `feat/vision-c-alertmanager-rule` | WT-E3, WT-C-Y (restart endpoint from Phase B) |
+| **WT-E5** | Enable OTLP export via `BASTION_OTLP_ENDPOINT` env + `telemetry.py` activation | ~1 h | `feat/vision-c-otlp-export` | WT-E1 (file-touch overlap on `config/broker.yaml`) |
 
 **Sequencing**: E1 → E2 → E3 → E4 (linear). E5 forks from the post-E1 merge commit and runs parallel to E2/E3/E4 from that point. The logical coupling between E1 and E5 is weak (E5 does not consume E1's metric schema), but both worktrees write the same `config/broker.yaml` block, so opening E5 before E1 merges produces a three-way YAML conflict at adjacent keys. None depend on the BastionPanel refactor or any Phase C-C/D layout work.
 
@@ -116,9 +116,9 @@ Each item is a single-purpose worktree. Branches under `feat/vision-c-*`.
 6. `python -m pytest tests/ -v` passes (no regressions).
 7. The TUI continues to render correctly with the new metric emit sites in place.
 
-## Falsifiable Guardrails (from council §5)
+## Falsifiable Guardrails
 
-Re-validation criteria for the vision pick after v0.4 ships.
+Re-validation criteria for the chosen direction after v0.4 ships.
 
 | Observation | Threshold that invalidates C | Triggered action |
 |---|---|---|
@@ -131,12 +131,12 @@ Re-validation criteria for the vision pick after v0.4 ships.
 
 ## Dissent Log
 
-Recorded for posterity.
+Dissenting positions raised during the design review, recorded for posterity.
 
-- **CC** would ship Vision B as primary; argues C is a free dividend of B's API surface.
-- **SYN** would ship E-scoped (headless refactor + B); flags BastionPanel subscriber pattern as the pivot.
-- **PMS** would defer all vision work until v0.3 is tagged clean.
-- **AFM** endorses C conditionally; would prefer B + TUI coexistence if asset-server crash isolation can be guaranteed.
+- One view would ship Vision B as primary, arguing C is a free dividend of B's API surface.
+- A second would ship E-scoped (headless refactor + B), flagging the BastionPanel subscriber pattern as the pivot.
+- A third would defer all vision work until v0.3 is tagged clean.
+- A failure-mode view endorses C conditionally, preferring B + TUI coexistence if asset-server crash isolation can be guaranteed.
 
 ## ADR Queue (deferred to their gating events)
 
@@ -149,14 +149,14 @@ Recorded for posterity.
 
 - Does not commit `docs/dashboard-redesign-spec` (the v0.3 redesign spec is on its own branch; that work is separate and ships first).
 - Does not touch `src/bastion/dashboard/` — TUI work is Phase C of the v0.3 plan.
-- Does not modify the 8-call council synthesis amendments tracked for Phase B/C of the dashboard redesign.
+- Does not modify the design-review synthesis amendments tracked for Phase B/C of the dashboard redesign.
 - Does not pre-commit any specific Grafana panel layout; that's a WT-E2 implementation detail.
 
 ---
 
-## Council Corrections (amendment 2026-05-15)
+## Plan-Review Corrections (amendment 2026-05-15)
 
-The implementation-plan review (4 lenses: parallel-merge-safety-engineer, adversarial-failure-mode-auditor, sre-incident-operator-3am, synthesizer) flagged four spec gaps. All four are folded into the body above and are restated here so the spec/plan delta is auditable.
+The implementation-plan review flagged four spec gaps. All four are folded into the body above and are restated here so the spec/plan delta is auditable.
 
 1. **WT-E5 dependency.** Spec originally said "parallel-safe, depends on: none." Corrected: WT-E5 forks from the post-E1 merge commit because both E1 and E5 write the `observability:` / `telemetry:` blocks of `config/broker.yaml`. The logical coupling is weak; the file-touch overlap is concrete. See Worktree Backlog table.
 
@@ -168,4 +168,4 @@ The implementation-plan review (4 lenses: parallel-merge-safety-engineer, advers
 
 ---
 
-*Spec authored S122 (2026-05-14) by Opus 4.7. Amended S122 (2026-05-15) with plan-review council corrections. Hand-off to implementation worktrees once v0.3 closes and the schema-freeze tag lands.*
+*Spec authored 2026-05-14. Amended 2026-05-15 with plan-review corrections. Hand-off to implementation worktrees once v0.3 closes and the schema-freeze tag lands.*

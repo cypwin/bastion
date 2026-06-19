@@ -268,7 +268,7 @@ _(none open — see "Resolved in v0.4.1" below)_
 ### `GET /broker/version` (new endpoint, paired with the fix above)
 
 - **Was:** A2A batch clients had no way to detect
-  that BASTION was redeployed mid-batch. Three S122 merges restarted the
+  that BASTION was redeployed mid-batch. Three back-to-back merges restarted the
   broker mid-batch and surfaced as four distinct error shapes downstream,
   each needing independent retry tuning.
 - **Fix:** `GET /broker/version` returns `{version, git_sha, boot_time_unix,

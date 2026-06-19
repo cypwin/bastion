@@ -2,18 +2,18 @@
 
 **Status:** Accepted (v0.3 scope)
 **Date:** 2026-05-14
-**Deciders:** S122 maintainer with reference to S121 design review
-**Related:** `docs/design/specs/2026-05-14-dashboard-v0.4-vision-c.md`; design-council synthesizer dissent §4 (internal artifact, archived)
+**Deciders:** BASTION maintainer
+**Related:** `docs/design/specs/2026-05-14-dashboard-v0.4-vision-c.md`
 
 ## Context
 
-The `BastionPanel` base class landed in v0.3 (commit `c203a88`, S122) to scope panel CSS away from the global `Static` rule. Today's TUI panel subclasses (GPUPanel, ModelsPanel, TemperaturePanel, etc.) consume broker state via a `render_data(data: dict[str, Any])` method: the dashboard's polling loop fetches `/broker/status` every N seconds and pushes the resulting dict into each panel's `render_data` call. Panels are direct accessors — they read whatever the polling loop hands them.
+The `BastionPanel` base class landed in v0.3 (commit `c203a88`) to scope panel CSS away from the global `Static` rule. Today's TUI panel subclasses (GPUPanel, ModelsPanel, TemperaturePanel, etc.) consume broker state via a `render_data(data: dict[str, Any])` method: the dashboard's polling loop fetches `/broker/status` every N seconds and pushes the resulting dict into each panel's `render_data` call. Panels are direct accessors — they read whatever the polling loop hands them.
 
-The S121 design review (run 2026-05-14) raised a sharper question through the Synthesizer lens:
+The design review (2026-05-14) raised a sharper question:
 
 > "What tips this: if the v0.3 BastionPanel base class is implemented as a broker-state subscriber rather than a direct state accessor, Vision E is nearly free. If panels reach into broker internals directly, every new surface is a fork."
 
-Vision E (hybrid multi-surface — TUI + Grafana + web + voice + autonomy) was not chosen for v0.4 (Vision C won — Grafana-Native Observability). But the SYN dissent observes that the **shape of `BastionPanel`'s data contract** decides the cost of every future surface, not just whether Vision E ships.
+Vision E (hybrid multi-surface — TUI + Grafana + web + voice + autonomy) was not chosen for v0.4 (Vision C won — Grafana-Native Observability). But this concern observes that the **shape of `BastionPanel`'s data contract** decides the cost of every future surface, not just whether Vision E ships.
 
 Two patterns are in play:
 
@@ -44,7 +44,7 @@ Rationale, in priority order:
 
 **Rejected risk:**
 
-- We are not "leaving Vision E nearly free on the table" (per SYN). Vision E was not picked. The free-ness was conditional on already paying the subscriber cost in v0.3 — which we are explicitly choosing not to do.
+- We are not "leaving Vision E nearly free on the table." Vision E was not picked. The free-ness was conditional on already paying the subscriber cost in v0.3 — which we are explicitly choosing not to do.
 
 **Gating event for revisiting:**
 
@@ -74,6 +74,6 @@ No implementation work follows from this ADR — it ratifies the status quo. The
 
 ## References
 
-- S121 design review FINAL_RECOMMENDATION §4 (Synthesizer dissent) — the original framing of the subscriber-vs-accessor question.
-- S121 design review decision_dag.json n2 — recorded as `"subscriber pattern (broker-state event stream) — recommended: true"`. This ADR formally overrides that node for the v0.3/v0.4 window because the council's recommendation was conditional on Vision E being picked, which it was not.
-- `tmp_S121_PLAN.md` §6 ponder-prompt #2 — "Is Phase A's `_extract_streaming_tokens` wire-up really the highest leverage?" — same shape of question (optimize for a vision we haven't picked vs. ship the vision we did pick). This ADR resolves the analogous question for `BastionPanel`.
+- The original framing of the subscriber-vs-accessor question came from the design review's discussion of future-surface cost.
+- The design review had tentatively recommended the subscriber pattern (broker-state event stream). This ADR formally overrides that recommendation for the v0.3/v0.4 window because it was conditional on Vision E being picked, which it was not.
+- A related question — "Is Phase A's `_extract_streaming_tokens` wire-up really the highest leverage?" — is the same shape (optimize for a vision we haven't picked vs. ship the vision we did pick). This ADR resolves the analogous question for `BastionPanel`.

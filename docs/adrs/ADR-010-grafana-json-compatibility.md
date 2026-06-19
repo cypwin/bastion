@@ -2,18 +2,17 @@
 
 **Status:** Accepted (v0.5 ship-blocker for any `dashboards/grafana/*.json`)
 **Date:** 2026-05-19
-**Deciders:** S122 maintainer with reference to S122 plan-C design review
-**Related:** S122 plan-C vision-council retro Step 5 + adversarial-failure-mode-auditor dissent (internal artifact, archived)
+**Deciders:** BASTION maintainer
 
 ## Context
 
-Vision C (v0.4) ships Grafana JSON in-tree at `dashboards/grafana/*.json`. The S122 plan-C council's adversarial lens dissent was unambiguous:
+Vision C (v0.4) ships Grafana JSON in-tree at `dashboards/grafana/*.json`. A failure-mode review raised an unambiguous concern:
 
 > *"Shipping [Grafana JSON] in-tree without a CI-enforced compatibility fixture guarantees that `dashboards/grafana/*.json` silently stops rendering within two Grafana minor releases."*
 
 The mechanism: Grafana evolves dashboard JSON shape across minor releases. Panel-plugin renames, query-shape changes, deprecated JSON keys silently dropped. Without compatibility validation, the dashboards in-tree become a slowly-rotting artifact. Operators who installed BASTION 6 months ago run a Grafana version that no longer renders BASTION's dashboards. Nobody files a bug because nobody is paid to maintain JSON they didn't write.
 
-The council recommended Step 5: *"One compatibility fixture test per shipped JSON artifact."* This ADR specifies the mechanism.
+The design review recommended one compatibility fixture test per shipped JSON artifact. This ADR specifies the mechanism.
 
 Three credible compatibility approaches:
 
@@ -23,11 +22,11 @@ Three credible compatibility approaches:
 
 **(c) Drop in-tree, provide provisioning guide:** Ship a markdown guide showing operators how to construct equivalent dashboards in their own Grafana instance.
 
-The falsifiable guardrail from the council:
+The falsifiable guardrail from the design review:
 
 > *"5. Grafana CI fixture fails >1×/quarter. Drop JSON in-tree; ship provisioning guide instead."*
 
-This implies the council's preferred state is (b), with (c) as the drop-on-breakage fallback.
+This implies the preferred state is (b), with (c) as the drop-on-breakage fallback.
 
 ## Decision
 
@@ -83,7 +82,7 @@ This ADR is reopened when any of:
 
 **Schema validation ONLY (rejected — false-positives).** JSON Schema is structural, not semantic. A JSON that schema-validates can still render to "Panel plugin not found." Renderer smoke test is needed alongside.
 
-**Drop in-tree now, ship provisioning guide (rejected — premature).** This is the council's drop-on-breakage fallback. The trigger condition (1×/quarter CI failure) has not been observed yet. Premature drop sacrifices the immediate-onboarding value of JSON-in-tree.
+**Drop in-tree now, ship provisioning guide (rejected — premature).** This is the drop-on-breakage fallback. The trigger condition (1×/quarter CI failure) has not been observed yet. Premature drop sacrifices the immediate-onboarding value of JSON-in-tree.
 
 **Image-diff in CI (rejected — flaky).** Pixel-perfect dashboards are too brittle. Renderer smoke test (renders ANYTHING > 5 KB) catches the failure mode that matters (panel-plugin-missing); image-diff catches changes that don't matter (anti-aliasing differences across Grafana minor versions).
 
@@ -104,7 +103,7 @@ Cost estimate: ~3 minutes of additional CI per release, $$ negligible.
 
 ## References
 
-- S122 plan-C council FINAL_RECOMMENDATION Step 5 — Grafana JSON CI fixture requirement.
-- adversarial-failure-mode-auditor lens dissent — silent-rot mechanism.
-- Council guardrail #5 — CI failure >1×/quarter triggers drop-in-tree.
+- Grafana JSON CI fixture requirement — one compatibility fixture test per shipped JSON artifact.
+- The silent-rot mechanism — Grafana JSON shipped in-tree stops rendering within ~2 Grafana minor releases without CI-enforced compatibility validation (see Context).
+- Guardrail #5 — CI failure >1×/quarter triggers drop-in-tree.
 - Grafana documentation — dashboard JSON model, image-renderer plugin, provisioning API.

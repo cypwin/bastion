@@ -2,7 +2,7 @@
 
 > **Date:** 2026-04-20
 > **Status:** Approved
-> **Source:** Internal handoff document from the upstream agent orchestrator
+> **Source:** internal design handoff
 > **Scope:** BASTION-side implementation for M58 Smart Local Offloading
 
 ---

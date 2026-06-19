@@ -2,8 +2,8 @@
 
 **Date**: 2026-03-13
 **Status**: Draft (post-review revision 1)
-**Reviewed by**: Spec reviewer agent (Opus 4.6) — 3 CRITICAL, 5 HIGH findings addressed below
-**Origin**: Comprehensive audit by 11 specialist agents (3 scouts + 8 analysts)
+**Reviewed**: design review — 3 CRITICAL, 5 HIGH findings addressed below
+**Origin**: comprehensive internal audit
 **Synthesis**: internal audit (164 findings; source not committed)
 
 ---

@@ -1,7 +1,7 @@
 """HTTP-contract tests for GET /broker/version.
 
 Motivation: long-batch A2A clients cannot currently detect that
-BASTION was redeployed mid-batch. Three S122 merges restarted the broker
+BASTION was redeployed mid-batch. Three back-to-back merges restarted the broker
 mid-batch during a 31B embedding run and surfaced as four distinct error
 shapes downstream (502, 500 CUDA, ECONNREFUSED, server-disconnected) that
 each needed independent retry tuning. /broker/version exposes a stable

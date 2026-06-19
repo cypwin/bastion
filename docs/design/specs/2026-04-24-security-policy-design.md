@@ -19,7 +19,7 @@ Ship a `SECURITY.md` at the repo root that:
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Primary disclosure channel | GitHub Private Security Advisories | Enabled by default on public repos; integrates with CVE flow; no extra infra |
-| Fallback channel | Email: `cw.claustrum@gmail.com` | Lowers barrier for researchers without GitHub accounts; address is already public in git history |
+| Fallback channel | Email: `cw.claustrum@gmail.com` | Lowers barrier for researchers without GitHub accounts |
 | Supported versions | 0.4.x and 0.3.x | Mirrors existing `docs/security.md` table |
 | Response SLA | Best-effort, no hard numbers | Solo maintainer; hard SLAs become unkept promises |
 | Safe harbor | Yes (good-faith research on own instances) | Standard OSS practice; removes a real reporting barrier |
@@ -105,5 +105,5 @@ No automated tests required; no pytest impact.
 
 ## Risks
 
-- **Email scraping:** `cw.claustrum@gmail.com` will be scraped by bots. User explicitly accepted this since the address is already public in git commit metadata.
+- **Email scraping:** `cw.claustrum@gmail.com` may be scraped by bots — an accepted tradeoff for a low-barrier reporting channel.
 - **Unhandled reports:** A vulnerability report that falls through the cracks is worse than no policy. Mitigation: the best-effort language sets expectations honestly; GPSA also generates GitHub notifications that are harder to miss than email.

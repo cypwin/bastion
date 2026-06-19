@@ -2,18 +2,18 @@
 
 **Status:** Proposed → Deferred (no v0.5 implementation)
 **Date:** 2026-05-19
-**Deciders:** S122 maintainer with reference to S122 plan-C design review
-**Related:** ADR-007 (MCP adapter — Vision A "emerges as AI-client behavior"); S122 plan-C vision-council retro Step 3 + adversarial-failure-mode-auditor dissent (internal artifact, archived)
+**Deciders:** BASTION maintainer
+**Related:** ADR-007 (MCP adapter — Vision A "emerges as AI-client behavior")
 
 ## Context
 
-The S121 design review (2026-05-14) queued ADR-BASTION-03 for "policy decision audit log format — reuse audit_event or new subtype." This anticipated **Vision A — Autonomous Self-Healing Broker** where a `policy.py` module emits decisions like *"queue_depth > 50 → restart qwen3:30b"* with one-line justifications written to an audit log.
+An earlier design review (2026-05-14) queued ADR-BASTION-03 for "policy decision audit log format — reuse audit_event or new subtype." This anticipated **Vision A — Autonomous Self-Healing Broker** where a `policy.py` module emits decisions like *"queue_depth > 50 → restart qwen3:30b"* with one-line justifications written to an audit log.
 
-The S122 plan-C council (2026-05-19) **explicitly punted Vision A as a designed module**:
+A subsequent design review (2026-05-19) **explicitly punted Vision A as a designed module**:
 
 > *"Vision D MCP adapter exposes broker tools to AI clients; Vision A emerges as AI-client behavior — no `policy.py` module required; autonomous decisions are AI-client-initiated tool calls with the operator confirmation prompt as the veto."*
 
-The adversarial-failure-mode-auditor lens (council 2026-05-19) reinforced:
+A failure-mode analysis (2026-05-19) reinforced this:
 
 > *"Vision A compounds [the watchdog blindspot] maximally — `policy.py` calls the local LLM to decide whether to restart the local LLM. Bootstrap failure is guaranteed during the exact incident class BASTION exists to prevent."*
 
@@ -46,7 +46,7 @@ Concretely:
 
 **Accepted:**
 
-- No `policy.py` module is built in v0.5. The council's recommendation (Vision A as AI-client behavior) is honored without additional infrastructure.
+- No `policy.py` module is built in v0.5. The design direction (Vision A as AI-client behavior) is honored without additional infrastructure.
 - The audit subsystem gains one optional `source` field and one optional `mcp_caller_id` field. Backwards-compatible; existing audit consumers ignore unknown fields.
 - A Vision-A-style "decision log" UI is implementable today by filtering `audit_event` where `source == "mcp_adapter"` — no new event type needed.
 - Operators wanting "show me what the AI client decided this hour" would run a planned `bastion audit --source mcp_adapter --since 1h` subcommand (proposed for v0.5; not yet implemented).
@@ -59,7 +59,7 @@ Concretely:
 
 This ADR is reopened — and a `policy_decision` schema designed — when any of:
 
-1. A `policy.py` module is added to BASTION as a designed first-class module (council reopens Vision A as designed-module rather than emergent-behavior).
+1. A `policy.py` module is added to BASTION as a designed first-class module (Vision A is reopened as a designed module rather than emergent behavior).
 2. An AI-client integration in practice requires a richer "decision context" than tool-call audit entries provide (e.g., the AI client wants to record its reasoning trace, not just the tool call).
 3. Compliance/audit requirements emerge (e.g., the broker ships into an environment requiring SOC2-style decision attestation).
 
@@ -67,7 +67,7 @@ If any of (1), (2), (3) hold, draft **ADR-008-B** with the policy-decision schem
 
 ## Alternatives Considered
 
-**New `policy_decision` event subtype now (rejected — premature).** Council picked Vision A as emergent behavior, not designed module. Defining a schema for a module we are not building violates the project's "no premature abstraction" rule.
+**New `policy_decision` event subtype now (rejected — premature).** The design review concluded Vision A is emergent behavior, not a designed module. Defining a schema for a module we are not building violates the project's "no premature abstraction" rule.
 
 **Repurpose `audit_event.type` (rejected — semantic drift).** Adding `type: "policy"` as a new enum value would let consumers filter, but the event content is identical to a tool-call audit. The `source` field is the right axis of variation, not the `type` field.
 
@@ -86,8 +86,8 @@ No schema versioning needed since the change is purely additive.
 
 ## References
 
-- S122 plan-C council FINAL_RECOMMENDATION Step 3 — Vision A as AI-client behavior.
-- S122 council adversarial dissent — Vision A bootstrap failure analysis.
+- Design review decision — Vision A as AI-client behavior, not a designed module.
+- Failure-mode analysis — Vision A bootstrap-failure risk (a `policy.py` that calls the local LLM to decide whether to restart the local LLM).
 - ADR-007 — MCP tool versioning (sister ADR; defines the tool-call source this ADR audits).
 - ADR-006 — auth (defines `mcp_caller_id` provenance).
 - `src/bastion/audit.py` — existing audit event subsystem.
