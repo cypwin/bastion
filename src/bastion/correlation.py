@@ -44,16 +44,48 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from typing import Callable
+from typing import Callable, Literal
 
+from bastion.constants import _fan_band
 from bastion.models import (
+    ContentionEvent,
+    ContentionSnapshot,
     CorrelationConfig,
     CorrelationEvent,
     GPUExtendedStatus,
     MachineSnapshot,
+    RiskIndexResult,
+    ThermalCoupling,
 )
 
 logger = logging.getLogger("bastion.correlation")
+
+# Bounded capacity of the dedicated discrete-contention-event deque (spec 6.3 /
+# Constraint #1). Separate from the ring because contention events are NOT in
+# the snapshot body — they ride GET /broker/correlation/contentions.
+CONTENTION_MAXLEN = 50
+
+# RiskIndex levels keyed on the composite score (spec 6.4). Forward-looking:
+# "risk approaching, not a crash".
+_RISK_LEVEL_NOMINAL = 0.30
+_RISK_LEVEL_ELEVATED = 0.55
+_RISK_LEVEL_HIGH = 0.80
+
+# The five canonical RiskIndex component names (spec 6.4). dominant_factor is
+# always one of these, even when every input is None.
+RISK_COMPONENT_NAMES: tuple[str, ...] = (
+    "vram_headroom",
+    "thermal_headroom",
+    "swap_rate",
+    "thrashing",
+    "memory_psi",
+)
+
+# Headroom (in C) at which the thermal-headroom risk term saturates to 1.0
+# (spec 6.4 — each component normalized to [0,1] before weighting). 20C of
+# headroom or more is treated as zero thermal risk; 0C as full risk.
+_THERMAL_HEADROOM_FULL_RISK_C = 0.0
+_THERMAL_HEADROOM_ZERO_RISK_C = 20.0
 
 # Bounded ring capacity (spec 6.1 / Constraint #1; ~200 KB ceiling at 512).
 RING_MAXLEN = 512
@@ -550,3 +582,470 @@ class CorrelationEngine:
         # Track the current active set so a reason clearing then recurring emits
         # again, but a sustained reason does not.
         self._active_throttle_reasons = reasons
+
+
+# ===========================================================================
+# 6.3 ContentionEventDetector — discrete non-inference contention
+# ===========================================================================
+
+
+class ContentionEventDetector:
+    """Stateful detector for discrete, attributable host-contention events (6.3).
+
+    Compares consecutive ticks and emits a :class:`ContentionEvent` **only when**
+    a threshold crossing **coincides** with an active inference stall — the
+    simultaneous-confirmation join ("IO at 94 % **AND** inference stalled at the
+    same instant") that is the moat. ``htop`` shows the IO alone; only BASTION
+    shows the coincidence.
+
+    Two clearly-separated thresholds, each on its **own unit**, both from
+    :class:`~bastion.models.CorrelationConfig` (no hard-coded constants):
+
+    * **disk leg** — ``contention_block_write_mb_s_threshold`` (MB/s) against the
+      busiest discovered block device's ``write_rate_mb_s``. Device-generic: it
+      keys off whatever base devices ``block_devices`` discovered
+      (``nvme*/sd*/vd*/mmcblk*``), not NVMe specifically.
+    * **PSI leg** — ``contention_psi_threshold`` against ``psi_mem_some_avg10``.
+
+    Each leg uses **edge detection** (fire at the crossing, not every tick above
+    threshold) plus a **2-tick hysteresis** (``contention_hysteresis_ticks``): a
+    leg's condition must hold for that many consecutive ticks before it is
+    eligible to fire, which kills transient kernel-flush spikes. On a host with
+    no PSI and/or no matching block device the corresponding leg's input is
+    ``None`` and that leg simply never fires; the detector degrades to whatever
+    legs *are* available (legs degrade independently).
+
+    Discrete events land in a dedicated bounded ``deque(maxlen=50)``
+    (:data:`CONTENTION_MAXLEN`) — separate from the ring because contention
+    events are not in the snapshot body (they ride
+    ``GET /broker/correlation/contentions``).
+    """
+
+    def __init__(self, config: CorrelationConfig | None = None) -> None:
+        self.config = config if config is not None else CorrelationConfig()
+        self.recent_contentions: deque[ContentionEvent] = deque(maxlen=CONTENTION_MAXLEN)
+        # Per-leg consecutive-over-threshold counters (the hysteresis state) and
+        # the "already fired on this sustained crossing" edge latch.
+        self._disk_streak = 0
+        self._psi_streak = 0
+        self._disk_fired = False
+        self._psi_fired = False
+
+    # -- config accessors (so tests/callers can assert the two units) ---------
+
+    @property
+    def write_mb_s_threshold(self) -> float:
+        """Disk-leg threshold (MB/s) — ``contention_block_write_mb_s_threshold``."""
+        return self.config.contention_block_write_mb_s_threshold
+
+    @property
+    def psi_threshold(self) -> float:
+        """PSI-leg threshold — ``contention_psi_threshold`` on ``psi_mem_some_avg10``."""
+        return self.config.contention_psi_threshold
+
+    @property
+    def hysteresis_ticks(self) -> int:
+        """Consecutive over-threshold ticks required before a leg may fire."""
+        return self.config.contention_hysteresis_ticks
+
+    # -- the per-tick entry point --------------------------------------------
+
+    def feed(
+        self,
+        snapshot: MachineSnapshot | None,
+        *,
+        inference_stalled: bool,
+        stall_reason: str | None,
+    ) -> ContentionEvent | None:
+        """Advance the detector by one tick; return a fired event or ``None``.
+
+        ``inference_stalled``/``stall_reason`` describe the inference state *at
+        this instant* (the scheduler stall the caller already knows). The
+        coincidence join requires a **real** stall: ``inference_stalled`` True
+        **and** a non-empty ``stall_reason``. A missing ``contention`` block (or
+        a ``None`` snapshot) yields no event and never raises — host data is
+        best-effort. Both legs advance their hysteresis each tick; the first leg
+        that satisfies hysteresis *and* coincides with a stall fires (disk
+        preferred, then PSI), and the resulting event is appended to the bounded
+        deque.
+        """
+        try:
+            return self._feed(snapshot, inference_stalled, stall_reason)
+        except Exception:
+            # Contention detection is best-effort intelligence; never raise into
+            # the snapshot loop.
+            logger.debug("contention detector tick failed", exc_info=True)
+            return None
+
+    def _feed(
+        self,
+        snapshot: MachineSnapshot | None,
+        inference_stalled: bool,
+        stall_reason: str | None,
+    ) -> ContentionEvent | None:
+        contention = snapshot.contention if snapshot is not None else None
+
+        # --- evaluate each leg's raw over-threshold condition ----------------
+        write_mb_s = self._busiest_write_rate(contention)
+        disk_over = write_mb_s is not None and write_mb_s >= self.write_mb_s_threshold
+
+        psi_mem = contention.psi_mem_some_avg10 if contention is not None else None
+        psi_over = psi_mem is not None and psi_mem >= self.psi_threshold
+
+        # --- advance hysteresis streaks + edge latches -----------------------
+        self._disk_streak, self._disk_fired = self._advance_leg(
+            disk_over, self._disk_streak, self._disk_fired
+        )
+        self._psi_streak, self._psi_fired = self._advance_leg(
+            psi_over, self._psi_streak, self._psi_fired
+        )
+
+        # A real inference stall = flagged AND a non-empty reason. The join is
+        # the contract: without it, no event regardless of how high the IO is.
+        stalled = bool(inference_stalled and stall_reason)
+        if not stalled:
+            return None
+
+        threshold = self.hysteresis_ticks
+
+        # Disk leg first (the canonical "NVMe burst"), then PSI. A leg is
+        # eligible once its streak reaches the hysteresis and it has not already
+        # fired on the current sustained crossing.
+        if disk_over and self._disk_streak >= threshold and not self._disk_fired:
+            self._disk_fired = True
+            return self._fire(
+                kind="nvme_burst",
+                attribution=self._disk_attribution(contention, write_mb_s),
+                stall_reason=stall_reason,
+                payload={
+                    "write_rate_mb_s": write_mb_s,
+                    "threshold_mb_s": self.write_mb_s_threshold,
+                },
+            )
+        if psi_over and self._psi_streak >= threshold and not self._psi_fired:
+            self._psi_fired = True
+            return self._fire(
+                kind="mem_pressure",
+                attribution=f"memory PSI some={psi_mem:.1f} (>= {self.psi_threshold:.0f})",
+                stall_reason=stall_reason,
+                payload={
+                    "psi_mem_some_avg10": psi_mem,
+                    "threshold": self.psi_threshold,
+                },
+            )
+        return None
+
+    @staticmethod
+    def _advance_leg(over: bool, streak: int, fired: bool) -> tuple[int, bool]:
+        """Advance one leg's (streak, fired-latch) for this tick.
+
+        While the condition holds the streak increments (capped where it stops
+        mattering). When it clears, the streak resets to 0 and the edge latch
+        clears so a *new* crossing can fire again.
+        """
+        if over:
+            # Cap the streak so a long sustained crossing does not overflow; any
+            # value >= hysteresis is equivalent for the eligibility check.
+            return min(streak + 1, 1_000_000), fired
+        return 0, False
+
+    def _fire(
+        self,
+        *,
+        kind: str,
+        attribution: str,
+        stall_reason: str | None,
+        payload: dict,
+    ) -> ContentionEvent:
+        event = ContentionEvent(
+            ts_monotonic=time.monotonic(),
+            ts_wall=time.time(),
+            domain="system",
+            kind=kind,
+            payload=payload,
+            attribution=attribution,
+            inference_was_stalled=True,
+            stall_reason_at_time=stall_reason,
+        )
+        self.recent_contentions.append(event)
+        return event
+
+    @staticmethod
+    def _busiest_write_rate(contention: ContentionSnapshot | None) -> float | None:
+        """Highest ``write_rate_mb_s`` across discovered block devices, or ``None``.
+
+        ``None`` when there is no contention block or no matching device (the
+        disk leg input is absent — the leg simply never fires, no misleading 0).
+        """
+        if contention is None:
+            return None
+        devices = getattr(contention, "block_devices", None) or []
+        busiest: float | None = None
+        for dev in devices:
+            rate = getattr(dev, "write_rate_mb_s", None)
+            if rate is None:
+                continue
+            if busiest is None or rate > busiest:
+                busiest = float(rate)
+        return busiest
+
+    @staticmethod
+    def _disk_attribution(
+        contention: ContentionSnapshot | None, write_mb_s: float | None,
+    ) -> str:
+        """Category-level attribution string for a disk-leg event.
+
+        Stays category-level (device name + rate) — process names are reserved
+        for the TUI process list, never the JSON API, to avoid leaking process
+        info (spec 6.3).
+        """
+        name = "block-device"
+        if contention is not None:
+            for dev in getattr(contention, "block_devices", None) or []:
+                if getattr(dev, "write_rate_mb_s", None) == write_mb_s:
+                    name = getattr(dev, "device", None) or name
+                    break
+        rate_txt = f"{write_mb_s:.0f}MB/s" if write_mb_s is not None else "?"
+        return f"{name} write {rate_txt}"
+
+
+# ===========================================================================
+# 6.4 RiskIndex — composite forward-looking gauge
+# ===========================================================================
+
+
+def _clamp01(x: float) -> float:
+    """Clamp ``x`` into the unit interval [0, 1]."""
+    if x < 0.0:
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    return x
+
+
+def _swap_rate_component(level: str | None) -> float | None:
+    """Normalize a scheduler swap-rate level label to [0, 1] (``None`` -> absent).
+
+    The detector's level labels (``normal``/``warn``/``critical``) are mapped to
+    risk magnitudes. An unknown label degrades to ``None`` (absent term), never a
+    misleading 0. The mapping reflects the *ordering* of the configured
+    thresholds, not their literal values, so it stays portable.
+    """
+    if level is None:
+        return None
+    mapping = {"normal": 0.0, "warn": 0.5, "critical": 1.0}
+    return mapping.get(str(level).lower())
+
+
+def _thrashing_component(verdict: str | None) -> float | None:
+    """Normalize a thrashing worst-verdict label to [0, 1] (``None`` -> absent)."""
+    if verdict is None:
+        return None
+    mapping = {"ok": 0.0, "warn": 0.5, "halt": 1.0, "halted": 1.0, "warned": 0.5}
+    return mapping.get(str(verdict).lower())
+
+
+def _level_for_score(score: float) -> Literal["nominal", "elevated", "high", "critical"]:
+    """Map a composite score in [0, 1] to a discrete risk level (spec 6.4)."""
+    if score < _RISK_LEVEL_NOMINAL:
+        return "nominal"
+    if score < _RISK_LEVEL_ELEVATED:
+        return "elevated"
+    if score < _RISK_LEVEL_HIGH:
+        return "high"
+    return "critical"
+
+
+def compute_risk_index(
+    *,
+    vram_utilization_pct: float | None,
+    thermal_headroom_c: float | None,
+    swap_rate_level: str | None,
+    thrashing_verdict: str | None,
+    memory_psi: float | None,
+    config: CorrelationConfig | None = None,
+) -> RiskIndexResult:
+    """Fold five live signals into one composite risk gauge (spec 6.4).
+
+    Pure function: takes already-extracted scalar inputs (so it is trivially
+    testable and has no I/O), normalizes each to [0, 1], weights them by
+    ``config.risk_weights``, and returns a :class:`RiskIndexResult` with
+    ``score`` ∈ [0, 1], a discrete ``level``, the per-component ``component_scores``
+    (only the *measured* components), and a ``dominant_factor`` (always one of the
+    five bounded component names, so it is safe as a Prometheus label).
+
+    Each component degrades **independently**: any input that is ``None`` (e.g.
+    thermal headroom on a no-GPU host, PSI on an old kernel) contributes nothing
+    — the term is *absent* from the weighted average, **not** a misleading
+    zero-risk reading for a present-but-unmeasured signal. When every input is
+    ``None`` the score is ``0.0``/``nominal``. The composite is the weighted mean
+    over the components that *are* present, so dropping a component does not
+    artificially deflate the score.
+
+    Parameters
+    ----------
+    vram_utilization_pct:
+        VRAM used as a percentage (0-100); higher = less headroom = more risk.
+    thermal_headroom_c:
+        Minimum thermal headroom in C (e.g. from :class:`ThermalCoupling`); less
+        headroom = more risk. Saturates to full risk at 0C, zero risk at
+        :data:`_THERMAL_HEADROOM_ZERO_RISK_C`.
+    swap_rate_level:
+        Scheduler swap-rate level label (``normal``/``warn``/``critical``).
+    thrashing_verdict:
+        Worst thrashing verdict label (``ok``/``warn``/``halt``).
+    memory_psi:
+        ``psi_mem_some_avg10`` (0-100); higher = more stalled-on-memory = more risk.
+    """
+    cfg = config if config is not None else CorrelationConfig()
+    weights = cfg.risk_weights or {}
+
+    # --- normalize each component to [0, 1]; None => absent term -------------
+    components: dict[str, float | None] = {
+        "vram_headroom": (
+            _clamp01(vram_utilization_pct / 100.0)
+            if vram_utilization_pct is not None
+            else None
+        ),
+        "thermal_headroom": _normalize_thermal_headroom(thermal_headroom_c),
+        "swap_rate": _swap_rate_component(swap_rate_level),
+        "thrashing": _thrashing_component(thrashing_verdict),
+        "memory_psi": (
+            _clamp01(memory_psi / 100.0) if memory_psi is not None else None
+        ),
+    }
+
+    component_scores: dict[str, float] = {
+        name: val for name, val in components.items() if val is not None
+    }
+
+    # Weighted mean over the PRESENT components (so an absent term neither adds
+    # risk nor deflates the score by occupying weight it cannot fill).
+    weighted_sum = 0.0
+    weight_total = 0.0
+    for name, val in component_scores.items():
+        w = float(weights.get(name, 0.0))
+        weighted_sum += w * val
+        weight_total += w
+    score = _clamp01(weighted_sum / weight_total) if weight_total > 0 else 0.0
+
+    dominant_factor = _dominant_factor(component_scores, weights)
+
+    return RiskIndexResult(
+        score=score,
+        level=_level_for_score(score),
+        component_scores=component_scores,
+        dominant_factor=dominant_factor,
+    )
+
+
+def _normalize_thermal_headroom(headroom_c: float | None) -> float | None:
+    """Map thermal headroom (C) to a [0, 1] risk magnitude (``None`` -> absent).
+
+    0C of headroom (or less) = full risk (1.0); ``_THERMAL_HEADROOM_ZERO_RISK_C``
+    or more = zero risk (0.0); linear in between.
+    """
+    if headroom_c is None:
+        return None
+    span = _THERMAL_HEADROOM_ZERO_RISK_C - _THERMAL_HEADROOM_FULL_RISK_C
+    if span <= 0:
+        return 1.0 if headroom_c <= _THERMAL_HEADROOM_FULL_RISK_C else 0.0
+    risk = (_THERMAL_HEADROOM_ZERO_RISK_C - headroom_c) / span
+    return _clamp01(risk)
+
+
+def _dominant_factor(
+    component_scores: dict[str, float], weights: dict[str, float],
+) -> str:
+    """The single most risk-contributing component name (always one of the five).
+
+    Ranks by **weighted** contribution (``weight * component_score``) so the
+    dominant factor reflects what actually moved the composite, then breaks ties
+    by the canonical order. When no component is measured, falls back to the
+    first canonical name so the field is never empty and stays a bounded label.
+    """
+    best_name: str | None = None
+    best_contrib = -1.0
+    for name in RISK_COMPONENT_NAMES:
+        if name not in component_scores:
+            continue
+        contrib = float(weights.get(name, 0.0)) * component_scores[name]
+        if contrib > best_contrib:
+            best_contrib = contrib
+            best_name = name
+    if best_name is not None:
+        return best_name
+    return RISK_COMPONENT_NAMES[0]
+
+
+# ===========================================================================
+# 6.5 CPU<->GPU thermal coupling
+# ===========================================================================
+
+
+def build_thermal_coupling(
+    *,
+    cpu_temp_c: float | None,
+    gpu_temp_c: float | None,
+    fan_speed_pct: int | None,
+    gpu_max_temperature_c: int | float | None,
+    config: CorrelationConfig | None = None,
+) -> ThermalCoupling:
+    """Build the :class:`ThermalCoupling` derivation (spec 6.5).
+
+    Makes explicit what the TUI auto-fan logic already knows implicitly: CPU heat
+    drives the GPU fan, so CPU heat indirectly constrains GPU throughput.
+
+    ``coupling_active`` is derived from the **definitive fan curve**
+    (:func:`bastion.constants._fan_band`) — never a duplicated constant —
+    as ``cpu_temp_c is not None and _fan_band(cpu_temp_c) is not None``, so any
+    future change to the escalation curve is honored automatically and there is
+    no app->engine / engine->app import (ADR-005).
+
+    ``thermal_headroom_min_c`` is the minimum headroom over the two terms that
+    are computable::
+
+        min(
+            gpu_ceiling      - gpu_temp_c,   # GPU term — only if both non-None
+            cpu_safe_ceiling - cpu_temp_c,   # CPU term — only if both non-None
+        )
+
+    where ``cpu_safe_ceiling`` = ``config.cpu_safe_ceiling_c`` (default **85.0**,
+    NOT the 60C fan-engagement threshold — that would read zero headroom the
+    instant the fan engages) and ``gpu_ceiling`` = ``config.gpu_safe_ceiling_c``
+    if set, else ``gpu_max_temperature_c`` (the device-auto-detected
+    ``GPUConfig.max_temperature_c``). A term is **skipped** when its inputs are
+    missing (``gpu_temp_c`` None, or the GPU ceiling unset/0 on a no-GPU host),
+    so the headroom is the present-terms-only value, never a misleading 0; it is
+    ``None`` only when *neither* term is computable.
+
+    All inputs are ``None``-tolerant: ``gpu_temp_c``/``fan_speed_pct`` are
+    ``None`` on non-NVIDIA / no-GPU / fanless-server-GPU hosts; ``cpu_temp_c`` is
+    ``None`` when no CPU sensor is discovered.
+    """
+    cfg = config if config is not None else CorrelationConfig()
+
+    coupling_active = cpu_temp_c is not None and _fan_band(cpu_temp_c) is not None
+
+    # Resolve the GPU ceiling: explicit override wins, else the device-detected
+    # GPUConfig.max_temperature_c. 0/None/<=0 means "no GPU ceiling known".
+    gpu_ceiling: float | None = cfg.gpu_safe_ceiling_c
+    if gpu_ceiling is None:
+        if gpu_max_temperature_c is not None and gpu_max_temperature_c > 0:
+            gpu_ceiling = float(gpu_max_temperature_c)
+
+    headroom_terms: list[float] = []
+    if gpu_ceiling is not None and gpu_ceiling > 0 and gpu_temp_c is not None:
+        headroom_terms.append(gpu_ceiling - gpu_temp_c)
+    if cpu_temp_c is not None:
+        headroom_terms.append(cfg.cpu_safe_ceiling_c - cpu_temp_c)
+
+    thermal_headroom_min_c = min(headroom_terms) if headroom_terms else None
+
+    return ThermalCoupling(
+        cpu_temp_c=cpu_temp_c,
+        gpu_temp_c=gpu_temp_c,
+        fan_speed_pct=fan_speed_pct,
+        coupling_active=coupling_active,
+        thermal_headroom_min_c=thermal_headroom_min_c,
+    )
