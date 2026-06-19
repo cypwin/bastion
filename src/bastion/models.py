@@ -277,6 +277,13 @@ class ObservabilityConfig(BaseModel):
     # Fast-tick cadence (seconds) for the broker-side _machine_snapshot_loop
     # (spec 4.9). Monotonic-anchored: a slow nvidia-smi does not compound drift.
     snapshot_interval_s: float = 2.0
+    # Slow-tick cadence (seconds) for subprocess-heavy / rarely-changing GPU
+    # signals — throttle reasons, PCIe tx/rx, Xid scan (spec 4.9 slow path).
+    # The loop derives an integer tick-modulo from
+    # round(slow_tick_interval_s / snapshot_interval_s); the most recent slow
+    # result is cached and reused on the intervening fast ticks so the 2s fast
+    # path is never blocked by 30s-stale subprocess work.
+    slow_tick_interval_s: float = 30.0
     # List of process names or `pid:NNN` always shown in the attribution panel.
     process_watchlist: list[str] = Field(default_factory=list)
     churn_threshold: int = 5  # New-PID count per slow tick that fires a churn event
