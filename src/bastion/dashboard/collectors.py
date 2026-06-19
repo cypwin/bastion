@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
 import threading
@@ -849,11 +850,9 @@ class SystemDataCollector:
 
         # Refresh the own-PID registry on the slow tick; reuse the cache otherwise.
         if slow_tick or not self._own_pids:
-            try:
-                self._own_pids = self._build_own_pid_registry(config)
-            except Exception:
+            with contextlib.suppress(Exception):
                 # Keep the prior cache rather than dropping all role tags.
-                pass
+                self._own_pids = self._build_own_pid_registry(config)
         own_pids = dict(self._own_pids)
 
         # ── Scan processes once: cpu/mem/io into one row per pid ────────────
@@ -1018,9 +1017,8 @@ class SystemDataCollector:
                     continue
                 is_ollama = any(n in name for n in self._OLLAMA_PROC_NAMES)
                 # Prefer a port-confirmed pid; otherwise fall back to name match.
-                if port_matched_pid is not None and pid == port_matched_pid:
-                    registry[pid] = "ollama"
-                elif port_matched_pid is None and is_ollama:
+                if (port_matched_pid is not None and pid == port_matched_pid
+                        or port_matched_pid is None and is_ollama):
                     registry[pid] = "ollama"
         except Exception:
             return registry

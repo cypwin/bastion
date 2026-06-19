@@ -27,10 +27,8 @@ import pytest
 from bastion.dashboard.collectors import SystemDataCollector
 from bastion.models import (
     ProcessChurnEvent,
-    ProcessRow,
     ProcessSnapshot,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fake psutil process objects
@@ -48,7 +46,7 @@ class _FakeMem:
         self.rss = rss
 
 
-class _FakeAccessDenied(Exception):
+class _FakeAccessDeniedError(Exception):
     """Stands in for ``psutil.AccessDenied`` in the fakes."""
 
 
@@ -270,7 +268,6 @@ async def test_churn_detector_fires_and_is_bounded() -> None:
 
     # Drive 15 churn ticks; the deque must stay bounded at maxlen=10.
     for k in range(15):
-        base = list(range(1, 2 + k * 10))
         nxt = list(range(1, 2 + (k + 1) * 10))
         with patch(
             "bastion.dashboard.collectors.psutil.process_iter", return_value=procs
