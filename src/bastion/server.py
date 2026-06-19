@@ -50,8 +50,10 @@ from bastion.models import (
     BrokerThrashing,
     BrokerThrashingAgent,
     CatalogEntry,
+    ContentionSnapshot,
     IntentDeclaration,
     IntentResponse,
+    MachineSnapshot,
     PriorityTier,
     QueuedRequest,
     ThrashingVerdictLabel,
@@ -192,6 +194,182 @@ def _lookup_intent(intent_id: str):
 
 # ── Recent requests ring buffer (S5: Dashboard Evolution) ────────────
 _recent_requests: deque[dict] = deque(maxlen=500)
+
+# ── Machine snapshot collection (observability spec 4.9/4.10) ─────────
+# The broker owns collection so /broker/snapshot works headless; the TUI is
+# a client (ADR-005). The deque stores model_dump() dicts so ?history=N
+# slices need no re-serialization (mirrors _recent_requests). maxlen=180 ≈
+# 6 min at the 2s fast tick (Constraint #1). Bounded, in-memory, no DB.
+_machine_snapshot_deque: deque[dict] = deque(maxlen=180)
+_machine_snapshot_task: asyncio.Task | None = None
+# Broker-side host-pressure collector (PSI/swap/OOM). Distinct from the TUI's
+# own SystemDataCollector instance — each tracks its own delta state on an
+# independent cadence (spec 4.9). Instantiated lazily so the import stays cheap
+# and tests that never touch the snapshot path pay nothing.
+_system_collector: Any | None = None
+
+
+def _get_system_collector() -> Any:
+    """Return the broker-side SystemDataCollector, creating it on first use."""
+    global _system_collector
+    if _system_collector is None:
+        from bastion.dashboard.collectors import SystemDataCollector
+        _system_collector = SystemDataCollector()
+    return _system_collector
+
+
+async def _collect_contention() -> ContentionSnapshot | None:
+    """Assemble the host-pressure leg of the snapshot (PSI/swap/OOM).
+
+    Every sub-collector is individually graceful (returns None fields on
+    hosts that lack the source — no PSI on old kernels, no swap on first
+    read), so a partial ``ContentionSnapshot`` with ``None`` fields is the
+    expected value here and is still emitted. The block-device / RAPL legs
+    are wired in Phase 2; for now those fields stay at their model defaults
+    (``[]`` / ``None``), never a misleading ``0``.
+    """
+    try:
+        collector = _get_system_collector()
+        psi = collector.get_psi_data()
+        swap = collector.get_swap_rate_data()
+        oom = collector.get_oom_data()
+        return ContentionSnapshot(
+            psi_cpu_some_avg10=psi.get("psi_cpu_some_avg10"),
+            psi_cpu_full_avg10=psi.get("psi_cpu_full_avg10"),
+            psi_mem_some_avg10=psi.get("psi_mem_some_avg10"),
+            psi_mem_full_avg10=psi.get("psi_mem_full_avg10"),
+            psi_io_some_avg10=psi.get("psi_io_some_avg10"),
+            psi_io_full_avg10=psi.get("psi_io_full_avg10"),
+            swap_in_rate_mb_s=swap.get("swap_in_rate_mb_s"),
+            swap_out_rate_mb_s=swap.get("swap_out_rate_mb_s"),
+            oom_kill_total=oom.get("oom_kill_total"),
+            oom_kill_rate=oom.get("oom_kill_rate"),
+        )
+    except Exception:
+        logger.exception("contention collection failed; emitting None leg")
+        return None
+
+
+async def _collect_broker_status_lite() -> BrokerStatus | None:
+    """Assemble a lightweight ``BrokerStatus`` for embedding in the snapshot.
+
+    Mirrors the /broker/status assembly but stays defensive: any missing
+    collaborator yields a partial status rather than raising, so the snapshot
+    loop never dies. The full observability-field enrichment lives on the
+    /broker/status route; the snapshot embeds the core model.
+    """
+    try:
+        loaded_raw = (
+            await _vram_tracker.get_loaded_models() if _vram_tracker else []
+        )
+        loaded = loaded_raw if loaded_raw is not None else []
+        return BrokerStatus(
+            uptime_seconds=time.time() - _start_time,
+            queue_depth=_queue.total_size if _queue else 0,
+            queue_by_model=_queue.queue_depth_by_model() if _queue else {},
+            loaded_models=loaded,
+            vram_state="unknown" if loaded_raw is None else "ok",
+            current_model=_scheduler.current_model if _scheduler else None,
+            total_requests_served=_proxy._requests_served if _proxy else 0,
+            total_model_swaps=_scheduler.total_swaps if _scheduler else 0,
+            state="draining" if (_scheduler and _scheduler.is_draining) else "running",
+            total_dispatched=_scheduler.total_dispatched if _scheduler else 0,
+            inflight_models=dict(_inflight_models),
+        )
+    except Exception:
+        logger.exception("broker status leg failed; emitting None leg")
+        return None
+
+
+async def _collect_machine_snapshot(tick: int) -> MachineSnapshot:
+    """Assemble one ``MachineSnapshot`` from the backend + collectors (spec 4.9).
+
+    Each leg is wrapped for graceful ``None`` (Constraint #4): a failing or
+    absent source yields a ``None``/empty leg, never an exception and never a
+    misleading ``0``. On a ``StubBackend`` / no-GPU host ``query_gpu_status``
+    returns an empty ``GPUStatus`` (all inner fields ``None``) — the correct
+    complete value there. The slow-path legs (``gpu_extended``, ``process``)
+    and the stream-tapped ``inference`` / ``correlation`` legs are wired in
+    later phases; in Phase 1 they remain ``None``.
+    """
+    snapshot_ts = time.time()
+
+    try:
+        gpu = await query_gpu_status()
+    except Exception:
+        logger.exception("GPU status leg failed; using empty GPUStatus")
+        from bastion.models import GPUStatus
+        gpu = GPUStatus()
+
+    broker = await _collect_broker_status_lite()
+    contention = await _collect_contention()
+
+    return MachineSnapshot(
+        snapshot_ts=snapshot_ts,
+        broker=broker,
+        gpu=gpu,
+        gpu_extended=None,
+        contention=contention,
+        process=None,
+        inference=None,
+        correlation=None,
+    )
+
+
+async def _machine_snapshot_loop() -> None:
+    """Monotonic-anchored collection loop (spec 4.9, the single tick authority).
+
+    Records ``collection_start = time.monotonic()`` before the work and sleeps
+    ``max(0.0, interval - elapsed)`` so a slow ``nvidia-smi`` (up to its 5s
+    timeout during a GPU lockup) does not compound cadence drift. The interval
+    is the configured fast tick (``observability.snapshot_interval_s``, default
+    2s). The body is wrapped so a transient exception never kills the loop and
+    leaves the snapshot stale forever.
+    """
+    interval = 2.0
+    if _config is not None:
+        interval = max(0.25, _config.observability.snapshot_interval_s)
+    tick = 0
+    while True:
+        collection_start = time.monotonic()
+        try:
+            snap = await _collect_machine_snapshot(tick)
+            _machine_snapshot_deque.appendleft(snap.model_dump())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("snapshot loop iteration failed")  # loop never dies
+        tick += 1
+        elapsed = time.monotonic() - collection_start
+        await asyncio.sleep(max(0.0, interval - elapsed))
+
+
+async def _handle_snapshot(request: Request) -> Any:
+    """Standalone handler for ``GET /broker/snapshot`` (dual-registered, 4.10).
+
+    Returns the most recent ``MachineSnapshot`` from the in-memory deque. If
+    the collection loop has not produced one yet (e.g. immediately after
+    startup), it collects one on demand so the endpoint never 404s or returns
+    an empty body before the first tick. ``?history=N`` returns the last N
+    snapshots (newest first), capped at the deque length.
+    """
+    history_raw = request.query_params.get("history")
+    if history_raw is not None:
+        try:
+            n = int(history_raw)
+        except ValueError:
+            n = 1
+        n = max(1, min(n, len(_machine_snapshot_deque) or 1))
+        items = list(_machine_snapshot_deque)[:n]
+        if not items:
+            items = [(await _collect_machine_snapshot(0)).model_dump()]
+        return JSONResponse({"snapshots": items, "count": len(items)})
+
+    if _machine_snapshot_deque:
+        return JSONResponse(_machine_snapshot_deque[0])
+    # No tick has landed yet — collect one on demand.
+    snap = await _collect_machine_snapshot(0)
+    return JSONResponse(snap.model_dump())
 
 
 def record_recent_request(
@@ -753,6 +931,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     )
     logger.info("Queue sweep started (TTL=%.0fs, interval=60s)", ttl)
 
+    # Start the broker-side machine-snapshot collection loop (observability
+    # spec 4.9). The broker owns collection so /broker/snapshot works headless;
+    # the TUI is a client that polls it (ADR-005).
+    global _machine_snapshot_task
+    _machine_snapshot_task = asyncio.create_task(
+        _machine_snapshot_loop(), name="bastion-machine-snapshot"
+    )
+    logger.info(
+        "Machine snapshot loop started (interval=%.1fs)",
+        config.observability.snapshot_interval_s,
+    )
+
     # Start process monitor (Ollama health + GPU lockup detection)
     global _process_monitor
     _process_monitor = ProcessMonitor(
@@ -782,6 +972,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     if _sweep_task:
         _sweep_task.cancel()
         _sweep_task = None
+    if _machine_snapshot_task:
+        _machine_snapshot_task.cancel()
+        _machine_snapshot_task = None
     if _process_monitor:
         await _process_monitor.stop()
     if _scheduler:
@@ -1353,6 +1546,12 @@ def create_app(config: BrokerConfig) -> FastAPI:
             snapshot_age_s=snapshot_age_s,
             residency_state="unknown" if loaded_raw is None else "ok",
         )
+
+    # ── Machine snapshot (observability spec 4.9/4.10) ──────────────
+    # Single-sourced handler registered in BOTH factories (dual-factory tax,
+    # spec 4.10 — there is no shared router; registering once would 404 in the
+    # admin-only two-port deployment).
+    broker_router.add_api_route("/snapshot", _handle_snapshot, methods=["GET"])
 
     # ── A2A Interface Routes ────────────────────────────────────────
 
@@ -2166,6 +2365,11 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
             snapshot_age_s=snapshot_age_s,
             residency_state="unknown" if loaded_raw is None else "ok",
         )
+
+    # ── Machine snapshot (observability spec 4.9/4.10) ──────────────
+    # Same single-sourced handler as create_app — registered here too so the
+    # admin-only two-port deployment serves /broker/snapshot (spec 4.10).
+    broker_router.add_api_route("/snapshot", _handle_snapshot, methods=["GET"])
 
     # ── A2A Interface Routes ────────────────────────────────────────
 
