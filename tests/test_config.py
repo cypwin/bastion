@@ -114,6 +114,140 @@ class TestLoadConfig:
         assert config.request_overrides.use_mmap is False
 
 
+class TestObservabilityConfigLoading:
+    """``observability:`` block wiring through ``load_config`` (spec 4.8, T2-config).
+
+    These exercise the YAML-file -> ``load_config`` -> ``BrokerConfig`` path
+    (not direct ``BrokerConfig(**)`` construction, which is covered in
+    ``test_observability_models.py``).  The contract: a present block populates
+    ``ObservabilityConfig`` + nested ``CorrelationConfig`` and is NOT silently
+    dropped; an absent block yields defaults via the default factory; an unknown
+    sub-key behaves per the existing config strictness (Pydantic ``extra=ignore``,
+    consistent with every other ``BrokerConfig`` sub-model).
+    """
+
+    def test_present_block_parses_into_model(self, tmp_path):
+        """A YAML observability block populates ObservabilityConfig fields."""
+        cfg = {
+            "observability": {
+                "churn_threshold": 9,
+                "process_watchlist": ["ollama", "pid:1234"],
+                "ecc_enabled": True,
+                "cpu_sensor_name": "zenpower",
+                "psi_io_full_warn_pct": 7.5,
+                "psi_io_full_crit_pct": 40.0,
+            }
+        }
+        path = tmp_path / "test.yaml"
+        path.write_text(yaml.dump(cfg))
+
+        config = load_config(path)
+        obs = config.observability
+        assert obs.churn_threshold == 9
+        assert obs.process_watchlist == ["ollama", "pid:1234"]
+        assert obs.ecc_enabled is True
+        assert obs.cpu_sensor_name == "zenpower"
+        assert obs.psi_io_full_warn_pct == 7.5
+        assert obs.psi_io_full_crit_pct == 40.0
+
+    def test_present_nested_correlation_block_parses(self, tmp_path):
+        """A nested observability.correlation block populates CorrelationConfig."""
+        cfg = {
+            "observability": {
+                "correlation": {
+                    "ring_maxlen": 1024,
+                    "ring_tail_in_snapshot": 16,
+                    "contention_block_write_mb_s_threshold": 2000.0,
+                    "cpu_safe_ceiling_c": 90.0,
+                    "gpu_safe_ceiling_c": 93.0,
+                    "risk_weights": {
+                        "vram_headroom": 0.30,
+                        "thermal_headroom": 0.20,
+                        "swap_rate": 0.20,
+                        "thrashing": 0.20,
+                        "memory_psi": 0.10,
+                    },
+                }
+            }
+        }
+        path = tmp_path / "test.yaml"
+        path.write_text(yaml.dump(cfg))
+
+        config = load_config(path)
+        corr = config.observability.correlation
+        assert corr.ring_maxlen == 1024
+        assert corr.ring_tail_in_snapshot == 16
+        assert corr.contention_block_write_mb_s_threshold == 2000.0
+        assert corr.cpu_safe_ceiling_c == 90.0
+        assert corr.gpu_safe_ceiling_c == 93.0
+        assert corr.risk_weights["vram_headroom"] == 0.30
+
+    def test_absent_block_yields_defaults(self, tmp_path):
+        """A YAML without an observability block falls back to defaults."""
+        cfg = {"server": {"port": 11434}}
+        path = tmp_path / "test.yaml"
+        path.write_text(yaml.dump(cfg))
+
+        config = load_config(path)
+        obs = config.observability
+        # Documented defaults from spec 4.8.
+        assert obs.churn_threshold == 5
+        assert obs.process_watchlist == []
+        assert obs.ecc_enabled is False
+        assert obs.cpu_sensor_name is None
+        assert obs.psi_io_full_warn_pct == 5.0
+        assert obs.psi_io_full_crit_pct == 25.0
+        # Nested correlation defaults too.
+        assert obs.correlation.ring_maxlen == 512
+        assert obs.correlation.contention_block_write_mb_s_threshold == 200.0
+        assert obs.correlation.gpu_safe_ceiling_c is None
+
+    def test_absent_observability_key_entirely(self, tmp_path, monkeypatch):
+        """No config file at all still yields a populated observability default."""
+        monkeypatch.chdir(tmp_path)
+        config = load_config(None)
+        assert config.observability.churn_threshold == 5
+        assert config.observability.correlation.ring_maxlen == 512
+
+    def test_unknown_subkey_is_ignored(self, tmp_path):
+        """An unknown observability sub-key behaves per existing config strictness.
+
+        Every BrokerConfig sub-model uses Pydantic v2's default ``extra=ignore``;
+        an unrecognized key is dropped rather than raising, and known siblings in
+        the same block still parse.
+        """
+        cfg = {
+            "observability": {
+                "made_up_future_key": 123,
+                "churn_threshold": 4,
+            }
+        }
+        path = tmp_path / "test.yaml"
+        path.write_text(yaml.dump(cfg))
+
+        config = load_config(path)
+        # Known sibling still parsed; unknown key silently dropped.
+        assert config.observability.churn_threshold == 4
+        assert not hasattr(config.observability, "made_up_future_key")
+
+    def test_unknown_correlation_subkey_is_ignored(self, tmp_path):
+        """Unknown keys under observability.correlation are also ignored."""
+        cfg = {
+            "observability": {
+                "correlation": {
+                    "made_up_corr_key": "x",
+                    "ring_maxlen": 256,
+                }
+            }
+        }
+        path = tmp_path / "test.yaml"
+        path.write_text(yaml.dump(cfg))
+
+        config = load_config(path)
+        assert config.observability.correlation.ring_maxlen == 256
+        assert not hasattr(config.observability.correlation, "made_up_corr_key")
+
+
 class TestLoadedFrom:
     def test_load_config_records_resolved_source_path(self, tmp_path):
         """/broker/catalog's registry_source depends on this being populated."""
