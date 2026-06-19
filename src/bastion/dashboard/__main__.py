@@ -3,4 +3,5 @@ from __future__ import annotations
 
 from bastion.dashboard import main
 
-main()
+if __name__ == "__main__":
+    main()
