@@ -228,6 +228,13 @@ _recent_requests: deque[dict] = deque(maxlen=500)
 # 6 min at the 2s fast tick (Constraint #1). Bounded, in-memory, no DB.
 _machine_snapshot_deque: deque[dict] = deque(maxlen=180)
 _machine_snapshot_task: asyncio.Task | None = None
+# SSE snapshot stream (spec 5.6). Caps concurrent /broker/snapshot/stream
+# clients so a misbehaving fleet of subscribers can't open unbounded
+# generators (each holds a slow loop). The 9th concurrent client gets 503.
+# In-process int (single event loop) — no lock needed; mutated only on the
+# loop thread at stream open/close.
+_SNAPSHOT_STREAM_MAX_CLIENTS = 8
+_snapshot_stream_clients = 0
 # Most-recent slow-path GPU extended status (throttle/PCIe/Xid). Refreshed only
 # on the slow tick (spec 4.9, ~30s) by a backend subprocess; cached here so the
 # 2s fast snapshot can attach the latest value without re-polling — the fast
@@ -876,6 +883,114 @@ def _expand_full_ring(body: dict) -> dict:
     out_corr["ring_size"] = len(full)
     out["correlation"] = out_corr
     return out
+
+
+async def _sse_wrapper(
+    generator: AsyncGenerator[dict | None, None],
+) -> AsyncGenerator[bytes, None]:
+    """Wrap a dict-event generator as SSE-formatted bytes (shared helper).
+
+    Single shared SSE encoder for every ``StreamingResponse`` in this module
+    (the A2A task stream and ``/broker/snapshot/stream``). Deduped from the two
+    near-identical nested copies that previously lived inside ``create_app`` and
+    ``create_admin_app``. Handles three event shapes:
+
+    - Heartbeats (``{"_heartbeat": True}``): emitted as an SSE comment
+      ``: heartbeat\\n\\n`` (keeps the connection warm without a data frame).
+    - Sentinels (``None``): stop the stream cleanly (generator should end).
+    - Regular events (any other dict): ``data: {json}\\n\\n``.
+    """
+    async for event in generator:
+        if event is None:
+            break
+        if isinstance(event, dict) and event.get("_heartbeat"):
+            yield b": heartbeat\n\n"
+            continue
+        data = json.dumps(event)
+        yield f"data: {data}\n\n".encode()
+
+
+async def _snapshot_stream_events(
+    request: Request,
+) -> AsyncGenerator[dict | None, None]:
+    """Yield the latest ``MachineSnapshot`` dict periodically for SSE (5.6).
+
+    Emits the freshest snapshot immediately, then re-emits on the configured
+    fast-tick cadence (``observability.snapshot_interval_s``). Between snapshot
+    emits it yields a heartbeat marker so a stalled collection loop still keeps
+    the connection warm. Honors client disconnect (``request.is_disconnected``)
+    so a closed browser tab frees its slot promptly. Non-buffering: each frame
+    is yielded the instant it is built (Constraint #3 — no accumulation).
+    """
+    interval = 2.0
+    if _config is not None:
+        interval = max(0.25, _config.observability.snapshot_interval_s)
+    # Emit one snapshot right away so a subscriber sees data without waiting a
+    # full interval; collect on demand if the loop hasn't produced one yet.
+    if _machine_snapshot_deque:
+        yield _machine_snapshot_deque[0]
+    else:
+        yield (await _collect_machine_snapshot(0)).model_dump()
+    last_emitted: int = id(_machine_snapshot_deque[0]) if _machine_snapshot_deque else 0
+    # Poll on a short sub-cadence so disconnects are noticed quickly, but only
+    # push a new data frame when a fresh snapshot has actually landed.
+    poll = min(0.5, interval)
+    while True:
+        if await request.is_disconnected():
+            break
+        await asyncio.sleep(poll)
+        if _machine_snapshot_deque:
+            head = _machine_snapshot_deque[0]
+            if id(head) != last_emitted:
+                last_emitted = id(head)
+                yield head
+                continue
+        yield {"_heartbeat": True}
+
+
+async def _handle_snapshot_stream(request: Request) -> Any:
+    """Standalone handler for ``GET /broker/snapshot/stream`` (dual-registered).
+
+    Server-Sent-Events surface (spec 5.6) that pushes the latest
+    ``MachineSnapshot`` to web/monitoring/MCP clients. Supersedes the older
+    2026-03-13 ``/broker/status/stream``; the TUI is unaffected (it keeps
+    polling). Returns **501** when the stream is disabled by config
+    (``observability.snapshot_stream_enabled``); caps concurrent clients at
+    ``_SNAPSHOT_STREAM_MAX_CLIENTS`` (8) and returns **503** beyond that. The
+    live-client counter is decremented in the generator's ``finally`` so a
+    disconnect always frees the slot.
+    """
+    global _snapshot_stream_clients
+    enabled = True
+    if _config is not None:
+        enabled = _config.observability.snapshot_stream_enabled
+    if not enabled:
+        return JSONResponse(
+            {"error": "snapshot stream disabled"}, status_code=501
+        )
+    if _snapshot_stream_clients >= _SNAPSHOT_STREAM_MAX_CLIENTS:
+        return JSONResponse(
+            {"error": "too many concurrent stream clients"}, status_code=503
+        )
+    _snapshot_stream_clients += 1
+
+    async def _bounded() -> AsyncGenerator[bytes, None]:
+        global _snapshot_stream_clients
+        try:
+            async for frame in _sse_wrapper(_snapshot_stream_events(request)):
+                yield frame
+        finally:
+            _snapshot_stream_clients -= 1
+
+    return StreamingResponse(
+        _bounded(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Prevents nginx 16KB buffering
+        },
+    )
 
 
 async def _handle_contention(request: Request) -> Any:
@@ -2208,6 +2323,9 @@ def create_app(config: BrokerConfig) -> FastAPI:
     # spec 4.10 — there is no shared router; registering once would 404 in the
     # admin-only two-port deployment).
     broker_router.add_api_route("/snapshot", _handle_snapshot, methods=["GET"])
+    broker_router.add_api_route(
+        "/snapshot/stream", _handle_snapshot_stream, methods=["GET"]
+    )
     broker_router.add_api_route("/contention", _handle_contention, methods=["GET"])
     broker_router.add_api_route(
         "/gpu/extended", _handle_gpu_extended, methods=["GET"]
@@ -2226,23 +2344,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
     )
 
     # ── A2A Interface Routes ────────────────────────────────────────
-
-    async def _sse_wrapper(generator: AsyncGenerator[dict, None]) -> AsyncGenerator[bytes, None]:
-        """Wrap A2A events as SSE-formatted bytes.
-
-        Handles three event types:
-        - Regular events: formatted as "data: {json}\\n\\n"
-        - Heartbeats: formatted as SSE comment ": heartbeat\\n\\n"
-        - Sentinels (None): ignored (generator should stop)
-        """
-        async for event in generator:
-            if event is None:
-                break
-            if isinstance(event, dict) and event.get("_heartbeat"):
-                yield b": heartbeat\n\n"
-                continue
-            data = json.dumps(event)
-            yield f"data: {data}\n\n".encode()
+    # SSE encoding is the shared module-level _sse_wrapper (deduped, spec 5.6).
 
     @a2a_router.get("/stats")
     async def a2a_stats():
@@ -3042,6 +3144,9 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
     # Same single-sourced handlers as create_app — registered here too so the
     # admin-only two-port deployment serves these endpoints (spec 4.10).
     broker_router.add_api_route("/snapshot", _handle_snapshot, methods=["GET"])
+    broker_router.add_api_route(
+        "/snapshot/stream", _handle_snapshot_stream, methods=["GET"]
+    )
     broker_router.add_api_route("/contention", _handle_contention, methods=["GET"])
     broker_router.add_api_route(
         "/gpu/extended", _handle_gpu_extended, methods=["GET"]
@@ -3060,19 +3165,7 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
     )
 
     # ── A2A Interface Routes ────────────────────────────────────────
-
-    async def _sse_wrapper_admin(
-        generator: AsyncGenerator[dict, None],
-    ) -> AsyncGenerator[bytes, None]:
-        """Wrap A2A events as SSE-formatted bytes."""
-        async for event in generator:
-            if event is None:
-                break
-            if isinstance(event, dict) and event.get("_heartbeat"):
-                yield b": heartbeat\n\n"
-                continue
-            data = json.dumps(event)
-            yield f"data: {data}\n\n".encode()
+    # SSE encoding is the shared module-level _sse_wrapper (deduped, spec 5.6).
 
     @a2a_router.get("/stats")
     async def a2a_stats():
@@ -3109,7 +3202,7 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
             return JSONResponse({"error": "Task not found"}, status_code=404)
         generator = _a2a_handler.subscribe_task(task_id, request=request)
         return StreamingResponse(
-            _sse_wrapper_admin(generator),
+            _sse_wrapper(generator),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
