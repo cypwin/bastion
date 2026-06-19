@@ -381,6 +381,13 @@ def record_recent_request(
     status_code: int,
     streaming: bool = False,
     source: str | None = None,
+    *,
+    prefill_tps: float | None = None,
+    decode_tps: float | None = None,
+    ttft_s: float | None = None,
+    ctx_utilization: float | None = None,
+    eval_count: int | None = None,
+    prompt_eval_count: int | None = None,
 ) -> None:
     """Record a completed request in the recent requests ring buffer.
 
@@ -389,6 +396,13 @@ def record_recent_request(
     stream and ``status_code`` reflects the actual outcome. ``source`` is
     the client's declared identity (``X-Agent-ID`` header) or, failing
     that, its User-Agent product token — ``None`` when neither is sent.
+
+    The six keyword-only inference signals (spec 4.6) are supplied by the
+    proxy's :class:`~bastion.inference_tap.InferenceTapCollector` when a
+    request completes; they all default to ``None`` so every existing
+    caller that omits them keeps working unchanged (back-compat is a hard
+    requirement). A ``None`` means "not measured" — never a misleading 0
+    (e.g. a cache hit with ``eval_duration==0`` records ``decode_tps=None``).
     """
     _recent_requests.appendleft({
         "timestamp": time.time(),
@@ -400,6 +414,12 @@ def record_recent_request(
         "status_code": status_code,
         "streaming": streaming,
         "source": source,
+        "prefill_tps": prefill_tps,
+        "decode_tps": decode_tps,
+        "ttft_s": ttft_s,
+        "ctx_utilization": ctx_utilization,
+        "eval_count": eval_count,
+        "prompt_eval_count": prompt_eval_count,
     })
 
 

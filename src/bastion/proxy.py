@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from bastion import audit, metrics
 from bastion.circuitbreaker import CircuitBreaker
+from bastion.inference_tap import InferenceTapCollector
 from bastion.models import BrokerConfig, PriorityTier, QueuedRequest
 
 logger = logging.getLogger(__name__)
@@ -253,6 +254,12 @@ class OllamaProxy:
         if options:
             payload["options"] = options
 
+        # ctx-utilization denominator (spec 5.4 precedence chain): the request's
+        # own options.num_ctx wins, else the value injected above (per-model
+        # default_num_ctx, else request_overrides.default_num_ctx), else None ->
+        # the tap reports ctx_utilization=None rather than a misleading ratio.
+        injected_num_ctx = options.get("num_ctx")
+
         # Detect priority tier
         tier = self._detect_priority(request)
         base_priority = tier.base_priority(self.config.priorities)
@@ -362,6 +369,14 @@ class OllamaProxy:
         _ua = request.headers.get("user-agent", "")
         source = agent_id or _ua.split("/", 1)[0].strip()[:24] or None
 
+        # Per-request inference tap (spec 5.4): O(1)/chunk, never buffers. The
+        # streaming generator feeds on_chunk(); the non-streaming path feeds
+        # on_complete_response(). At true completion the six derived signals
+        # (decode/prefill tps, ttft, ctx-utilization, eval/prompt counts) are
+        # threaded into record_recent_request. Each is None when unmeasurable
+        # (cache hit, missing field, no num_ctx) — never a misleading 0.
+        inference_tap = InferenceTapCollector(injected_num_ctx=injected_num_ctx)
+
         def record_complete(status_code: int) -> None:
             # Record for /broker/recent + /broker/latency at TRUE completion:
             # duration_s is measured from dispatch_start to *now*, so for
@@ -370,6 +385,9 @@ class OllamaProxy:
             # constructed — otherwise streaming durations collapse to ~0.
             if self._record_fn is None:
                 return
+            ttft_s: float | None = None
+            if inference_tap.first_chunk_time is not None:
+                ttft_s = max(0.0, inference_tap.first_chunk_time - dispatch_start)
             self._record_fn(
                 model=model,
                 endpoint=path,
@@ -379,6 +397,12 @@ class OllamaProxy:
                 status_code=status_code,
                 streaming=is_streaming,
                 source=source,
+                prefill_tps=inference_tap.prefill_tps,
+                decode_tps=inference_tap.decode_tps,
+                ttft_s=ttft_s,
+                ctx_utilization=inference_tap.ctx_utilization,
+                eval_count=inference_tap.eval_count,
+                prompt_eval_count=inference_tap.prompt_eval_count,
             )
 
         result: StreamingResponse | JSONResponse
@@ -389,12 +413,13 @@ class OllamaProxy:
                     request, target_url, modified_body, model, path, tier,
                     done_fn=done_fn, routing_meta=routing_meta,
                     record_fn=record_complete, dispatch_start=dispatch_start,
+                    inference_tap=inference_tap,
                 )
                 done_fn = None  # Generator owns done_fn now; prevent double-call in finally
             else:
                 result = await self._forward_response(
                     request, target_url, modified_body, model, path, tier,
-                    routing_meta=routing_meta,
+                    routing_meta=routing_meta, inference_tap=inference_tap,
                 )
         finally:
             # Non-streaming: call done_fn here (after _forward_response returns).
@@ -550,6 +575,7 @@ class OllamaProxy:
         routing_meta: dict[str, str] | None = None,
         record_fn: Callable[[int], None] | None = None,
         dispatch_start: float | None = None,
+        inference_tap: InferenceTapCollector | None = None,
     ) -> StreamingResponse | JSONResponse:
         """Stream Ollama's NDJSON response back to the client.
 
@@ -599,6 +625,13 @@ class OllamaProxy:
             ttft_observed = False
             try:
                 async for chunk in resp.aiter_bytes():
+                    # Feed the per-request tap (O(1): parses one small object,
+                    # captures first-chunk time + the done:true token accounting)
+                    # then yield immediately — never buffered. Guarded so a
+                    # malformed chunk can never break the stream.
+                    if inference_tap is not None:
+                        with contextlib.suppress(Exception):
+                            inference_tap.on_chunk(chunk, time.time())
                     if not ttft_observed and chunk and dispatch_start is not None:
                         ttft_observed = True
                         with contextlib.suppress(Exception):
@@ -649,6 +682,7 @@ class OllamaProxy:
         self, request: Request, url: str, body: bytes,
         model: str = "", path: str = "", tier: PriorityTier = PriorityTier.AGENT,
         routing_meta: dict[str, str] | None = None,
+        inference_tap: InferenceTapCollector | None = None,
     ) -> JSONResponse:
         """Forward a non-streaming request and return the full response."""
         headers = self._forward_headers(request)
@@ -680,6 +714,13 @@ class OllamaProxy:
             resp_json = {
                 "error": f"upstream returned non-JSON response: {resp.text[:500]}",
             }
+
+        # Feed the non-streaming token accounting into the tap so the six
+        # inference signals reach record_recent_request (caller records after
+        # this returns). Guarded — a missing/odd field never breaks forwarding.
+        if inference_tap is not None and isinstance(resp_json, dict):
+            with contextlib.suppress(Exception):
+                inference_tap.on_complete_response(resp_json)
 
         response_headers: dict[str, str] = {}
         if routing_meta:
