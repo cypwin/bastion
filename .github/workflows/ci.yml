@@ -27,6 +27,11 @@ jobs:
       - name: Lint
         run: ruff check src/ tests/
 
+      - name: Metric cardinality lint
+        # Enforce the Prometheus label permitted-set (spec Section 3 rule #2):
+        # fails the build on any per-PID/per-id label in metrics.py.
+        run: python scripts/check_metric_cardinality.py
+
       - name: Type check
         run: mypy src/bastion --ignore-missing-imports --no-strict-optional
 
