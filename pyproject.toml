@@ -37,7 +37,7 @@ dependencies = [
 
 [project.optional-dependencies]
 a2a = ["a2a-sdk[http-server]>=0.3,<1.0"]
-dashboard = ["textual>=1.0,<3.0", "httpx>=0.27,<1.0", "psutil>=5.9,<7.0"]
+dashboard = ["textual>=1.0,<8.0", "httpx>=0.27,<1.0", "psutil>=5.9,<8.0"]
 metrics = ["prometheus-client>=0.20,<1.0"]
 persistence = ["aiosqlite>=0.20,<1.0"]
 dev = [
