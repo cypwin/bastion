@@ -93,6 +93,21 @@ class BastionClient:
         """Fetch /broker/catalog for the registered-models + residency view."""
         return await self._get_safe("/broker/catalog", {})
 
+    async def get_snapshot(self, history: int = 1) -> dict:
+        """Fetch /broker/snapshot for the unified MachineSnapshot (spec 5.6).
+
+        ``history`` requests the last N snapshots (newest first); the server
+        caps it at the deque length. Follows the ``_get_safe`` pattern —
+        returns ``{}`` on any failure so the dashboard renders an empty panel.
+        """
+        return await self._get_safe(
+            "/broker/snapshot", {}, params={"history": history}
+        )
+
+    async def get_contention(self) -> dict:
+        """Fetch /broker/contention for the host-pressure leg (spec 5.6)."""
+        return await self._get_safe("/broker/contention", {})
+
     async def post_preload(self, model: str) -> dict:
         """Preload a model via /broker/preload."""
         resp = await self._client.post(

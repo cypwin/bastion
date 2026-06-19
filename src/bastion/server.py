@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+import statistics
 import subprocess
 import time
 from collections import deque
@@ -54,12 +55,16 @@ from bastion.models import (
     BrokerStatus,
     BrokerThrashing,
     BrokerThrashingAgent,
+    BlockDeviceIOStats,
     CatalogEntry,
     ContentionSnapshot,
+    GPUExtendedStatus,
     GPUStatus,
+    InferenceThroughputState,
     IntentDeclaration,
     IntentResponse,
     MachineSnapshot,
+    XidEvent,
     PriorityTier,
     QueuedRequest,
     ThrashingVerdictLabel,
@@ -208,6 +213,12 @@ _recent_requests: deque[dict] = deque(maxlen=500)
 # 6 min at the 2s fast tick (Constraint #1). Bounded, in-memory, no DB.
 _machine_snapshot_deque: deque[dict] = deque(maxlen=180)
 _machine_snapshot_task: asyncio.Task | None = None
+# Most-recent slow-path GPU extended status (throttle/PCIe/Xid). Refreshed only
+# on the slow tick (spec 4.9, ~30s) by a backend subprocess; cached here so the
+# 2s fast snapshot can attach the latest value without re-polling — the fast
+# path stays free of blocking 30s-stale subprocess work. None until the first
+# slow tick runs (graceful: a partial snapshot with gpu_extended=None is valid).
+_gpu_extended_latest: GPUExtendedStatus | None = None
 # Broker-side host-pressure collector (PSI/swap/OOM). Distinct from the TUI's
 # own SystemDataCollector instance — each tracks its own delta state on an
 # independent cadence (spec 4.9). Instantiated lazily so the import stays cheap
@@ -225,20 +236,33 @@ def _get_system_collector() -> Any:
 
 
 async def _collect_contention() -> ContentionSnapshot | None:
-    """Assemble the host-pressure leg of the snapshot (PSI/swap/OOM).
+    """Assemble the host-pressure leg of the snapshot (spec 4.4, fast 2s path).
 
-    Every sub-collector is individually graceful (returns None fields on
-    hosts that lack the source — no PSI on old kernels, no swap on first
-    read), so a partial ``ContentionSnapshot`` with ``None`` fields is the
-    expected value here and is still emitted. The block-device / RAPL legs
-    are wired in Phase 2; for now those fields stay at their model defaults
-    (``[]`` / ``None``), never a misleading ``0``.
+    Every sub-collector is individually graceful (returns None fields / empty
+    lists on hosts that lack the source — no PSI on old kernels, no swap on
+    first read, no powercap on containers/ARM, non-NVMe storage), so a partial
+    ``ContentionSnapshot`` is the expected value here and is still emitted. All
+    of PSI/swap/OOM/block-device-IO/CPU-package-power are cheap 2s fast-path
+    signals (spec 5.2); ``gpu_board_watts`` stays ``None`` (backend-provided,
+    Tier 4). No degradation path emits a misleading ``0``.
     """
     try:
         collector = _get_system_collector()
         psi = collector.get_psi_data()
         swap = collector.get_swap_rate_data()
         oom = collector.get_oom_data()
+
+        device_filter = None
+        if _config is not None:
+            device_filter = _config.observability.storage_device_filter
+        rapl_path = None
+        if _config is not None:
+            rapl_path = _config.observability.rapl_domain_path
+
+        block_rows = collector.get_block_io_data(device_filter)
+        block_devices = [BlockDeviceIOStats(**row) for row in block_rows]
+        cpu_package_watts = collector.read_package_power(rapl_path)
+
         return ContentionSnapshot(
             psi_cpu_some_avg10=psi.get("psi_cpu_some_avg10"),
             psi_cpu_full_avg10=psi.get("psi_cpu_full_avg10"),
@@ -248,11 +272,114 @@ async def _collect_contention() -> ContentionSnapshot | None:
             psi_io_full_avg10=psi.get("psi_io_full_avg10"),
             swap_in_rate_mb_s=swap.get("swap_in_rate_mb_s"),
             swap_out_rate_mb_s=swap.get("swap_out_rate_mb_s"),
+            block_devices=block_devices,
+            cpu_package_watts=cpu_package_watts,
             oom_kill_total=oom.get("oom_kill_total"),
             oom_kill_rate=oom.get("oom_kill_rate"),
         )
     except Exception:
         logger.exception("contention collection failed; emitting None leg")
+        return None
+
+
+async def _collect_gpu_extended() -> GPUExtendedStatus | None:
+    """Assemble the slow-path GPU leg (spec 4.3, ~30s slow tick).
+
+    Routes every signal through the ``GPUBackend`` seam (Constraint #7c): the
+    throttle reasons, PCIe tx/rx, and Xid scan are NVIDIA concepts and come
+    back empty/``None`` from ``StubBackend`` (non-NVIDIA / no-GPU), which is
+    the *correct complete* value there — not a degradation. Each leg is
+    individually graceful so a denied ``dmesg`` (``dmesg_restrict=1``) or a
+    pre-R418 driver (no PCIe tx/rx) yields ``[]``/``None`` rather than killing
+    the slow tick. The ``recent_xids`` list is already bounded (maxlen 20) at
+    the backend.
+    """
+    from bastion.gpu import get_backend
+
+    backend = get_backend()
+    try:
+        throttle_reasons = await backend.query_throttle_reasons()
+    except Exception:
+        logger.debug("throttle-reasons slow poll failed", exc_info=True)
+        throttle_reasons = []
+    try:
+        pcie_tx, pcie_rx = await backend.query_pcie_throughput()
+    except Exception:
+        logger.debug("PCIe-throughput slow poll failed", exc_info=True)
+        pcie_tx, pcie_rx = None, None
+    try:
+        xid_rows = await backend.query_xid_errors()
+    except Exception:
+        logger.debug("Xid slow poll failed", exc_info=True)
+        xid_rows = []
+
+    recent_xids = [XidEvent(**row) for row in xid_rows]
+    # xid_count_since_start lives on NvidiaBackend; StubBackend has no such
+    # attribute, so read it defensively (0 on non-NVIDIA — correct, complete).
+    xid_count = getattr(backend, "xid_count_since_start", 0)
+
+    return GPUExtendedStatus(
+        throttle_reasons=throttle_reasons,
+        pcie_tx_kb_s=pcie_tx,
+        pcie_rx_kb_s=pcie_rx,
+        recent_xids=recent_xids,
+        xid_count_since_start=xid_count,
+        last_polled_at=time.time(),
+    )
+
+
+def _collect_inference_throughput() -> InferenceThroughputState | None:
+    """Aggregate the stream-tapped per-request token signals (spec 4.6).
+
+    Reads the per-request token/TTFT/ctx fields that the inference tap writes
+    into ``_recent_requests`` (Section 4.6) and folds them into p50 aggregates.
+    Model-agnostic: it uses whatever ``model`` Ollama reported on each request.
+    Returns ``None`` when no recent request carried any token signal (e.g. only
+    non-inference traffic, or before the first stream completes) — never a
+    misleading ``0``.
+    """
+    try:
+        decode: list[float] = []
+        prefill: list[float] = []
+        ttft: list[float] = []
+        ctx: list[float] = []
+        last_model: str | None = None
+        for rec in _recent_requests:
+            d = rec.get("decode_tps")
+            if d is not None:
+                decode.append(d)
+            p = rec.get("prefill_tps")
+            if p is not None:
+                prefill.append(p)
+            t = rec.get("ttft_s")
+            if t is not None:
+                ttft.append(t)
+            c = rec.get("ctx_utilization")
+            if c is not None:
+                ctx.append(c)
+            if (
+                rec.get("decode_tps") is not None
+                or rec.get("ttft_s") is not None
+            ) and rec.get("model"):
+                last_model = rec.get("model")
+
+        if not (decode or prefill or ttft or ctx):
+            return None  # no token signal yet -> None, not a row of zeros
+
+        def _p50(values: list[float]) -> float | None:
+            if not values:
+                return None
+            return statistics.median(values)
+
+        return InferenceThroughputState(
+            decode_tps_p50=_p50(decode),
+            prefill_tps_p50=_p50(prefill),
+            ttft_p50_s=_p50(ttft),
+            ctx_utilization_p50=_p50(ctx),
+            last_model=last_model,
+        )
+    except Exception:
+        logger.debug("inference-throughput aggregation failed", exc_info=True)
         return None
 
 
@@ -287,6 +414,22 @@ async def _collect_broker_status_lite() -> BrokerStatus | None:
         return None
 
 
+def _slow_tick_divisor() -> int:
+    """Integer tick-modulo for the slow path (spec 4.9).
+
+    Derived from ``round(slow_tick_interval_s / snapshot_interval_s)`` so the
+    cadence comes from ``ObservabilityConfig`` rather than a magic literal
+    (default 30s / 2s = 15). Clamped to >=1 so a misconfiguration cannot make
+    the slow path run never or every-tick-divide-by-zero.
+    """
+    fast = 2.0
+    slow = 30.0
+    if _config is not None:
+        fast = max(0.25, _config.observability.snapshot_interval_s)
+        slow = max(fast, _config.observability.slow_tick_interval_s)
+    return max(1, round(slow / fast))
+
+
 async def _collect_machine_snapshot(tick: int) -> MachineSnapshot:
     """Assemble one ``MachineSnapshot`` from the backend + collectors (spec 4.9).
 
@@ -294,37 +437,53 @@ async def _collect_machine_snapshot(tick: int) -> MachineSnapshot:
     absent source yields a ``None``/empty leg, never an exception and never a
     misleading ``0``. On a ``StubBackend`` / no-GPU host ``query_gpu_status``
     returns an empty ``GPUStatus`` (all inner fields ``None``) — the correct
-    complete value there. The slow-path legs (``gpu_extended``, ``process``)
-    and the stream-tapped ``inference`` / ``correlation`` legs are wired in
-    later phases; in Phase 1 they remain ``None``.
+    complete value there.
+
+    Two cadences (spec 4.9): the **fast 2s path** builds the GPU status,
+    contention (PSI/swap/OOM/block-IO/CPU-power), and the cheap in-memory
+    ``inference`` aggregate every tick. The **slow path** (``tick %
+    _slow_tick_divisor() == 0``, ~30s) refreshes the subprocess-heavy
+    ``gpu_extended`` leg (throttle/PCIe/Xid via the backend) and the VRAM
+    ledger-drift gauge; the most recent ``gpu_extended`` is cached in
+    ``_gpu_extended_latest`` and reattached on the intervening fast ticks, so
+    the 2s path never blocks on 30s-stale subprocess work. ``process`` and
+    ``correlation`` remain ``None`` (wired in later phases).
     """
+    global _gpu_extended_latest
     snapshot_ts = time.time()
 
     try:
         gpu = await query_gpu_status()
     except Exception:
         logger.exception("GPU status leg failed; using empty GPUStatus")
-        from bastion.models import GPUStatus
         gpu = GPUStatus()
 
     broker = await _collect_broker_status_lite()
     contention = await _collect_contention()
+    inference = _collect_inference_throughput()
 
-    # Slow-tick only (tick % 5 == 0 → 10s): publish the signed VRAM ledger-drift
-    # gauge (spec 5.4). Drift = measured (backend) − tracked (allocated+reserved).
-    # SKIP — never publish 0 — when the backend reports no measured VRAM
-    # (StubBackend / non-NVIDIA) or no VRAMManager is configured.
-    if tick % 5 == 0:
+    slow = _slow_tick_divisor()
+    if tick % slow == 0:
+        # Slow tick: refresh the subprocess-heavy GPU extended leg and cache it
+        # so fast ticks reuse the latest value without re-polling.
+        try:
+            _gpu_extended_latest = await _collect_gpu_extended()
+        except Exception:
+            logger.debug("gpu_extended slow collection failed", exc_info=True)
+        # Publish the signed VRAM ledger-drift gauge (spec 5.4). Drift =
+        # measured (backend) − tracked (allocated+reserved). SKIP — never
+        # publish 0 — when the backend reports no measured VRAM (StubBackend /
+        # non-NVIDIA) or no VRAMManager is configured.
         await _emit_vram_ledger_drift(gpu)
 
     return MachineSnapshot(
         snapshot_ts=snapshot_ts,
         broker=broker,
         gpu=gpu,
-        gpu_extended=None,
+        gpu_extended=_gpu_extended_latest,
         contention=contention,
         process=None,
-        inference=None,
+        inference=inference,
         correlation=None,
     )
 
@@ -414,6 +573,46 @@ async def _handle_snapshot(request: Request) -> Any:
     # No tick has landed yet — collect one on demand.
     snap = await _collect_machine_snapshot(0)
     return JSONResponse(snap.model_dump())
+
+
+async def _handle_contention(request: Request) -> Any:
+    """Standalone handler for ``GET /broker/contention`` (dual-registered, 4.10).
+
+    Returns the host-pressure leg (``ContentionSnapshot``, spec 4.4) of the
+    most recent ``MachineSnapshot`` when the loop has produced one; otherwise
+    collects the leg on demand so the endpoint never 404s before the first
+    tick. ``None`` legs (no PSI on an old kernel/container, no powercap, no
+    matching block device) are valid and returned as a partial snapshot with
+    ``None`` fields — never a misleading ``0``.
+    """
+    if _machine_snapshot_deque:
+        latest = _machine_snapshot_deque[0]
+        contention = latest.get("contention")
+        if contention is not None:
+            return JSONResponse(contention)
+    snap = await _collect_contention()
+    if snap is None:
+        # Collection failed wholesale — still return a valid (empty) body, not
+        # a 500: a partial/empty ContentionSnapshot is the graceful contract.
+        return JSONResponse(ContentionSnapshot().model_dump())
+    return JSONResponse(snap.model_dump())
+
+
+async def _handle_gpu_extended(request: Request) -> Any:
+    """Standalone handler for ``GET /broker/gpu/extended`` (dual-registered, 4.10).
+
+    Returns the slow-path GPU leg (``GPUExtendedStatus``, spec 4.3) — throttle
+    reasons, PCIe tx/rx, recent Xids. Serves the cached value the slow tick
+    maintains (``_gpu_extended_latest``); if no slow tick has run yet it
+    collects once on demand. On a ``StubBackend`` / non-NVIDIA host the lists
+    are the *correct complete* empty value, not an error.
+    """
+    if _gpu_extended_latest is not None:
+        return JSONResponse(_gpu_extended_latest.model_dump())
+    ext = await _collect_gpu_extended()
+    if ext is None:
+        return JSONResponse(GPUExtendedStatus().model_dump())
+    return JSONResponse(ext.model_dump())
 
 
 def record_recent_request(
@@ -1612,10 +1811,14 @@ def create_app(config: BrokerConfig) -> FastAPI:
         )
 
     # ── Machine snapshot (observability spec 4.9/4.10) ──────────────
-    # Single-sourced handler registered in BOTH factories (dual-factory tax,
+    # Single-sourced handlers registered in BOTH factories (dual-factory tax,
     # spec 4.10 — there is no shared router; registering once would 404 in the
     # admin-only two-port deployment).
     broker_router.add_api_route("/snapshot", _handle_snapshot, methods=["GET"])
+    broker_router.add_api_route("/contention", _handle_contention, methods=["GET"])
+    broker_router.add_api_route(
+        "/gpu/extended", _handle_gpu_extended, methods=["GET"]
+    )
 
     # ── A2A Interface Routes ────────────────────────────────────────
 
@@ -2431,9 +2634,13 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
         )
 
     # ── Machine snapshot (observability spec 4.9/4.10) ──────────────
-    # Same single-sourced handler as create_app — registered here too so the
-    # admin-only two-port deployment serves /broker/snapshot (spec 4.10).
+    # Same single-sourced handlers as create_app — registered here too so the
+    # admin-only two-port deployment serves these endpoints (spec 4.10).
     broker_router.add_api_route("/snapshot", _handle_snapshot, methods=["GET"])
+    broker_router.add_api_route("/contention", _handle_contention, methods=["GET"])
+    broker_router.add_api_route(
+        "/gpu/extended", _handle_gpu_extended, methods=["GET"]
+    )
 
     # ── A2A Interface Routes ────────────────────────────────────────
 
