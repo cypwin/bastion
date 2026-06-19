@@ -4,8 +4,9 @@
 # different libraries than local runs used. This file makes CI reproduce the
 # known-good closure. Used via `pip install -e ".[...]" -c constraints.txt`.
 #
-# NOTE: this is an interim measure. The destination is a proper uv/pip-tools
-# lockfile generated from pyproject; tracked as a follow-up.
+# NOTE: this file is currently hand-seeded from a known-good env. Regenerate it
+# reproducibly with `./scripts/lock-deps.sh` (resolves + runs the test suite in
+# a clean venv, then freezes the GREEN closure). Run where PyPI is reachable.
 
 # --- Web framework / ASGI (route-enumeration behaviour) ---
 fastapi==0.128.0
