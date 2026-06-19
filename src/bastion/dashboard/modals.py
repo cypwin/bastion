@@ -372,8 +372,46 @@ class GPUProcessListModal(ModalScreen[str]):
         super().__init__(**kwargs)
         self._procs: list[dict[str, str]] = []
 
+    @staticmethod
+    def _rows_from_snapshot(snapshot: Any) -> list[dict[str, str]]:
+        """Normalize ``ProcessSnapshot.gpu_processes`` to the modal's row shape.
+
+        Reads the cached snapshot (a ``model_dump()`` dict the broker's 10s slow
+        tick maintains) and returns one ``{pid, name, vram_mb}`` string-keyed row
+        per GPU process — the shape ``compose`` / ``on_button_pressed`` and the
+        kill confirmation flow already consume. A missing snapshot, a missing
+        ``gpu_processes`` key, or a malformed row degrades to ``[]`` (no GPU rows,
+        no crash — StubBackend / no-GPU host).
+        """
+        if not snapshot:
+            return []
+        gpu_rows = snapshot.get("gpu_processes") if isinstance(snapshot, dict) else None
+        if not gpu_rows:
+            return []
+        out: list[dict[str, str]] = []
+        for row in gpu_rows:
+            try:
+                pid = row.get("pid")
+                if pid is None:
+                    continue
+                vram = row.get("vram_mb")
+                out.append({
+                    "pid": str(pid),
+                    "name": str(row.get("name") or ""),
+                    "vram_mb": str(vram) if vram is not None else "?",
+                })
+            except AttributeError:
+                continue
+        return out
+
     def compose(self) -> ComposeResult:
-        self._procs = SystemDataCollector.query_gpu_processes()
+        # Read the broker-maintained cached snapshot instead of spawning an
+        # nvidia-smi subprocess on open (spec 5.3 — moves the modal off the
+        # UI-thread subprocess; the always-on ProcessAttributionPanel owns
+        # collection now). ``app._last_process_snapshot`` may be absent on a
+        # host app that does not poll /broker/processes -> empty (graceful).
+        snapshot = getattr(self.app, "_last_process_snapshot", None)
+        self._procs = self._rows_from_snapshot(snapshot)
         with Vertical(id="gpuproc-dialog"):
             yield Label("GPU Processes", id="gpuproc-title")
             if self._procs:

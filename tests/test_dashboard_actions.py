@@ -571,13 +571,28 @@ async def test_action_gpu_kill_empty_pid_noop() -> None:
             os_kill.assert_not_called()
 
 
+def _gpu_snapshot(rows: list[dict]) -> dict:
+    """Build a ProcessSnapshot-shaped dict with the given gpu_processes rows.
+
+    The kill flow now reads ``app._last_process_snapshot`` (spec 5.3), not a
+    subprocess, so the action tests seed the cached snapshot directly.
+    """
+    return {
+        "top_processes": [],
+        "gpu_processes": rows,
+        "own_pids": {},
+        "watchlist_hits": [],
+        "recent_churn_events": [],
+        "collected_at": 1.0,
+        "gpu_collected_at": 1.0,
+    }
+
+
 async def test_action_gpu_kill_pid_not_found_warns() -> None:
     """If the PID disappears between modals, surface a warning."""
-    with patch(
-        "bastion.dashboard.app.SystemDataCollector.query_gpu_processes",
-        return_value=[],
-    ), patch("os.kill") as os_kill:
+    with patch("os.kill") as os_kill:
         async with _mounted_dashboard() as (app, _pilot, runner):
+            app._last_process_snapshot = _gpu_snapshot([])
             runner.next_value = "12345"  # user selects a PID
             app.action_gpu_kill()
             os_kill.assert_not_called()
@@ -586,12 +601,10 @@ async def test_action_gpu_kill_pid_not_found_warns() -> None:
 
 
 async def test_action_gpu_kill_sigterm_sent() -> None:
-    procs = [{"pid": "12345", "name": "ollama", "vram_mb": "8192"}]
-    with patch(
-        "bastion.dashboard.app.SystemDataCollector.query_gpu_processes",
-        return_value=procs,
-    ), patch("os.kill") as os_kill:
+    rows = [{"pid": 12345, "name": "ollama", "vram_mb": 8192}]
+    with patch("os.kill") as os_kill:
         async with _mounted_dashboard() as (app, _pilot, runner):
+            app._last_process_snapshot = _gpu_snapshot(rows)
             runner.values = ["12345", "kill"]
             app.action_gpu_kill()
             import signal as _sig
@@ -600,12 +613,10 @@ async def test_action_gpu_kill_sigterm_sent() -> None:
 
 
 async def test_action_gpu_kill_sigkill_sent_on_force() -> None:
-    procs = [{"pid": "67890", "name": "python", "vram_mb": "2048"}]
-    with patch(
-        "bastion.dashboard.app.SystemDataCollector.query_gpu_processes",
-        return_value=procs,
-    ), patch("os.kill") as os_kill:
+    rows = [{"pid": 67890, "name": "python", "vram_mb": 2048}]
+    with patch("os.kill") as os_kill:
         async with _mounted_dashboard() as (app, _pilot, runner):
+            app._last_process_snapshot = _gpu_snapshot(rows)
             runner.values = ["67890", "kill-9"]
             app.action_gpu_kill()
             import signal as _sig
@@ -613,12 +624,10 @@ async def test_action_gpu_kill_sigkill_sent_on_force() -> None:
 
 
 async def test_action_gpu_kill_permission_error_notifies() -> None:
-    procs = [{"pid": "12345", "name": "ollama", "vram_mb": "8192"}]
-    with patch(
-        "bastion.dashboard.app.SystemDataCollector.query_gpu_processes",
-        return_value=procs,
-    ), patch("os.kill", side_effect=PermissionError("denied")):
+    rows = [{"pid": 12345, "name": "ollama", "vram_mb": 8192}]
+    with patch("os.kill", side_effect=PermissionError("denied")):
         async with _mounted_dashboard() as (app, _pilot, runner):
+            app._last_process_snapshot = _gpu_snapshot(rows)
             runner.values = ["12345", "kill"]
             app.action_gpu_kill()
             msgs = app._notifications
@@ -628,12 +637,10 @@ async def test_action_gpu_kill_permission_error_notifies() -> None:
 
 async def test_action_gpu_kill_inner_cancel_no_call() -> None:
     """User cancels the confirm modal -> os.kill must not be called."""
-    procs = [{"pid": "12345", "name": "ollama", "vram_mb": "8192"}]
-    with patch(
-        "bastion.dashboard.app.SystemDataCollector.query_gpu_processes",
-        return_value=procs,
-    ), patch("os.kill") as os_kill:
+    rows = [{"pid": 12345, "name": "ollama", "vram_mb": 8192}]
+    with patch("os.kill") as os_kill:
         async with _mounted_dashboard() as (app, _pilot, runner):
+            app._last_process_snapshot = _gpu_snapshot(rows)
             runner.values = ["12345", ""]
             app.action_gpu_kill()
             os_kill.assert_not_called()

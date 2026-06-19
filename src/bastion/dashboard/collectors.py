@@ -77,6 +77,27 @@ class SystemDataCollector:
         self._last_rapl_path: str | None = None
         self._last_rapl_time: float | None = None
 
+        # Per-process IO delta state (spec 5.3). Maps pid -> (read_bytes,
+        # write_bytes, monotonic_ts) from the prior tick so io_counters() can be
+        # turned into bytes/s. A process seen for the first time primes its entry
+        # and emits None io rates (no misleading 0). Bounded by reaping stale
+        # pids each tick so it cannot grow unbounded across long uptime.
+        self._last_proc_io: dict[int, tuple[int, int, float]] = {}
+        # Process-churn state (spec 5.3): the prior slow-tick PID set + a bounded
+        # event deque(maxlen=10) of ProcessChurnEvent. First slow tick primes the
+        # baseline (no event); thereafter a set-diff above churn_threshold emits.
+        self._last_pid_set: set[int] | None = None
+        self._churn_events: deque[Any] = deque(maxlen=10)
+        # Own-PID registry cache (spec 5.3, ~30s refresh): pid -> role. Refreshed
+        # only on the slowest tick; reused on intervening ticks so the fast path
+        # never re-scans /proc/net for the Ollama port.
+        self._own_pids: dict[int, str] = {}
+        # Most-recent slow-tick GPU sub-data (compute-apps VRAM + pmon util),
+        # keyed by pid. Reattached on fast ticks so the 2s path never blocks on a
+        # 10s subprocess. None until the first slow tick runs.
+        self._gpu_rows_cache: list[Any] = []
+        self._gpu_collected_at: float | None = None
+
         # Prime psutil cpu_percent so the first real call returns meaningful values
         if _HAS_PSUTIL:
             psutil.cpu_percent(percpu=True)
@@ -770,3 +791,402 @@ class SystemDataCollector:
 
         procs.sort(key=lambda p: p["cpu_percent"], reverse=True)
         return procs[:n]
+
+    # ------------------------------------------------------------------
+    # Process attribution (spec 5.3 / 4.5 — TUI + JSON only, never a label)
+    # ------------------------------------------------------------------
+
+    # Ollama process-name match for the own-PID registry. A list so a future
+    # rename / wrapper does not require a code edit; matched case-insensitively
+    # against the leaf process name.
+    _OLLAMA_PROC_NAMES = ("ollama",)
+
+    # Per-section row caps (spec 5.3): 6 GPU / 8 CPU / 5 watchlist / 3 churn,
+    # matching the LeasePanel/A2ATaskPanel cap pattern. Applied at render in the
+    # panel; the collector keeps a slightly larger top-N so the panel can pick.
+    _TOP_N = 12
+
+    async def collect_process_snapshot(
+        self,
+        config: Any | None = None,
+        *,
+        slow_tick: bool = False,
+    ) -> Any:
+        """Assemble a ``ProcessSnapshot`` (spec 5.3 / 4.5).
+
+        TUI + JSON only — process identity is never a Prometheus label.
+
+        Fast path (every tick): top-N by CPU **and** by memory joined into one
+        ``ProcessRow`` set, per-process ``io_counters()`` bytes/s (a per-process
+        ``AccessDenied`` leaves the io fields ``None`` but **keeps** the row),
+        and the watchlist partition (``observability.process_watchlist`` names
+        or ``pid:NNN``).  Slow path (``slow_tick=True``, ~10s): the process-churn
+        set-diff (bounded ``deque(maxlen=10)``) and the GPU sub-data join
+        (compute-apps VRAM + pmon SM%/mem%/enc%/dec% through the ``GPUBackend``
+        seam — empty on ``StubBackend`` / no-GPU, no error).  The own-PID
+        registry is refreshed on the slow tick and cached for the fast ticks.
+
+        Graceful degradation (Constraint #4): a wholesale failure yields a valid
+        (empty) ``ProcessSnapshot``, never an exception, never a misleading 0.
+        """
+        from bastion.models import (
+            ProcessGPURow,
+            ProcessRow,
+            ProcessSnapshot,
+        )
+
+        collected_at = time.time()
+        if not _HAS_PSUTIL:
+            return ProcessSnapshot(collected_at=collected_at)
+
+        watchlist_names, watchlist_pids = self._parse_watchlist(config)
+        churn_threshold = 5
+        if config is not None:
+            try:
+                churn_threshold = int(config.observability.churn_threshold)
+            except Exception:
+                churn_threshold = 5
+
+        # Refresh the own-PID registry on the slow tick; reuse the cache otherwise.
+        if slow_tick or not self._own_pids:
+            try:
+                self._own_pids = self._build_own_pid_registry(config)
+            except Exception:
+                # Keep the prior cache rather than dropping all role tags.
+                pass
+        own_pids = dict(self._own_pids)
+
+        # ── Scan processes once: cpu/mem/io into one row per pid ────────────
+        rows: list[ProcessRow] = []
+        now_mono = time.monotonic()
+        seen_pids: set[int] = set()
+        try:
+            proc_attrs = ["pid", "name", "cpu_percent", "memory_info"]
+            for proc in psutil.process_iter(proc_attrs):
+                try:
+                    info = proc.info
+                    pid = int(info["pid"])
+                except (psutil.NoSuchProcess, psutil.ZombieProcess, KeyError, TypeError):
+                    continue
+                except psutil.AccessDenied:
+                    continue
+                seen_pids.add(pid)
+                name = info.get("name") or ""
+                cpu = info.get("cpu_percent")
+                mem_info = info.get("memory_info")
+                rss_mb = (mem_info.rss / (1024 * 1024)) if mem_info else None
+
+                io_read_s, io_write_s = self._proc_io_rate(proc, pid, now_mono)
+
+                role = own_pids.get(pid)
+                rows.append(
+                    ProcessRow(
+                        pid=pid,
+                        name=name,
+                        cpu_pct=float(cpu) if cpu is not None else None,
+                        rss_mb=rss_mb,
+                        io_read_bytes_s=io_read_s,
+                        io_write_bytes_s=io_write_s,
+                        is_inference_owned=role is not None,
+                        role=role,
+                        watchlisted=(
+                            name.lower() in watchlist_names or pid in watchlist_pids
+                        ),
+                    )
+                )
+        except Exception:
+            # process_iter itself blew up — return a valid empty snapshot.
+            return ProcessSnapshot(
+                own_pids=own_pids, collected_at=collected_at
+            )
+
+        # Reap stale per-process IO state so the dict cannot grow unbounded.
+        if seen_pids:
+            stale = set(self._last_proc_io) - seen_pids
+            for dead in stale:
+                self._last_proc_io.pop(dead, None)
+
+        # ── Top-N = union of top-by-CPU and top-by-memory (4.5 composite) ───
+        top_processes = self._select_top_n(rows)
+
+        # ── Watchlist partition (always present regardless of rank) ─────────
+        watchlist_hits = [r for r in rows if r.watchlisted]
+
+        # ── Slow path: churn + GPU join ─────────────────────────────────────
+        if slow_tick:
+            # Churn uses the cheap psutil.pids() int list (spec 5.3), not the
+            # process_iter set, so transient workers that already exited between
+            # the iter and this read are still captured by the set-diff.
+            try:
+                churn_pids = set(psutil.pids())
+            except Exception:
+                churn_pids = set(seen_pids)
+            self._update_churn(churn_pids, churn_threshold)
+            try:
+                self._gpu_rows_cache = await self._collect_gpu_rows(own_pids)
+                self._gpu_collected_at = time.time()
+            except Exception:
+                # Keep the prior cache; a failed GPU join must not drop the snap.
+                pass
+
+        gpu_processes = list(self._gpu_rows_cache)
+        # Annotate top rows that hold a GPU row (best-effort join by pid).
+        if gpu_processes:
+            gpu_by_pid: dict[int, ProcessGPURow] = {g.pid: g for g in gpu_processes}
+            for r in top_processes:
+                if r.pid in gpu_by_pid:
+                    r.gpu_row = gpu_by_pid[r.pid]
+
+        return ProcessSnapshot(
+            top_processes=top_processes,
+            gpu_processes=gpu_processes,
+            own_pids=own_pids,
+            watchlist_hits=watchlist_hits,
+            recent_churn_events=list(self._churn_events),
+            collected_at=collected_at,
+            gpu_collected_at=self._gpu_collected_at,
+        )
+
+    @staticmethod
+    def _parse_watchlist(config: Any | None) -> tuple[set[str], set[int]]:
+        """Split ``observability.process_watchlist`` into name + pid sets.
+
+        Entries are process names (matched case-insensitively against the leaf
+        name) or ``pid:NNN``.  An empty/absent watchlist returns two empty sets
+        (the common case — a single ``len()``-free early exit in the caller).
+        """
+        names: set[str] = set()
+        pids: set[int] = set()
+        if config is None:
+            return names, pids
+        try:
+            entries = list(config.observability.process_watchlist or [])
+        except Exception:
+            return names, pids
+        for entry in entries:
+            text = str(entry).strip()
+            if not text:
+                continue
+            if text.lower().startswith("pid:"):
+                try:
+                    pids.add(int(text.split(":", 1)[1]))
+                except (ValueError, IndexError):
+                    continue
+            else:
+                names.add(text.lower())
+        return names, pids
+
+    def _build_own_pid_registry(self, config: Any | None) -> dict[int, str]:
+        """Build the own-PID role registry (spec 5.3, ~30s refresh).
+
+        ``os.getpid()`` is this BASTION process -> ``'bastion'``.  The Ollama
+        process is matched by leaf name (``ollama``) and, when discoverable,
+        confirmed by its listening port read from ``BrokerConfig.upstream.port``
+        (never hard-coded).  ``net_connections()`` may raise ``AccessDenied`` on
+        locked-down hosts / non-Linux — that degrades to name-only matching, not
+        a crash.
+        """
+        registry: dict[int, str] = {os.getpid(): "bastion"}
+        if not _HAS_PSUTIL:
+            return registry
+
+        ollama_port = self._ollama_port(config)
+        # Port -> pid map (best-effort; AccessDenied => name-only fallback).
+        port_pid: dict[int, int] = {}
+        if ollama_port is not None:
+            try:
+                for conn in psutil.net_connections(kind="inet"):
+                    if (
+                        conn.status == psutil.CONN_LISTEN
+                        and conn.laddr
+                        and conn.laddr.port == ollama_port
+                        and conn.pid is not None
+                    ):
+                        port_pid[ollama_port] = conn.pid
+            except (psutil.AccessDenied, PermissionError, OSError):
+                port_pid = {}  # name-only fallback
+
+        port_matched_pid = port_pid.get(ollama_port) if ollama_port else None
+        try:
+            for proc in psutil.process_iter(["pid", "name"]):
+                try:
+                    pid = int(proc.info["pid"])
+                    name = (proc.info.get("name") or "").lower()
+                except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError, TypeError):
+                    continue
+                if pid in registry:
+                    continue
+                is_ollama = any(n in name for n in self._OLLAMA_PROC_NAMES)
+                # Prefer a port-confirmed pid; otherwise fall back to name match.
+                if port_matched_pid is not None and pid == port_matched_pid:
+                    registry[pid] = "ollama"
+                elif port_matched_pid is None and is_ollama:
+                    registry[pid] = "ollama"
+        except Exception:
+            return registry
+        return registry
+
+    @staticmethod
+    def _ollama_port(config: Any | None) -> int | None:
+        """Read the Ollama upstream port from config (never hard-coded)."""
+        if config is None:
+            return None
+        for attr_path in (("upstream", "port"), ("ollama", "port")):
+            try:
+                obj: Any = config
+                for attr in attr_path:
+                    obj = getattr(obj, attr)
+                if isinstance(obj, int):
+                    return obj
+            except AttributeError:
+                continue
+        return None
+
+    def _proc_io_rate(
+        self, proc: Any, pid: int, now_mono: float
+    ) -> tuple[float | None, float | None]:
+        """Return ``(read_bytes_s, write_bytes_s)`` from an io_counters() delta.
+
+        First sighting of a pid primes the baseline and returns ``(None, None)``
+        — no misleading 0.  A per-process ``AccessDenied`` (common even as the
+        broker user) returns ``(None, None)`` so the CALLER keeps the row with
+        ``io_*`` None rather than dropping it (spec 5.3).
+        """
+        try:
+            counters = proc.io_counters()
+            read_b = int(counters.read_bytes)
+            write_b = int(counters.write_bytes)
+        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess,
+                AttributeError, NotImplementedError, OSError):
+            return None, None
+
+        prior = self._last_proc_io.get(pid)
+        self._last_proc_io[pid] = (read_b, write_b, now_mono)
+        if prior is None:
+            return None, None  # first sighting -> prime only
+        prev_read, prev_write, prev_ts = prior
+        dt = now_mono - prev_ts
+        if dt <= 0:
+            return None, None
+        read_rate = max(0.0, (read_b - prev_read) / dt)
+        write_rate = max(0.0, (write_b - prev_write) / dt)
+        return read_rate, write_rate
+
+    def _select_top_n(self, rows: list[Any]) -> list[Any]:
+        """Top-N = union of top-by-CPU and top-by-memory (spec 4.5 composite).
+
+        An NVMe burst from a 5%-CPU but high-RSS process is the real stall
+        cause, so memory pressure must not be hidden behind the CPU ranking.
+        """
+        half = max(1, self._TOP_N // 2)
+        by_cpu = sorted(rows, key=lambda r: (r.cpu_pct or 0.0), reverse=True)[:half]
+        by_mem = sorted(rows, key=lambda r: (r.rss_mb or 0.0), reverse=True)[:half]
+        out: list[Any] = []
+        seen: set[int] = set()
+        for r in by_cpu + by_mem:
+            if r.pid in seen:
+                continue
+            seen.add(r.pid)
+            out.append(r)
+            if len(out) >= self._TOP_N:
+                break
+        return out
+
+    def _update_churn(self, current_pids: set[int], threshold: int) -> None:
+        """Symmetric PID set-diff per slow tick (spec 5.3, bounded deque(10)).
+
+        First slow tick primes the baseline and emits nothing.  Thereafter a
+        new-PID count above ``threshold`` appends a ``ProcessChurnEvent``; the
+        deque(maxlen=10) drops the oldest by design.
+        """
+        from bastion.models import ProcessChurnEvent
+
+        if self._last_pid_set is None:
+            self._last_pid_set = set(current_pids)
+            return
+        new_pids = current_pids - self._last_pid_set
+        exited_pids = self._last_pid_set - current_pids
+        self._last_pid_set = set(current_pids)
+        if len(new_pids) > threshold:
+            new_names: list[str] = []
+            for pid in list(new_pids)[:16]:
+                try:
+                    new_names.append(psutil.Process(pid).name())
+                except (psutil.NoSuchProcess, psutil.AccessDenied,
+                        psutil.ZombieProcess, OSError):
+                    continue
+            self._churn_events.append(
+                ProcessChurnEvent(
+                    timestamp=time.time(),
+                    new_count=len(new_pids),
+                    exited_count=len(exited_pids),
+                    new_names=new_names,
+                )
+            )
+
+    async def _collect_gpu_rows(self, own_pids: dict[int, str]) -> list[Any]:
+        """Join compute-apps VRAM + pmon utilization into ``ProcessGPURow`` rows.
+
+        Both queries route through the async ``GPUBackend`` seam (spec 5.3 / T0)
+        so the event loop never blocks on a synchronous subprocess.  On a
+        ``StubBackend`` / no-GPU host both return ``[]`` and this yields ``[]``
+        (the correct complete value — the panel shows ``(no GPU)``, no error).
+        Each PID seen in either source becomes one row; the own-PID registry
+        tags inference-owned rows so the TUI can colour competitors distinctly.
+        """
+        from bastion.gpu import get_backend
+        from bastion.models import ProcessGPURow
+
+        backend = get_backend()
+        try:
+            compute_apps = await backend.query_processes()
+        except Exception:
+            compute_apps = []
+        try:
+            pmon = await backend.query_process_utilization()
+        except Exception:
+            pmon = []
+
+        # vram by pid (compute-apps dicts carry string pid/vram_mb).
+        vram_by_pid: dict[int, int | None] = {}
+        name_by_pid: dict[int, str] = {}
+        for entry in compute_apps:
+            try:
+                pid = int(entry.get("pid"))
+            except (TypeError, ValueError):
+                continue
+            name_by_pid[pid] = entry.get("name") or ""
+            raw_vram = entry.get("vram_mb")
+            try:
+                vram_by_pid[pid] = int(raw_vram) if raw_vram not in (None, "") else None
+            except (TypeError, ValueError):
+                vram_by_pid[pid] = None
+
+        util_by_pid: dict[int, dict[str, Any]] = {}
+        for entry in pmon:
+            try:
+                pid = int(entry.get("pid"))
+            except (TypeError, ValueError):
+                continue
+            util_by_pid[pid] = entry
+            if pid not in name_by_pid and entry.get("name"):
+                name_by_pid[pid] = entry.get("name") or ""
+
+        rows: list[ProcessGPURow] = []
+        for pid in sorted(set(vram_by_pid) | set(util_by_pid)):
+            util = util_by_pid.get(pid, {})
+            role = own_pids.get(pid)
+            rows.append(
+                ProcessGPURow(
+                    pid=pid,
+                    name=name_by_pid.get(pid, ""),
+                    vram_mb=vram_by_pid.get(pid),
+                    sm_pct=util.get("sm_pct"),
+                    mem_pct=util.get("mem_pct"),
+                    enc_pct=util.get("enc_pct"),
+                    dec_pct=util.get("dec_pct"),
+                    is_inference_owned=role is not None,
+                    role=role,
+                )
+            )
+        return rows
