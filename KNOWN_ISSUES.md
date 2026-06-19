@@ -30,13 +30,12 @@ _(none open — see "Resolved in v0.4.1" below)_
 
 ### Broker dies after upstream Ollama 500 (under VRAM contention)
 
-- **Observed:** 2026-06-11 ~22:02, during the the-batch-client atlas bulk-extract
-  sweep (~600 trees of `/api/chat` calls through the proxy). Under
+- **Observed:** 2026-06-11 ~22:02, during a high-concurrency batch-extraction
+  workload (~600 sequential `/api/chat` request trees through the proxy). Under
   concurrent-session VRAM contention Ollama returned a 500; shortly after, the
   broker stopped serving entirely. Ollama itself never crashed
   (journalctl-verified). Repro evidence: journalctl around 2026-06-11 22:02;
-  client-side symptoms recorded in the-batch-client
-  (`the batch client` header comment + S129/S130 session notes).
+  client-side symptoms recorded in the calling batch client's logs.
 - **Problem:** an upstream 5xx is a *response*, not an httpx exception — so
   `CircuitBreakerTransport` never counts it (see the existing
   `RemoteProtocolError`/`PoolTimeout` item) and no handler path treats
@@ -44,7 +43,7 @@ _(none open — see "Resolved in v0.4.1" below)_
   breaker opening; the actual death path needs the journal traceback to pin
   down.
 - **Consequence worth flagging:** the failure pushed the batch client to ship
-  a proxy-bypass (`OLLAMA_HOST_OVERRIDE` → direct :11434) — i.e. this bug's
+  a proxy-bypass (a direct-to-Ollama host override on :11434) — i.e. this bug's
   practical effect is clients routing AROUND the crash-prevention layer,
   re-exposing exactly the load class BASTION exists to absorb.
 - **Fix path:** (1) pull the traceback from journalctl for 2026-06-11 ~22:02;
@@ -58,7 +57,7 @@ _(none open — see "Resolved in v0.4.1" below)_
   counts toward the circuit breaker. Regression tests pin the contract
   (`TestUpstream500Survival`). **Root cause still open** — needs the
   journalctl traceback from 2026-06-11 ~22:02 to pin the actual death path.
-- **Surfaced by:** the-batch-client S129 data/sessions sweep (2026-06-11); filed
+- **Surfaced by:** a high-concurrency batch run (2026-06-11); filed
   S131 (2026-06-12).
 
 ### `_dispatch_error_cleanup` sets grant events without distinguishing failure from grant
@@ -204,8 +203,8 @@ _(none open — see "Resolved in v0.4.1" below)_
 - **Was:** `src/bastion/vram.py:133-135` returned `[]` on any HTTP exception,
   so every downstream consumer treated transient `/api/ps` failures as "VRAM
   is free" — exactly the misclassification that approved a second 31B load on
-  top of an unflushed one during the S122-merge restart burst and crashed the
-  5090 (downstream batch-client crash dossier, 2026-05-19).
+  top of an unflushed one during a rapid redeploy burst and crashed the
+  5090 (confirmed in post-incident analysis, 2026-05-19).
 - **Fix:** `get_loaded_models()` now returns `list[LoadedModel] | None`;
   `None` is the "state unknown" sentinel. Callers propagated:
   - `can_load_model()` — fail-closed: returns `(False, "VRAM state unknown…")`

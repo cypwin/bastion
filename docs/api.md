@@ -256,7 +256,7 @@ curl http://localhost:11434/broker/recent
     "duration_s": 2.3,
     "status_code": 200,
     "streaming": true,
-    "source": "swarm-agent-7"
+    "source": "my-agent"
   }
 ]
 ```

@@ -1,7 +1,7 @@
 """Root conftest — suite-wide determinism shims.
 
 Added 2026-06 alongside the nvidia-smi admission-gate backstop in
-``VRAMManager.reserve()`` (see docs/design/specs/2026-06-04-vram-ledger-honesty-design.md).
+``VRAMManager.reserve()``.
 
 The backstop calls ``bastion.vram.get_vram_free_gb()`` (real nvidia-smi) on
 every reservation. Without neutralization, every pre-existing test that drives
