@@ -111,3 +111,19 @@ Privacy: `tui_session_start` events stay local in BASTION's audit log. No teleme
 - socratic-interrogator lens — evidence-based decision pattern.
 - ADR-005 (BastionPanel direct-accessor contract) — locks panel data shape during the TUI lifetime; ADR-005 gating event #1 ("third operational surface") aligns with this ADR's revisit trigger #3.
 - ADR-007 — MCP adapter ships in v0.5; instrumentation surface ratio starts then.
+
+---
+
+## Addendum — 2026-06-19: observability expansion as the TUI-instrumentation baseline reference
+
+The 2026-06-19 **inference-correlated observatory** expansion (`docs/design/specs/2026-06-19-observability-expansion.md`, rev. 3; Phases 1–4) lands a large block of new TUI surface — three new panels (`ContentionPanel`, `ProcessAttributionPanel`, `CorrelationPanel`) plus extended rows on existing panels (GPU clocks/throttle/PCIe/mem-junction, RiskIndex bar, thermal-coupling, stall-reason enrichment). For the purposes of this ADR, that expansion is the **TUI-instrumentation baseline reference**: the population of TUI panels against which future `tui_session_start` telemetry (this ADR's signal *a*) is interpreted.
+
+Three points are fixed here so the deprecation-trigger evidence stays well-defined as the TUI grows:
+
+1. **No new TUI-deprecation signals are added.** Per spec §9, the expansion is *orthogonal* to ADR-009 — it introduces no new deprecation telemetry and does not change the trigger combination (telemetry + maintenance-debt OR survey, two-release rule). The new panels are instrumented from the **same `tui_session_start` baseline** defined in this ADR's Implementation Notes; they do not get their own per-panel session counters.
+
+2. **The expansion is the reference panel set for "what the TUI is" at v0.5/v0.6.** When signal *a* (TUI session erosion) is later evaluated against signals *b*/*c*, "the TUI" means the panel set as of this expansion — including the observatory panels. A drop in TUI usage is read relative to a TUI that already offers the correlation/contention/process surfaces, not the narrower v0.4 panel set. This guards against a false "TUI is unused" reading taken before the richer surface had time to land in operators' workflows.
+
+3. **The third-surface alignment is unchanged and now has its own record.** This ADR's revisit trigger #3 (a non-TUI operational surface arriving) aligns with ADR-005 gating event #1. The expansion's MCP `broker_snapshot_v1` tool is that prospective third surface; its deferral/governance is now recorded in **ADR-005-B** (2026-06-19). ADR-009's trigger combination is not altered by ADR-005-B — the two ADRs share the same keying event but govern different decisions (TUI-deprecation evidence vs. subscriber-bus deferral).
+
+Status of this ADR is **unchanged** by the addendum (still Accepted, long-horizon; instrumentation v0.5+, deprecation no earlier than v0.7). The addendum records the baseline, not a new decision.
