@@ -17,10 +17,26 @@ class GPUBackend(Protocol):
     """
 
     async def query_status(self, timeout_seconds: int = 5) -> GPUStatus:
-        """Query GPU temperature, VRAM, and power draw.
+        """Query the GPU fast-path status record.
 
         Returns a :class:`GPUStatus` with whatever fields are available.
         Unavailable fields are ``None`` (graceful degradation).
+
+        Beyond the original temperature / VRAM / power fields, the extended
+        fast-path contract (observability spec Section 5.1) is that an
+        implementation populates the eleven new ``GPUStatus`` fields from this
+        *single* query when the hardware exposes them:
+        ``compute_utilization_pct``, ``memory_bandwidth_utilization_pct``,
+        ``sm_clock_mhz``, ``gr_clock_mhz``, ``mem_clock_mhz``, ``fan_speed_pct``,
+        ``memory_junction_temp_c`` and the four
+        ``pcie_link_gen_{current,max}`` / ``pcie_link_width_{current,max}``
+        fields.  Any field the device cannot report (``[N/A]``, pre-Ampere
+        memory-junction temp, fanless server GPU, non-NVIDIA hardware) MUST be
+        left ``None`` — never a misleading ``0``.  :class:`NvidiaBackend`
+        parses these from one ``nvidia-smi`` call; :class:`StubBackend`
+        (non-NVIDIA / no-GPU) leaves them all ``None`` as the *correct
+        complete* value.  Vendor field names belong only inside the
+        implementing backend, never in higher layers (Constraint #7c).
         """
         ...
 
