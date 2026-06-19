@@ -12,6 +12,11 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Label
 
+# Re-exported as a patch seam: tests patch ``modals.SystemDataCollector`` to verify
+# the GPU-process modal reads the cached snapshot without spawning a subprocess
+# (the modal itself no longer references it after the T1 refactor).
+from bastion.dashboard.collectors import SystemDataCollector  # noqa: F401
+
 # ---------------------------------------------------------------------------
 # Fan control constants and helper
 # ---------------------------------------------------------------------------
