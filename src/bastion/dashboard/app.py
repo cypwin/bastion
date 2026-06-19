@@ -59,25 +59,11 @@ LAYOUT_MODES: set[str] = {"compact", "standard", "full"}
 # ---------------------------------------------------------------------------
 # Auto-fan constants
 # ---------------------------------------------------------------------------
-
-# Escalation curve (operator spec 2026-06-12): the top band is exclusive
-# ("over 85C"), the rest inclusive. Below 60C the fan returns to BIOS auto.
-# De-escalation waits until the temperature sits _AUTO_FAN_HYSTERESIS_C below
-# the hotter band's trigger, so boundary hovering doesn't oscillate the fan.
-_AUTO_FAN_HYSTERESIS_C = 5.0
-
-
-def _fan_band(temp_c: float) -> str | None:
-    """Target fan speed (in %) for ``temp_c``; ``None`` means BIOS auto."""
-    if temp_c > 85.0:
-        return "100"
-    if temp_c >= 80.0:
-        return "90"
-    if temp_c >= 70.0:
-        return "50"
-    if temp_c >= 60.0:
-        return "30"
-    return None
+# Moved to ``bastion.constants`` so the correlation engine can reuse the
+# definitive fan curve without importing this (Textual) app module (spec
+# Section 6.5; ADR-005). Re-exported here for back-compat with existing
+# references in this module.
+from bastion.constants import _AUTO_FAN_HYSTERESIS_C, _fan_band  # noqa: E402
 
 
 class BastionDashboard(App):
