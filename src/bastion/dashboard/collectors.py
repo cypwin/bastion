@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from collections import deque
 from pathlib import Path
@@ -24,6 +25,16 @@ class SystemDataCollector:
     # so tests can point them at fixture files; overridden, never inlined.
     _PSI_DIR: str = "/proc/pressure"
     _VMSTAT_PATH: str = "/proc/vmstat"
+    # RAPL energy sources (spec 5.2 CPU-package-power). Probed in order:
+    # Intel powercap, then AMD ``amd_energy`` hwmon / AMD powercap domain.
+    # Class attributes so tests point them at fixtures; never inlined.
+    _POWERCAP_DIR: str = "/sys/class/powercap"
+    _HWMON_DIR: str = "/sys/class/hwmon"
+
+    # Portable BASE block-device regex (spec 5.2): matches whole disks
+    # (``nvme0n1``/``sda``/``vdb``/``mmcblk0``/``hdc``), NOT NVMe-only, and
+    # excludes partitions (``nvme0n1p1``/``sda1``), loop, and dm devices.
+    _BASE_DEVICE_RE = re.compile(r"^(nvme\d+n\d+|sd[a-z]+|vd[a-z]+|mmcblk\d+|hd[a-z]+)$")
 
     # Page size for swap page->byte conversion. ``os.sysconf`` is unavailable
     # on some platforms; fall back to the canonical 4 KiB.
@@ -50,6 +61,19 @@ class SystemDataCollector:
         self._last_swap_time: float | None = None
         self._last_oom_kill: int | None = None
         self._last_oom_time: float | None = None
+
+        # Per-block-device IO delta state (spec 5.2). Maps base device name to
+        # the prior psutil ``sdiskio`` snapshot + the monotonic timestamp it was
+        # taken at, so util%/await/rate are computed from deltas. First read of
+        # any device primes its entry and emits no row (no misleading 0).
+        self._last_block_io: dict[str, Any] = {}
+        self._last_block_time: dict[str, float] = {}
+
+        # RAPL energy delta state (spec 5.2). Keyed on the resolved energy path
+        # so swapping override paths does not produce a bogus cross-source delta.
+        self._last_rapl_uj: int | None = None
+        self._last_rapl_path: str | None = None
+        self._last_rapl_time: float | None = None
 
         # Prime psutil cpu_percent so the first real call returns meaningful values
         if _HAS_PSUTIL:
@@ -448,6 +472,219 @@ class SystemDataCollector:
         self._last_oom_kill = cur
         self._last_oom_time = now
         return result
+
+    # ------------------------------------------------------------------
+    # Block-device IO — util% / await / throughput (spec 5.2, fast 2s path)
+    # ------------------------------------------------------------------
+
+    def get_block_io_data(
+        self, device_filter: list[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Return per-base-device IO stats from psutil ``disk_io_counters``.
+
+        Discovers BASE block devices dynamically (``nvme*/sd*/vd*/mmcblk*/hd*``
+        — **not** NVMe only) via :attr:`_BASE_DEVICE_RE`, excluding partitions,
+        loop, and dm devices.  ``device_filter`` (the
+        ``observability.storage_device_filter`` override) pins an explicit
+        allow-list of base device names instead of the regex.
+
+        Each returned dict matches the ``BlockDeviceIOStats`` field names:
+        ``device``, ``util_pct`` (``busy_time`` delta / elapsed, as a percent),
+        ``read_await_ms``/``write_await_ms`` (``read_time``/``write_time`` delta
+        over the op-count delta; ``None`` when no ops occurred this interval —
+        never a misleading ``0``), and ``read_rate_mb_s``/``write_rate_mb_s``.
+
+        The **first** observation of any device primes its delta state and the
+        device contributes **no row** (mirrors the swap/OOM first-read-``None``
+        contract).  A missing psutil, ``disk_io_counters`` returning ``None``,
+        or any raised error (e.g. ``AccessDenied``) degrades to ``[]`` — never
+        an exception, never a row of zeros.
+        """
+        if not _HAS_PSUTIL:
+            return []
+        try:
+            perdisk = psutil.disk_io_counters(perdisk=True)
+        except Exception:
+            return []
+        if not perdisk:
+            return []
+
+        now = time.monotonic()
+        bytes_per_mb = 1024 * 1024
+        allow = set(device_filter) if device_filter is not None else None
+        rows: list[dict[str, Any]] = []
+
+        for device, cur in perdisk.items():
+            if allow is not None:
+                if device not in allow:
+                    continue
+            elif not self._BASE_DEVICE_RE.match(device):
+                continue
+
+            prev = self._last_block_io.get(device)
+            prev_time = self._last_block_time.get(device)
+            # Record current snapshot for the next tick regardless of outcome.
+            self._last_block_io[device] = cur
+            self._last_block_time[device] = now
+
+            if prev is None or prev_time is None:
+                continue  # priming read for this device -> no row
+            dt = now - prev_time
+            if dt <= 0:
+                continue
+
+            row = self._block_io_row(device, prev, cur, dt, bytes_per_mb)
+            rows.append(row)
+
+        return rows
+
+    @staticmethod
+    def _block_io_row(
+        device: str, prev: Any, cur: Any, dt: float, bytes_per_mb: int
+    ) -> dict[str, Any]:
+        """Build one ``BlockDeviceIOStats``-shaped dict from two snapshots."""
+        # busy_time / read_time / write_time are milliseconds; dt is seconds.
+        busy_delta_ms = cur.busy_time - prev.busy_time
+        util_pct = busy_delta_ms / (dt * 1000.0) * 100.0
+
+        read_ops = cur.read_count - prev.read_count
+        write_ops = cur.write_count - prev.write_count
+        read_await: float | None = None
+        write_await: float | None = None
+        if read_ops > 0:
+            read_await = (cur.read_time - prev.read_time) / read_ops
+        if write_ops > 0:
+            write_await = (cur.write_time - prev.write_time) / write_ops
+
+        read_rate = (cur.read_bytes - prev.read_bytes) / dt / bytes_per_mb
+        write_rate = (cur.write_bytes - prev.write_bytes) / dt / bytes_per_mb
+
+        return {
+            "device": device,
+            "util_pct": util_pct,
+            "read_await_ms": read_await,
+            "write_await_ms": write_await,
+            "read_rate_mb_s": read_rate,
+            "write_rate_mb_s": write_rate,
+        }
+
+    # ------------------------------------------------------------------
+    # CPU package power — RAPL energy_uj delta (spec 5.2, fast 2s path)
+    # ------------------------------------------------------------------
+
+    def _resolve_rapl_energy_path(self, override: str | None) -> Path | None:
+        """Resolve the RAPL ``energy_uj`` source, probing Intel then AMD.
+
+        Order (spec 5.2 / 4.8 ``rapl_domain_path``):
+          1. ``override`` (``observability.rapl_domain_path``) — a domain dir
+             containing ``energy_uj``, or the ``energy_uj`` file itself.
+          2. Intel ``<powercap>/intel-rapl:0/energy_uj``.
+          3. AMD ``amd_energy`` hwmon ``energy*_input`` (cumulative µJ), then any
+             AMD powercap domain exposing ``energy_uj``.
+        Returns the ``Path`` to a microjoule energy counter, or ``None`` when no
+        source exists.  Counters from all sources use identical rollover math.
+        """
+        if override:
+            p = Path(override)
+            cand = p / "energy_uj" if p.is_dir() else p
+            if cand.exists():
+                return cand
+
+        # (2) Intel powercap.
+        intel = Path(self._POWERCAP_DIR) / "intel-rapl:0" / "energy_uj"
+        if intel.exists():
+            return intel
+
+        # (3a) AMD amd_energy hwmon — cumulative energy*_input in µJ.
+        hwmon_base = Path(self._HWMON_DIR)
+        if hwmon_base.exists():
+            for hwmon_dir in sorted(hwmon_base.iterdir()):
+                name_file = hwmon_dir / "name"
+                try:
+                    if not name_file.exists() or name_file.read_text().strip() != "amd_energy":
+                        continue
+                except OSError:
+                    continue
+                for energy_file in sorted(hwmon_dir.glob("energy*_input")):
+                    if energy_file.exists():
+                        return energy_file
+
+        # (3b) AMD powercap domain — any non-Intel package domain.
+        powercap_base = Path(self._POWERCAP_DIR)
+        if powercap_base.exists():
+            for dom in sorted(powercap_base.iterdir()):
+                energy = dom / "energy_uj"
+                if energy.exists():
+                    return energy
+
+        return None
+
+    def read_package_power(self, rapl_domain_path: str | None = None) -> float | None:
+        """Return CPU package power in watts from a RAPL energy_uj delta.
+
+        Probes Intel (``intel-rapl``) **and** AMD (``amd_energy`` / AMD
+        powercap) sources via :meth:`_resolve_rapl_energy_path`.  Power is the
+        energy delta (µJ) over elapsed time, rollover-safe: when the counter
+        wraps (``new < last``) the domain's ``max_energy_range_uj`` is added.
+
+        Returns ``None`` (never a misleading ``0``) when:
+          - no powercap / amd_energy source exists (container, ARM, no kernel
+            support);
+          - ``energy_uj`` is permission-denied (``PermissionError``);
+          - this is the first read of the resolved path (no prior delta yet);
+          - the resolved energy path changed since the last read (the prior
+            sample is from a different source and cannot form a valid delta).
+        """
+        path = self._resolve_rapl_energy_path(rapl_domain_path)
+        if path is None:
+            # Source absent: clear any primed state so we never compute a bogus
+            # delta if the source reappears against a stale baseline.
+            self._last_rapl_uj = None
+            self._last_rapl_path = None
+            self._last_rapl_time = None
+            return None
+
+        try:
+            cur_uj = int(Path(path).read_text().strip())
+        except (OSError, ValueError):
+            # AccessDenied / unreadable / malformed -> None, keep no baseline.
+            self._last_rapl_uj = None
+            self._last_rapl_path = None
+            self._last_rapl_time = None
+            return None
+
+        now = time.monotonic()
+        path_str = str(path)
+        watts: float | None = None
+        if (
+            self._last_rapl_uj is not None
+            and self._last_rapl_time is not None
+            and self._last_rapl_path == path_str
+        ):
+            dt = now - self._last_rapl_time
+            if dt > 0:
+                delta_uj = cur_uj - self._last_rapl_uj
+                if delta_uj < 0:
+                    delta_uj += self._read_rapl_max_range(path)
+                watts = delta_uj / 1_000_000.0 / dt
+
+        self._last_rapl_uj = cur_uj
+        self._last_rapl_path = path_str
+        self._last_rapl_time = now
+        return watts
+
+    @staticmethod
+    def _read_rapl_max_range(energy_path: Path) -> int:
+        """Read the sibling ``max_energy_range_uj`` for rollover correction.
+
+        Returns 0 when the file is absent/unreadable so a missing range simply
+        yields no correction (the delta stays as computed) rather than raising.
+        """
+        max_file = energy_path.parent / "max_energy_range_uj"
+        try:
+            return int(max_file.read_text().strip())
+        except (OSError, ValueError):
+            return 0
 
     # ------------------------------------------------------------------
     # GPU processes
