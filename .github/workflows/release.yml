@@ -52,7 +52,8 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=semver,pattern={{version}}
-            type=raw,value=latest
+            # :latest only follows STABLE releases — never a pre-release (aN/bN/rcN tag)
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, 'a') && !contains(github.ref_name, 'b') && !contains(github.ref_name, 'rc') }}
 
       - name: Build and push
         uses: docker/build-push-action@v5

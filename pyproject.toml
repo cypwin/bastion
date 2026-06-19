@@ -66,6 +66,24 @@ Changelog = "https://github.com/cypwin/bastion/blob/main/CHANGELOG.md"
 [tool.hatch.build.targets.wheel]
 packages = ["src/bastion"]
 
+[tool.hatch.build.targets.sdist]
+# Lean source distribution: ship what a consumer needs to build, test, and
+# configure — not internal design docs, CI workflows, dev scripts, or the
+# separately-published client package. (The wheel already contains only the
+# package; this trims the sdist tarball to match.)
+exclude = [
+  "/docs",
+  "/clients",
+  "/reference",
+  "/scripts",
+  "/systemd",
+  "/.github",
+  "/_archive",
+  "/tmp",
+  "/.worktrees",
+  "/constraints.txt",
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
