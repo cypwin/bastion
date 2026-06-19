@@ -20,7 +20,11 @@ import httpx
 
 from bastion import audit
 from bastion.health import get_vram_free_gb, query_gpu_status
-from bastion.metrics import update_vram_used_mb
+from bastion.metrics import (
+    record_vram_reconcile_import,
+    record_vram_reconcile_stale,
+    update_vram_used_mb,
+)
 from bastion.models import BrokerConfig, LoadedModel, ModelInfo
 
 logger = logging.getLogger(__name__)
@@ -865,6 +869,10 @@ class VRAMManager:
                 )
 
             if freed_total:
+                # NET-NEW Prometheus counter (spec 5.4): meter how often the
+                # ledger drops a stale allocation. Label-less (model name is
+                # unbounded); incremented by the number of models removed.
+                record_vram_reconcile_stale(len(stale))
                 audit.emit("vram_reconciliation", {
                     "stale_models": stale,
                     "freed_bytes": freed_total,
@@ -872,6 +880,9 @@ class VRAMManager:
                     "loaded_models": list(loaded_model_names),
                 })
             if imported_total:
+                # NET-NEW Prometheus counter (spec 5.4): meter how often a
+                # resident-but-untracked model is imported into the budget.
+                record_vram_reconcile_import(len(imported))
                 audit.emit("vram_import", {
                     "imported_models": imported,
                     "imported_bytes": imported_total,

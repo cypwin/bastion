@@ -39,7 +39,12 @@ from bastion.auth import make_a2a_token_dependency, make_admin_key_dependency
 from bastion.circuitbreaker import CircuitBreakerTransport
 from bastion.health import check_gpu_safe, query_gpu_status
 from bastion.latency_aggregator import aggregate_latency
-from bastion.metrics import CONTENT_TYPE_LATEST, PROMETHEUS_AVAILABLE, get_metrics_text
+from bastion.metrics import (
+    CONTENT_TYPE_LATEST,
+    PROMETHEUS_AVAILABLE,
+    get_metrics_text,
+    update_vram_ledger_drift,
+)
 from bastion.middleware import MetricsMiddleware
 from bastion.models import (
     BrokerCatalog,
@@ -51,6 +56,7 @@ from bastion.models import (
     BrokerThrashingAgent,
     CatalogEntry,
     ContentionSnapshot,
+    GPUStatus,
     IntentDeclaration,
     IntentResponse,
     MachineSnapshot,
@@ -304,6 +310,13 @@ async def _collect_machine_snapshot(tick: int) -> MachineSnapshot:
     broker = await _collect_broker_status_lite()
     contention = await _collect_contention()
 
+    # Slow-tick only (tick % 5 == 0 → 10s): publish the signed VRAM ledger-drift
+    # gauge (spec 5.4). Drift = measured (backend) − tracked (allocated+reserved).
+    # SKIP — never publish 0 — when the backend reports no measured VRAM
+    # (StubBackend / non-NVIDIA) or no VRAMManager is configured.
+    if tick % 5 == 0:
+        await _emit_vram_ledger_drift(gpu)
+
     return MachineSnapshot(
         snapshot_ts=snapshot_ts,
         broker=broker,
@@ -314,6 +327,37 @@ async def _collect_machine_snapshot(tick: int) -> MachineSnapshot:
         inference=None,
         correlation=None,
     )
+
+
+async def _emit_vram_ledger_drift(gpu: GPUStatus) -> None:
+    """Publish ``bastion_vram_ledger_drift_mb{gpu_index}`` (spec 5.4, slow tick).
+
+    Drift is the signed delta between **measured** VRAM (the backend's
+    ``query_status`` ``vram_used_mb``, already in hand on this tick) and
+    **tracked** VRAM (``allocated + reserved`` from the in-memory ledger). A
+    growing positive drift means the ledger under-counts real residency, which
+    is the unsafe direction BASTION exists to catch.
+
+    Graceful degradation (Constraint #4): if the backend reports no measured
+    value (``vram_used_mb is None`` on StubBackend / non-NVIDIA) or no
+    ``VRAMManager`` is configured, the gauge is **skipped** — publishing ``0``
+    would falsely claim a perfectly-synced ledger on a host that simply cannot
+    read VRAM. Any failure degrades to a logged skip, never an exception that
+    would kill the snapshot tick.
+    """
+    try:
+        measured_mb = gpu.vram_used_mb
+        if measured_mb is None:
+            return  # no measured value → skip, do not emit a misleading 0
+        if _vram_manager is None:
+            return  # nothing to compare against
+        status = await _vram_manager.status()
+        tracked_bytes = status.get("allocated_bytes", 0) + status.get("reserved_bytes", 0)
+        tracked_mb = tracked_bytes / (1024 * 1024)
+        drift_mb = float(measured_mb) - tracked_mb
+        update_vram_ledger_drift(gpu_index=str(gpu.gpu_index), mb=drift_mb)
+    except Exception:
+        logger.debug("VRAM ledger-drift gauge emission skipped", exc_info=True)
 
 
 async def _machine_snapshot_loop() -> None:
