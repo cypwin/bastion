@@ -26,7 +26,9 @@ from typing import Any
 from bastion import audit
 from bastion.health import check_gpu_safe, query_gpu_status  # noqa: F401
 from bastion.metrics import (
+    record_cooldown_wait,
     record_model_swap,
+    record_model_swap_duration,
     record_queue_wait,
     set_concurrent_requests_active,
 )
@@ -503,6 +505,9 @@ class Scheduler:
                 return await self._dispatch_for_model(self._current_model, needs_swap=False)
             else:
                 # Wait for cooldown
+                # Tier-0 dead-metric activation (spec 5.4): count each enforced
+                # cooldown wait so the swap-rate limiter is visible to alerts.
+                record_cooldown_wait()
                 logger.debug("Cooldown: %.1fs remaining before model swap", remaining)
                 await asyncio.sleep(min(remaining, 0.5))
                 return False
@@ -628,10 +633,20 @@ class Scheduler:
 
         # Dispatch the request (blocking -- swap path)
         # Use load semaphore if VRAMManager is available to serialize GPU I/O
+        #
+        # Tier-0 dead-metric activation (spec 5.4): capture the swap-I/O start
+        # BEFORE the if/else split (set on both branches) and record the
+        # duration AFTER _dispatch_for_model returns in EACH branch. Capturing
+        # here — not before the _load_semaphore acquisition inside the branch —
+        # avoids folding in semaphore-contention wait (already metered by
+        # cooldown_waits_total) into the swap duration, and instrumenting both
+        # branches keeps the no-VRAMManager path from silently under-counting.
+        swap_start = time.monotonic()
         if self.vram_manager is not None and reservation is not None:
             async with self.vram_manager._load_semaphore:
                 try:
                     result = await self._dispatch_for_model(candidate.model, needs_swap=True)
+                    record_model_swap_duration(candidate.model, time.monotonic() - swap_start)
                     if result:
                         await self.vram_manager.commit(reservation)
                     else:
@@ -641,7 +656,9 @@ class Scheduler:
                     await self.vram_manager.release(reservation)
                     raise
         else:
-            return await self._dispatch_for_model(candidate.model, needs_swap=True)
+            result = await self._dispatch_for_model(candidate.model, needs_swap=True)
+            record_model_swap_duration(candidate.model, time.monotonic() - swap_start)
+            return result
 
     async def _evict_for_model(self, candidate: QueuedRequest) -> bool:
         """Evict resident models to make VRAM space for a candidate model.
