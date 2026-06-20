@@ -73,7 +73,7 @@ request_overrides:
   use_mmap: false          # Prevents GPU crashes from mmap on some hardware
 
 # ── Persistence (optional SQLite storage) ──────────────────────────
-# Requires: pip install bastion[persistence]
+# Requires: pip install bastion-broker[persistence]
 # Stores audit events, task state, and optionally queue entries in SQLite
 # for recovery after restart. In-memory stores remain primary — SQLite
 # is a durable archive and recovery source.

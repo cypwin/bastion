@@ -4,7 +4,7 @@ Provides DatabaseManager (connection lifecycle + migrations) and persistent
 wrappers for AuditLogger, TaskStore, and AffinityQueue. All wrappers use
 composition: reads stay in-memory, writes dual-write to SQLite.
 
-Requires: pip install bastion[persistence]  (aiosqlite)
+Requires: pip install bastion-broker[persistence]  (aiosqlite)
 """
 
 from __future__ import annotations

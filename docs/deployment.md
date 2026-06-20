@@ -56,7 +56,7 @@ Python 3.11+ is required. Install BASTION and its dependencies:
 ```bash
 pip install -e ".[persistence]"    # From source
 # or
-pip install bastion[persistence]   # From PyPI (when published)
+pip install bastion-broker[persistence]   # From PyPI (when published)
 ```
 
 ---

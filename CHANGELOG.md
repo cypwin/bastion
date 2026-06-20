@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.5.0a1] - 2026-06-19
 
-_Pre-release (alpha). Reserves the PyPI name and ships the inference-correlated observability work below for early testing. Excluded from `pip install bastion` by default (PEP 440 pre-release); the stable `0.5.0` follows after live-host validation._
+_Pre-release (alpha). Reserves the PyPI name and ships the inference-correlated observability work below for early testing. Excluded from `pip install bastion-broker` by default (PEP 440 pre-release); the stable `0.5.0` follows after live-host validation._
 
 ### Changed
 - **`GPUBackend.query_processes()` is now `async`** (breaking protocol change). It was synchronous (`subprocess.run`); it now uses `asyncio.create_subprocess_exec` like `query_status` so it never blocks the asyncio event loop for up to 5s when polled from the machine-snapshot loop. Custom `GPUBackend` implementations must update the signature to `async def query_processes(self) -> list[dict[str, str]]`. A new async `query_process_utilization()` (per-PID `nvidia-smi pmon` sm/mem/enc/dec util) is added to the protocol; `StubBackend` returns `[]`. The Textual `SystemDataCollector.query_gpu_processes()` wrapper keeps its synchronous call contract by driving the coroutine to completion.

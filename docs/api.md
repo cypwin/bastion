@@ -216,7 +216,7 @@ Prometheus metrics in text exposition format. Returns 501 if `prometheus-client`
 curl http://localhost:11434/broker/metrics
 ```
 
-Install with: `pip install bastion[metrics]`
+Install with: `pip install bastion-broker[metrics]`
 
 **Metrics exported:**
 - `bastion_requests_total` -- total requests by endpoint, status, tier

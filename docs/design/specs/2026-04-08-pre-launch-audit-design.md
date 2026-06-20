@@ -66,7 +66,7 @@ Each agent report uses this structure:
 
 Reviews:
 - README quickstart: do the commands work? Missing steps?
-- `pip install bastion` -> `bastion --help` -> first config -> first request path
+- `pip install bastion-broker` -> `bastion --help` -> first config -> first request path
 - `--detect-models` and config generation flow
 - `config/broker.example.yaml` -> `config/broker.yaml` copy-and-edit experience
 - All 4 example directories: correct API references? Would they run?

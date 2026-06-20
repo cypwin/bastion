@@ -71,7 +71,7 @@ except ImportError:
     PROMETHEUS_AVAILABLE = False
     logger.warning(
         "prometheus-client not installed — metrics will be no-ops. "
-        "Install with: pip install bastion[metrics]"
+        "Install with: pip install bastion-broker[metrics]"
     )
 
     # No-op stubs that match the prometheus_client API

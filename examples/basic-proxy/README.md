@@ -7,7 +7,7 @@ port (11434) and forwards requests to Ollama on 11435.
 ## 1. Install BASTION
 
 ```bash
-pip install bastion
+pip install bastion-broker
 ```
 
 ## 2. Move Ollama to port 11435

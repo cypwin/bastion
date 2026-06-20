@@ -7,7 +7,7 @@
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| SQLite library | `aiosqlite` (optional dep) | Async-native, fits existing async lifespan; optional via `pip install bastion[persistence]` |
+| SQLite library | `aiosqlite` (optional dep) | Async-native, fits existing async lifespan; optional via `pip install bastion-broker[persistence]` |
 | Store pattern | Composition/wrapper | Zero changes to existing in-memory stores; reads stay fast from memory, writes dual-write to SQLite |
 | Schema approach | Versioned with migration runner | Simple `schema_version` table + migration list; ~30 lines, prevents upgrade pain |
 | Queue recovery | TTL-gated replay | Only recover entries younger than configurable TTL (default 5 min); stale entries discarded with audit log |
@@ -35,7 +35,7 @@ Added as `persistence: PersistenceConfig` field on `BrokerConfig` (default: disa
 
 ### Dependency
 
-- `aiosqlite` as optional extra: `pip install bastion[persistence]`
+- `aiosqlite` as optional extra: `pip install bastion-broker[persistence]`
 - `pyproject.toml`: `persistence = ["aiosqlite>=0.20"]`
 - Env overrides: `BASTION_PERSISTENCE_ENABLED`, `BASTION_PERSISTENCE_DB_PATH`
 
@@ -190,7 +190,7 @@ of BASTION doesn't know or care whether persistence is active.
 ### Error handling
 
 - `persistence.enabled: true` + aiosqlite missing: clear error —
-  `"Persistence requires aiosqlite. Install with: pip install bastion[persistence]"`
+  `"Persistence requires aiosqlite. Install with: pip install bastion-broker[persistence]"`
 - SQLite file locked/corrupt: log error, fall back to in-memory with warning (don't crash)
 
 ## 5. Testing Strategy

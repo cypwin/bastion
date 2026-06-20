@@ -52,7 +52,7 @@ and set visibility to Public (if desired).
    - `docker` runs only if `pypi` succeeds
    - `github-release` runs only if both succeed
 8. Verify:
-   - PyPI: `pip install bastion==X.Y.Z`
+   - PyPI: `pip install bastion-broker==X.Y.Z`
    - Docker: `docker pull ghcr.io/cypwin/bastion:X.Y.Z`
    - GitHub: check the Release page and auto-generated notes
 

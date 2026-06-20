@@ -1508,7 +1508,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         except ImportError as exc:
             logger.error(
                 "Persistence requires aiosqlite. "
-                "Install with: pip install bastion[persistence]"
+                "Install with: pip install bastion-broker[persistence]"
             )
             raise SystemExit(1) from exc
 
@@ -2044,7 +2044,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
         """Prometheus metrics endpoint (text exposition format).
 
         Returns 501 Not Implemented if prometheus-client is not installed.
-        To enable: pip install bastion[metrics]
+        To enable: pip install bastion-broker[metrics]
         """
         if not PROMETHEUS_AVAILABLE:
             return JSONResponse(
@@ -2052,7 +2052,7 @@ def create_app(config: BrokerConfig) -> FastAPI:
                     "error": "Metrics not available",
                     "details": (
                         "prometheus-client not installed."
-                        " Install with: pip install bastion[metrics]"
+                        " Install with: pip install bastion-broker[metrics]"
                     ),
                 },
                 status_code=501,
@@ -2909,7 +2909,7 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
                     "error": "Metrics not available",
                     "details": (
                         "prometheus-client not installed."
-                        " Install with: pip install bastion[metrics]"
+                        " Install with: pip install bastion-broker[metrics]"
                     ),
                 },
                 status_code=501,
