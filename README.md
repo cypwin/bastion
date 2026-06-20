@@ -1,6 +1,7 @@
 # BASTION
 
 ![CI](https://github.com/cypwin/bastion/actions/workflows/ci.yml/badge.svg)
+![PyPI](https://img.shields.io/pypi/v/bastion-broker)
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)
 
@@ -51,10 +52,18 @@ standard Ollama port so every client benefits with zero configuration changes.
 ### 1. Install
 
 ```bash
+pip install bastion-broker
+```
+
+Or from source, for development:
+
+```bash
 git clone https://github.com/cypwin/bastion.git
 cd bastion
 pip install -e ".[dev]"
 ```
+
+> Installed as **`bastion-broker`** on PyPI; the command you run and the module you import are both `bastion`.
 
 ### 2. Move Ollama to port 11435
 
@@ -215,11 +224,13 @@ mode, `r` manual refresh, `h` help overlay, `q` quit.
 ## Optional Extras
 
 ```bash
-pip install -e ".[metrics]"     # Prometheus metrics export
-pip install -e ".[dashboard]"   # TUI dashboard (Textual)
-pip install -e ".[a2a]"         # A2A SDK types
-pip install -e ".[dev]"         # Testing and linting tools
+pip install "bastion-broker[dashboard]"   # TUI dashboard (Textual)
+pip install "bastion-broker[metrics]"     # Prometheus metrics export
+pip install "bastion-broker[a2a]"         # A2A agent interface
+pip install "bastion-broker[persistence]" # SQLite task persistence
 ```
+
+From a source checkout, use the editable form instead — e.g. `pip install -e ".[dashboard]"` (and `pip install -e ".[dev]"` for testing + linting tools).
 
 ## Testing
 
