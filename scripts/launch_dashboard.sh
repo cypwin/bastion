@@ -2,6 +2,13 @@
 # BASTION Dashboard Launcher
 # Ensures GPU, Ollama, and BASTION are ready, then launches the TUI dashboard.
 # Cleanup: on exit, stops BASTION if we started it (Ollama keeps running).
+#
+# Env vars:
+#   BASTION_CONDA_ENV        conda env to activate (else any env with the deps
+#                            is auto-detected). Useful for GUI .desktop launches,
+#                            which do not load your shell's conda init.
+#   BASTION_LAUNCH_SELFTEST  if set, resolve Python + verify deps, then exit 0
+#                            before touching the GPU/Ollama/broker (used by tests).
 
 # Note: no set -euo here — conda activate breaks with set -u,
 # and many commands (nvidia-smi, curl, systemctl) intentionally return non-zero.
@@ -26,50 +33,107 @@ echo $$ > "$LOCK_FILE"
 
 cd "$PROJECT_DIR" || exit 1
 
-# Source conda
+# ---------------------------------------------------------------------------
+# Resolve a Python interpreter that has the dashboard's dependencies.
+#
+# GUI .desktop launches do NOT source ~/.bashrc, so conda is never initialised
+# and no env is active — `python` may not even be on PATH. We therefore source
+# conda, honour BASTION_CONDA_ENV if set, and otherwise auto-detect *any* conda
+# env that can import the deps (portable: no hard-coded env name). Any fatal
+# failure calls die(), which keeps the terminal window open so the message is
+# readable — a .desktop-spawned terminal closes the instant this script exits.
+# ---------------------------------------------------------------------------
+
+# Imports the TUI dashboard needs at startup (collectors pull in psutil).
+_DASH_DEPS="textual, httpx, psutil"
+
+# Keep a .desktop-spawned terminal open long enough to read a message. No-op
+# when stdin is not a TTY (CI / piped / selftest) so automation never hangs.
+keep_open() {
+    if [ -t 0 ]; then
+        echo
+        read -rn1 -p "Press any key to close this window..." _ || true
+        echo
+    fi
+}
+
+die() {
+    echo "[!!] $*" >&2
+    keep_open
+    rm -f "$LOCK_FILE"
+    exit 1
+}
+
+# True when the `python` on PATH can import every dashboard dependency.
+_deps_ok() {
+    command -v python &>/dev/null && python -c "import ${_DASH_DEPS}" 2>/dev/null
+}
+
+# Source conda so `conda activate` becomes available in this non-login shell.
 CONDA_BASE="$(conda info --base 2>/dev/null || true)"
-if [ -n "$CONDA_BASE" ] && [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
-    source "$CONDA_BASE/etc/profile.d/conda.sh"
-elif [ -f "$HOME/miniforge3/etc/profile.d/conda.sh" ]; then
-    source "$HOME/miniforge3/etc/profile.d/conda.sh"
-elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
-    source "$HOME/miniconda3/etc/profile.d/conda.sh"
-elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
-    source "$HOME/anaconda3/etc/profile.d/conda.sh"
-else
-    echo "[!!] Could not find conda — continuing without activation"
-fi
+for _conda_sh in \
+    "${CONDA_BASE:+$CONDA_BASE/etc/profile.d/conda.sh}" \
+    "$HOME/miniforge3/etc/profile.d/conda.sh" \
+    "$HOME/miniconda3/etc/profile.d/conda.sh" \
+    "$HOME/anaconda3/etc/profile.d/conda.sh"; do
+    if [ -n "$_conda_sh" ] && [ -f "$_conda_sh" ]; then
+        # shellcheck disable=SC1090
+        source "$_conda_sh"
+        break
+    fi
+done
 
-# Activate a project-specific conda env if BASTION_CONDA_ENV is set.
+# 1. An explicitly requested env wins.
 if [ -n "${BASTION_CONDA_ENV:-}" ]; then
-    conda activate "$BASTION_CONDA_ENV" 2>/dev/null || true
+    conda activate "$BASTION_CONDA_ENV" 2>/dev/null \
+        || die "BASTION_CONDA_ENV='${BASTION_CONDA_ENV}' could not be activated."
 fi
 
-# Resolve Python: prefer the activated conda env's python; if not found, walk
-# common conda env locations that are known to have the project installed.
-if ! command -v python &>/dev/null; then
-    for _py_candidate in \
-        "$HOME/miniforge3/envs/bastion/bin/python" \
-        "$HOME/miniconda3/envs/bastion/bin/python" \
-        "$HOME/anaconda3/envs/bastion/bin/python"; do
-        if [ -x "$_py_candidate" ]; then
-            export PATH="$(dirname "$_py_candidate"):$PATH"
-            echo "[..] Using Python: $_py_candidate"
+# 2. If the deps still aren't importable, auto-detect a conda env that has them.
+if ! _deps_ok; then
+    _candidates=(
+        "$HOME/miniforge3/envs/"*/bin/python
+        "$HOME/miniconda3/envs/"*/bin/python
+        "$HOME/anaconda3/envs/"*/bin/python
+    )
+    [ -n "$CONDA_BASE" ] && _candidates+=( "$CONDA_BASE/envs/"*/bin/python )
+    for _env_py in "${_candidates[@]}"; do
+        [ -x "$_env_py" ] || continue
+        if "$_env_py" -c "import ${_DASH_DEPS}" 2>/dev/null; then
+            export PATH="$(dirname "$_env_py"):$PATH"
+            echo "[..] Using Python: $_env_py"
             break
         fi
     done
 fi
-if ! command -v python &>/dev/null; then
-    echo "[!!] No Python found. Set BASTION_CONDA_ENV to your conda environment name"
-    echo "     or run:  conda activate <your-env>  before launching."
-    rm -f "$LOCK_FILE"
-    exit 1
+
+# 3. Last resort: a named env exists but is missing deps — try to install them.
+if ! _deps_ok && [ -n "${BASTION_CONDA_ENV:-}" ] && command -v python &>/dev/null; then
+    echo "[..] Installing dashboard dependencies into '${BASTION_CONDA_ENV}'..."
+    python -m pip install "textual>=1.0" "httpx>=0.27" "psutil>=5.9" -q || true
 fi
 
-python -c "import textual, httpx" 2>/dev/null || {
-    echo "Installing required packages..."
-    python -m pip install "textual>=1.0" "httpx>=0.27" -q
-}
+# 4. Still no usable interpreter — fail loudly, window stays open.
+if ! _deps_ok; then
+    if ! command -v python &>/dev/null; then
+        die "No Python found. GUI launches do not load your shell's conda setup.
+     Fix: set BASTION_CONDA_ENV to your conda env name in the launcher, e.g.
+       env BASTION_CONDA_ENV=<your-env> '$0'
+     or run 'conda activate <your-env>' before launching from a terminal."
+    fi
+    die "Python ($(command -v python)) is missing required packages: ${_DASH_DEPS}.
+     Install them:  python -m pip install textual httpx psutil
+     or point BASTION_CONDA_ENV at an environment that has them."
+fi
+
+# Self-test hook: verify the interpreter resolved, then exit before touching
+# the GPU / Ollama / broker. Lets the install path be validated non-invasively.
+if [ -n "${BASTION_LAUNCH_SELFTEST:-}" ]; then
+    echo "[ok] Python: $(command -v python)"
+    echo "[ok] Dashboard deps present: ${_DASH_DEPS}"
+    rm -f "$LOCK_FILE"
+    exit 0
+fi
 
 LOG_DIR="${PROJECT_DIR}/logs"
 mkdir -p "$LOG_DIR"
@@ -206,3 +270,9 @@ trap cleanup EXIT
 # 4. Launch the TUI dashboard
 # ---------------------------------------------------------------------------
 PYTHONPATH=src python -m bastion.dashboard "$@"
+_dash_rc=$?
+if [ "$_dash_rc" -ne 0 ]; then
+    echo "[!!] Dashboard exited with code ${_dash_rc} (see traceback above)."
+    keep_open
+fi
+exit "$_dash_rc"
