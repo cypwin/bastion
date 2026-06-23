@@ -44,7 +44,7 @@ def _make_fake_env(home: Path, name: str, *, deps_ok: bool) -> Path:
     bindir = home / "miniforge3" / "envs" / name / "bin"
     bindir.mkdir(parents=True, exist_ok=True)
     py = bindir / "python"
-    py.write_text("#!/bin/bash\nexit %d\n" % (0 if deps_ok else 1))
+    py.write_text(f"#!/bin/bash\nexit {0 if deps_ok else 1}\n")
     py.chmod(0o755)
     return py
 
@@ -161,7 +161,9 @@ def test_launcher_syntax_is_valid() -> None:
 # install-desktop.sh — XDG entry generation
 # ---------------------------------------------------------------------------
 
-def _run_install(tmp_path: Path, *args: str, conda_env: str | None) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+def _run_install(
+    tmp_path: Path, *args: str, conda_env: str | None
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
     data_home = tmp_path / "data"
     config_home = tmp_path / "cfg"
     env = {
