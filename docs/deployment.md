@@ -93,23 +93,30 @@ dashboard, automatically starting Ollama and BASTION if needed.
    sudo systemctl enable --now nvidia-persistenced
    ```
 
-4. **Install the desktop shortcut:**
+4. **Install the desktop app:**
 
-   Create a `.desktop` entry that launches the dashboard via
-   `scripts/launch_dashboard.sh`:
+   From a repo checkout, with your BASTION conda env **activated** (so the right
+   interpreter is baked into the launcher), run the installer:
 
    ```bash
-   cat > ~/.local/share/applications/bastion-dashboard.desktop <<EOF
-   [Desktop Entry]
-   Type=Application
-   Name=BASTION Dashboard
-   Exec=bash $HOME/BASTION/scripts/launch_dashboard.sh
-   Terminal=true
-   Categories=Utility;
-   EOF
+   conda activate <your-env>     # the env where BASTION + its deps are installed
+   scripts/install-desktop.sh                 # app menu entry + login autostart
+   # or: scripts/install-desktop.sh --no-autostart   # app menu entry only
    ```
 
-   Or skip the entry and launch the dashboard directly:
+   This writes `~/.local/share/applications/bastion-dashboard.desktop` (and an
+   autostart entry unless `--no-autostart`). Search "BASTION" in your app menu,
+   then right-click → Pin. Remove with `scripts/install-desktop.sh uninstall`.
+
+   > **Why activate first:** GUI `.desktop` launches do **not** load your shell's
+   > `~/.bashrc`, so conda is never initialised and `python` may not be on PATH.
+   > The installer bakes the active env into the launcher as
+   > `env BASTION_CONDA_ENV=<env>`. If you install without an env active, the
+   > launcher falls back to auto-detecting a conda env that has the dashboard
+   > dependencies. You can also force one by exporting `BASTION_CONDA_ENV=<env>`
+   > before launching, or by editing the `Exec=` line of the `.desktop` file.
+
+   Or skip the desktop entry and launch the dashboard directly:
 
    ```bash
    bash ~/BASTION/scripts/launch_dashboard.sh
@@ -128,18 +135,22 @@ dashboard, automatically starting Ollama and BASTION if needed.
 
 ### What the launcher does
 
-1. Creates GPU device nodes if missing (`nvidia-modprobe`)
-2. Detects Ollama: starts/restarts via systemd, or falls back to manual launch
-3. Starts BASTION under the `bastion` group (required for nftables access)
-4. Launches the Textual TUI dashboard
-5. On exit: stops BASTION (Ollama keeps running)
+1. Resolves a Python interpreter: activates `BASTION_CONDA_ENV` if set, otherwise
+   auto-detects a conda env that can import the dashboard deps (`textual`,
+   `httpx`, `psutil`). If none is found it prints an actionable error and **keeps
+   the terminal window open** so the message is readable.
+2. Creates GPU device nodes if missing (`nvidia-modprobe`)
+3. Detects Ollama: starts/restarts via systemd, or falls back to manual launch
+4. Starts BASTION under the `bastion` group (required for nftables access)
+5. Launches the Textual TUI dashboard
+6. On exit: stops BASTION (Ollama keeps running)
 
 ### Troubleshooting the launcher
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | "Dashboard already running" but nothing visible | Stale lock file from a crash | `rm ${XDG_RUNTIME_DIR}/bastion-dashboard.lock` |
-| Terminal opens then closes immediately | `conda activate` or a command failed | Run `bash -x ~/BASTION/scripts/launch_dashboard.sh 2>&1` to see the error |
+| Terminal opens then closes immediately | No Python/deps in the GUI launch env (conda not initialised) | The launcher now stays open and prints the cause. Install BASTION's deps in a conda env and re-run `scripts/install-desktop.sh` from that activated env, or set `BASTION_CONDA_ENV=<env>`. Debug: `bash -x ~/BASTION/scripts/launch_dashboard.sh 2>&1` |
 | Ollama shows "unhealthy" in dashboard | BASTION can't reach Ollama on 11435 | Check nftables (see below) and that Ollama is on 11435: `sg bastion "curl -sf http://127.0.0.1:11435/api/tags"` |
 | GPU panels show null values | `nvidia-smi` not working | Run `nvidia-smi` — if it fails, `sudo nvidia-modprobe && sudo nvidia-modprobe -u` |
 | Duplicate Ollama instances fighting for port | Clicked launcher multiple times before it finished | `pkill -f "ollama serve"` then wait and relaunch |

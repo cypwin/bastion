@@ -1,0 +1,25 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=BASTION Dashboard
+GenericName=GPU Broker Monitor
+Comment=Monitor BASTION's GPU/LLM broker — queues, models, VRAM, alerts
+Exec=@LAUNCHER@
+Terminal=true
+Icon=utilities-system-monitor
+Categories=Development;System;Monitor;
+StartupNotify=false
+Keywords=GPU;LLM;Ollama;Broker;BASTION;Monitor;
+# scripts/install-desktop.sh substitutes @LAUNCHER@ at install time. When the
+# launcher is scripts/launch_dashboard.sh and a conda env is active at install
+# time, the installer bakes `env BASTION_CONDA_ENV=<env>` into the command —
+# GUI .desktop launches do not load your shell's conda init, so the interpreter
+# must be made explicit or the TUI cannot start.
+#
+# TODO(window-positioning): With Terminal=true the system picks the user's
+# default terminal emulator; placing the resulting window is left to the
+# window manager. On GNOME+X11 a per-session wrapper using wmctrl can pin
+# the window (e.g. `wmctrl -r "BASTION Dashboard" -e 0,1280,540,640,540`
+# after a short sleep). On Wayland this needs a Mutter/GNOME extension
+# such as "Auto Move Windows". Not implemented here — manual placement
+# until either approach is wired up.
