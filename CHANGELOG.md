@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0a2] - 2026-06-23
+
+_Pre-release (alpha). Packaging/tooling fixes on top of `0.5.0a1`; no runtime broker changes. Still excluded from `pip install bastion-broker` by default (PEP 440 pre-release)._
+
+### Fixed
+- **Desktop-app launch is now robust and self-diagnosing.** `scripts/launch_dashboard.sh` no longer hard-codes a conda environment path: it auto-detects the interpreter (active `$CONDA_PREFIX` → `conda run` → repo-relative venv → `python3` on `PATH`), so the launcher works regardless of where the environment lives. Failures are now surfaced visibly (the terminal no longer flashes and closes silently) — the launcher reports the unresolved interpreter or import error and pauses so it can be read. Root cause of the GUI launcher closing immediately on machines whose env path differed from the build host's.
+
+### Added
+- `scripts/install-desktop.sh` — installs the dashboard as a desktop application from `packaging/bastion-dashboard.desktop.in`, resolving the interpreter at install time and writing a portable `.desktop` entry. Replaces the brittle hand-rolled heredoc previously documented in the deployment guide (which was the exact pattern that broke). The installer warns when the conda env is not active, because GUI launches do not load `~/.bashrc`.
+- `tests/test_desktop_launcher.py` — 13 hermetic tests covering interpreter resolution order, error surfacing, and `.desktop` generation.
+
+### Documentation
+- `docs/deployment.md` — Step 4 now uses `scripts/install-desktop.sh`; adds the env-resolution step to "What the launcher does" and a callout on why the conda env must be active at install time.
+- `docs/troubleshooting.md` — new "desktop app flashes then closes" entry.
+- `README.md` — Dashboard section points to the desktop-app installer.
+
 ## [0.5.0a1] - 2026-06-19
 
 _Pre-release (alpha). Reserves the PyPI name and ships the inference-correlated observability work below for early testing. Excluded from `pip install bastion-broker` by default (PEP 440 pre-release); the stable `0.5.0` follows after live-host validation._
