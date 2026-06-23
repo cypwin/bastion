@@ -203,6 +203,10 @@ bastion-dashboard --url http://localhost:11434 --interval 2.0
 
 (Or: `python -m bastion.dashboard` / `python -m bastion.dashboard --url http://localhost:11434 --interval 2.0`)
 
+Prefer a clickable app? Install a desktop entry (app menu + optional autostart)
+with `scripts/install-desktop.sh` — see
+[Deployment → Desktop Launcher](docs/deployment.md#desktop-launcher).
+
 **Keyboard shortcuts:** `p` preload model, `u` unload model, `d` toggle drain
 mode, `r` manual refresh, `h` help overlay, `q` quit.
 

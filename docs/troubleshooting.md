@@ -239,6 +239,21 @@ curl -H "Authorization: Bearer your-api-key" http://localhost:11434/broker/statu
 pip install -e ".[dashboard]"
 ```
 
+### Desktop app: terminal flashes open then closes
+
+**Symptom:** Double-clicking the BASTION Dashboard desktop entry opens a terminal
+that vanishes instantly; running the dashboard from your shell works fine.
+
+**Cause:** GUI `.desktop` launches do **not** load your shell's `~/.bashrc`, so
+conda is never initialised and `python` may not be on PATH.
+
+**Fix:** `scripts/launch_dashboard.sh` now auto-detects a conda env that has the
+dashboard deps and, on failure, stays open and prints what to do. To pin a
+specific env, set `BASTION_CONDA_ENV=<env>` — re-running
+`scripts/install-desktop.sh` from the activated env bakes this into the launcher
+automatically. See
+[Deployment → Desktop Launcher](deployment.md#desktop-launcher).
+
 ## Persistence
 
 ### Persistence database errors
