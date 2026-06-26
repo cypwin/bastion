@@ -31,6 +31,7 @@ from bastion.metrics import (
     record_model_swap_duration,
     record_queue_wait,
     set_concurrent_requests_active,
+    update_swap_rate_per_min,
 )
 from bastion.models import BrokerConfig, QueuedRequest
 from bastion.queue import AffinityQueue
@@ -158,7 +159,10 @@ class Scheduler:
         float
             Cooldown duration in seconds.
         """
-        now = time.time()
+        # Swap-timing clock is MONOTONIC (F1): a wall-clock backward NTP step /
+        # suspend-resume would otherwise read the trailing window as ~0 swaps and
+        # silently disarm the rate throttle. Stall-DISPLAY stamps stay wall-clock.
+        now = time.monotonic()
         window = self.config.scheduler.swap_rate_window_seconds
 
         # Prune timestamps outside the window
@@ -166,6 +170,9 @@ class Scheduler:
             self._swap_timestamps.popleft()
 
         rate = len(self._swap_timestamps)
+        # Vision C gauge: surface the live per-minute swap rate so a storm is
+        # visible forming, independent of whether the brake has engaged.
+        update_swap_rate_per_min(float(rate))
         cfg = self.config.scheduler
 
         if rate >= cfg.swap_rate_critical_threshold:
@@ -319,7 +326,7 @@ class Scheduler:
 
         while current_inflight < max_concurrent:
             # Stagger concurrent dispatches to reduce GPU power transients
-            # (460W→80W→460W spikes stress VRMs; 100ms delay staggers ramp-up)
+            # (large cold-load power swings stress VRMs; a short delay staggers ramp-up)
             if dispatched_any and dispatch_delay > 0:
                 await asyncio.sleep(dispatch_delay)
 
@@ -351,7 +358,7 @@ class Scheduler:
                 logger.debug("Co-resident dispatch: %s (non-blocking)", model)
                 if self._current_model is None:
                     # First dispatch — set swap time baseline for cooldown tracking
-                    self._last_swap_time = time.time()
+                    self._last_swap_time = time.monotonic()
                 elif model != self._current_model:
                     logger.debug("Co-resident transition: %s -> %s, skipping cooldown",
                                 self._current_model, model)
@@ -438,7 +445,7 @@ class Scheduler:
                 non_resident = [m for m in models_with_work if m not in resident_models]
                 if non_resident:
                     swap_cooldown = self._get_swap_cooldown()
-                    elapsed = time.time() - self._last_swap_time
+                    elapsed = max(0.0, time.monotonic() - self._last_swap_time)
                     remaining = swap_cooldown - elapsed
                     if remaining > 0:
                         reason = "swap_cooldown"
@@ -452,7 +459,7 @@ class Scheduler:
             non_resident_with_work = [m for m in models_with_work if m not in resident_models]
             if non_resident_with_work:
                 swap_cooldown = self._get_swap_cooldown()
-                elapsed = time.time() - self._last_swap_time
+                elapsed = max(0.0, time.monotonic() - self._last_swap_time)
                 remaining = swap_cooldown - elapsed
                 if remaining > 0:
                     reason = "swap_cooldown"
@@ -495,7 +502,7 @@ class Scheduler:
         """
         # Check cooldown (dynamic based on swap rate)
         swap_cooldown = self._get_swap_cooldown()
-        elapsed = time.time() - self._last_swap_time
+        elapsed = max(0.0, time.monotonic() - self._last_swap_time)
         remaining = swap_cooldown - elapsed
         if remaining > 0:
             # Can we serve a request for the current model instead?
@@ -599,7 +606,7 @@ class Scheduler:
         )
 
         self._current_model = candidate.model
-        self._last_swap_time = time.time()
+        self._last_swap_time = time.monotonic()
         self._swap_timestamps.append(self._last_swap_time)
         self._total_swaps += 1
 
@@ -895,7 +902,7 @@ class Scheduler:
                 largest = max(loaded, key=lambda m: m.vram_gb)
                 self._current_model = largest.name
                 # Set swap time baseline so first non-resident swap respects cooldown
-                self._last_swap_time = time.time()
+                self._last_swap_time = time.monotonic()
                 logger.info(
                     "Synced with Ollama: %d models loaded, current='%s' (%.1f GB)",
                     len(loaded), largest.name, largest.vram_gb,

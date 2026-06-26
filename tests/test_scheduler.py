@@ -563,7 +563,7 @@ class TestSwapCooldown:
     def test_normal_cooldown_below_warn_threshold(self, cooldown_config: BrokerConfig) -> None:
         """With fewer swaps than warn_threshold, cooldown stays at base."""
         sched = self._make_scheduler(cooldown_config)
-        now = time.time()
+        now = time.monotonic()
         # Add 3 swaps (below warn threshold of 4)
         for i in range(3):
             sched._swap_timestamps.append(now - i)
@@ -573,7 +573,7 @@ class TestSwapCooldown:
     def test_warn_cooldown_at_warn_threshold(self, cooldown_config: BrokerConfig) -> None:
         """At warn threshold, cooldown should escalate to warn level."""
         sched = self._make_scheduler(cooldown_config)
-        now = time.time()
+        now = time.monotonic()
         # Add exactly 4 swaps (= warn threshold)
         for i in range(4):
             sched._swap_timestamps.append(now - i)
@@ -583,7 +583,7 @@ class TestSwapCooldown:
     def test_critical_cooldown_at_critical_threshold(self, cooldown_config: BrokerConfig) -> None:
         """At critical threshold, cooldown should escalate to critical level."""
         sched = self._make_scheduler(cooldown_config)
-        now = time.time()
+        now = time.monotonic()
         # Add 6 swaps (= critical threshold)
         for i in range(6):
             sched._swap_timestamps.append(now - i)
@@ -593,7 +593,7 @@ class TestSwapCooldown:
     def test_old_timestamps_are_pruned(self, cooldown_config: BrokerConfig) -> None:
         """Timestamps older than the window should be pruned."""
         sched = self._make_scheduler(cooldown_config)
-        now = time.time()
+        now = time.monotonic()
         window = cooldown_config.scheduler.swap_rate_window_seconds
         # Add 8 swaps, all outside the window
         for i in range(8):
@@ -607,7 +607,7 @@ class TestSwapCooldown:
         """Swap rate level transitions should update _swap_rate_level."""
         sched = self._make_scheduler(cooldown_config)
         assert sched._swap_rate_level == "normal"
-        now = time.time()
+        now = time.monotonic()
         for i in range(4):
             sched._swap_timestamps.append(now - i)
         sched._get_swap_cooldown()
@@ -616,7 +616,7 @@ class TestSwapCooldown:
     def test_critical_to_normal_transition(self, cooldown_config: BrokerConfig) -> None:
         """After timestamps expire, level should drop back to normal."""
         sched = self._make_scheduler(cooldown_config)
-        now = time.time()
+        now = time.monotonic()
         window = cooldown_config.scheduler.swap_rate_window_seconds
         # Set up critical level
         for i in range(6):
@@ -629,6 +629,33 @@ class TestSwapCooldown:
             sched._swap_timestamps.append(now - window - 1 - i)
         sched._get_swap_cooldown()
         assert sched._swap_rate_level == "normal"
+
+    def test_cooldown_window_uses_monotonic_clock(self, cooldown_config: BrokerConfig) -> None:
+        """F1: the swap-rate window must prune on time.monotonic(), not wall clock.
+
+        A wall-clock backward NTP step / suspend-resume would otherwise read the
+        trailing window as ~0 swaps and silently disarm the throttle.
+        """
+        sched = self._make_scheduler(cooldown_config)
+        window = cooldown_config.scheduler.swap_rate_window_seconds
+        with patch("bastion.scheduler.time.monotonic", return_value=1000.0):
+            old = 1000.0 - window - 5.0  # outside window -> pruned (oldest, appended first)
+            sched._swap_timestamps.append(old)
+            sched._swap_timestamps.append(999.0)  # 1s ago -> within window -> kept
+            sched._get_swap_cooldown()
+            assert old not in sched._swap_timestamps
+            assert 999.0 in sched._swap_timestamps
+
+    def test_swap_rate_gauge_published(self, cooldown_config: BrokerConfig) -> None:
+        """F1: _get_swap_cooldown publishes the live per-minute swap-rate gauge."""
+        sched = self._make_scheduler(cooldown_config)
+        now = time.monotonic()
+        for i in range(3):
+            sched._swap_timestamps.append(now - i)
+        with patch("bastion.scheduler.update_swap_rate_per_min") as gauge:
+            sched._get_swap_cooldown()
+            gauge.assert_called_once()
+            assert gauge.call_args[0][0] == 3.0
 
 
 # ---------------------------------------------------------------------------
