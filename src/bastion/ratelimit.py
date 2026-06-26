@@ -93,6 +93,56 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self._buckets: dict[str, _TokenBucket] = {}
         self._lock = asyncio.Lock()
 
+    def _get_or_create_bucket(self, caller: str) -> _TokenBucket:
+        """Return the token bucket for ``caller``, creating it if absent.
+
+        Not coroutine-safe on its own; callers inside ``dispatch`` hold
+        ``self._lock``. The synchronous :meth:`throttle` hook relies on the
+        single-step ``dict`` mutation being atomic under asyncio.
+        """
+        bucket = self._buckets.get(caller)
+        if bucket is None:
+            bucket = _TokenBucket(rate=self._rate, burst=self._burst)
+            self._buckets[caller] = bucket
+        return bucket
+
+    def throttle(self, caller: str, model: str) -> None:
+        """Throttle ``caller`` at the next admission check.
+
+        Invoked when the swap-velocity brake sheds a request (503): the
+        shedding path calls this so a client that ignores ``Retry-After``
+        (notably the ``--stress-test`` calibration loop) cannot hot-retry the
+        enqueue -> 503 path into a CPU busy-loop. It drains the caller's
+        token bucket so the next admission check reports a positive wait and
+        returns 429.
+
+        This is the admission-coupling hook of the brake design; wiring it to
+        the shedding code is done by S3/S4/SRV1, not here.
+
+        Parameters
+        ----------
+        caller : str
+            Admission key for the shed client (``X-Agent-Id`` or client IP),
+            matching the key used by :meth:`_get_client_ip`.
+        model : str
+            Model the shed swap demand targeted; recorded for observability.
+
+        Notes
+        -----
+        Idempotent-safe: draining an already-empty bucket floors at zero
+        tokens, so repeated sheds for the same caller never raise and never
+        over-debit. Synchronous (zero ``await``) so it stays atomic under
+        asyncio without acquiring ``self._lock``.
+        """
+        bucket = self._get_or_create_bucket(caller)
+        # Drain to empty and reset the refill clock so the very next
+        # consume() sees ~zero elapsed time and reports a wait > 0.
+        bucket.tokens = 0.0
+        bucket.last_refill = time.monotonic()
+        logger.info(
+            "Brake-shed throttle applied to caller %s (model %s)", caller, model
+        )
+
     def _get_client_ip(self, request: Request) -> str:
         """Extract client IP from the request.
 
@@ -131,10 +181,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         client_ip = self._get_client_ip(request)
 
         async with self._lock:
-            bucket = self._buckets.get(client_ip)
-            if bucket is None:
-                bucket = _TokenBucket(rate=self._rate, burst=self._burst)
-                self._buckets[client_ip] = bucket
+            bucket = self._get_or_create_bucket(client_ip)
             wait_seconds = bucket.consume()
 
         if wait_seconds > 0:

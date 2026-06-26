@@ -111,6 +111,35 @@ class TestRateLimitEnabled:
         assert resp.status_code == 200
 
 
+class TestShedThrottle:
+    """The brake-shed admission throttle hook (TASK RL1)."""
+
+    def test_shed_throttles_caller(self) -> None:
+        """``throttle`` exists, is idempotent-safe, and rate-limits the
+        caller on the next admission check."""
+        from bastion.ratelimit import RateLimitConfig, RateLimitMiddleware
+
+        config = RateLimitConfig(enabled=True, requests_per_minute=60, burst=5)
+        mw = RateLimitMiddleware(app=None, config=config)
+
+        caller = "10.0.0.5"
+
+        # A pristine caller has a full bucket -> next admission is allowed.
+        fresh = mw._get_or_create_bucket("10.0.0.6")
+        assert fresh.consume() == 0.0
+
+        # The brake sheds a 503 for this caller/model -> throttle it.
+        mw.throttle(caller, "llama3")
+
+        # Idempotent-safe: repeated throttling must not raise.
+        mw.throttle(caller, "llama3")
+
+        # The throttled caller is now rate-limited on the next admission
+        # check: its bucket is drained so consume() reports a wait > 0.
+        bucket = mw._buckets[caller]
+        assert bucket.consume() > 0.0
+
+
 def test_xff_ignored_when_no_trusted_proxies() -> None:
     from starlette.requests import Request
 
