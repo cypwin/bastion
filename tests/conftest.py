@@ -9,6 +9,7 @@ Provides:
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -26,8 +27,10 @@ from bastion.models import (
     QueuedRequest,
     SchedulerConfig,
     ServerConfig,
+    SwapBrakeConfig,
 )
 from bastion.queue import AffinityQueue
+from bastion.swapbrake import SwapBrake
 from bastion.vram import VRAMTracker
 
 # ---------------------------------------------------------------------------
@@ -411,6 +414,11 @@ def _build_scheduler_stub() -> AsyncMock:
     sched.drain = AsyncMock(return_value=None)
     sched.resume = AsyncMock(return_value=None)
     sched.stop = AsyncMock(return_value=None)
+    # Swap-velocity brake + load serializer (the /broker/preload funnel
+    # chokepoint and /broker/status + /broker/swap-brake read these). Real
+    # objects so acquire()/snapshot()/force() behave, not AsyncMock coroutines.
+    sched.swap_brake = SwapBrake(SwapBrakeConfig())
+    sched.load_serializer = asyncio.Semaphore(1)
     return sched
 
 
