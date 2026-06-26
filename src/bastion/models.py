@@ -66,6 +66,13 @@ class GPUConfig(BaseModel):
     max_power_watts: float = 300.0  # Conservative default; auto-detect overrides
     default_vram_estimate_gb: float = 10.0  # VRAM estimate for unknown models
     nvidia_smi_timeout_seconds: int = 5  # nvidia-smi subprocess timeout
+    # F5 — physical-VRAM hardware gate (best-effort cross-check, NOT the crash boundary).
+    hardware_margin_gb: float = 2.0  # nvidia-smi free-VRAM safety margin; raise to 3-4 for multi-monitor GPUs
+    non_ollama_reserve_gb: float = 0.0  # subtract compositor/framebuffer VRAM from the budget
+    hardware_gate_fail_mode: Literal["open", "closed_on_swap"] = "closed_on_swap"
+    hardware_gate_miss_degrade_after: int = 3  # consecutive cold-swap misses before degrade-to-open
+    # F6 — optional steady-state power headroom trip (0 = disabled; the brake is the transient backstop).
+    power_headroom_pct: float = 0.0
 
     @property
     def max_vram_gb(self) -> float:

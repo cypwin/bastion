@@ -8,6 +8,7 @@ implementation plan's test-file ownership map.
 from __future__ import annotations
 
 from bastion.models import (
+    GPUConfig,
     LoadedModel,
     PinDetectionConfig,
     SchedulerConfig,
@@ -41,6 +42,16 @@ class TestSwapBrakeConfigDefaults:
         p = SchedulerConfig().pin_detection
         assert p.enabled is True
         assert p.expires_horizon_seconds == 3600.0
+
+
+class TestGPUConfigF5F6Fields:
+    def test_gpu_config_f5_f6_defaults(self) -> None:
+        g = GPUConfig()
+        assert g.hardware_margin_gb == 2.0
+        assert g.non_ollama_reserve_gb == 0.0
+        assert g.hardware_gate_fail_mode == "closed_on_swap"
+        assert g.hardware_gate_miss_degrade_after == 3
+        assert g.power_headroom_pct == 0.0
 
 
 class TestLoadedModelF4Fields:
