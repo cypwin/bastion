@@ -11,6 +11,7 @@ from bastion.stress import (
     baseline_phase,
     check_prerequisites,
     single_load_phase,
+    swap_ramp_phase,
 )
 
 
@@ -126,3 +127,77 @@ class TestSingleLoadPhase:
         assert result.success
         assert "inference_latency_s" in result.data
         assert "thermal_delta_c" in result.data
+
+
+class TestSwapRampPhase:
+    """Test Phase 3: swap-velocity ramp + burst-depth calibration."""
+
+    @pytest.mark.asyncio
+    async def test_stable_path_reports_safe_burst_depth(self) -> None:
+        """Completing all intervals emits safe_burst_depth in PhaseResult.data."""
+        ok_resp = MagicMock()
+        ok_resp.status_code = 200
+
+        cool_gpu = MagicMock()
+        cool_gpu.temperature_c = 50  # well below cutoff
+
+        with (
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=ok_resp),
+            patch(
+                "bastion.stress.query_gpu_status",
+                new_callable=AsyncMock,
+                return_value=cool_gpu,
+            ),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            result = await swap_ramp_phase(
+                bastion_url="http://localhost:11434",
+                models=["a:latest", "b:latest"],
+                thermal_ceiling=100,
+            )
+
+        assert result.phase == "swap_ramp"
+        assert result.success
+        assert "safe_swap_rate_per_min" in result.data
+        assert "safe_burst_depth" in result.data
+        # All 5 intervals x 3 swaps tolerated with min-spacing respected.
+        assert result.data["safe_burst_depth"] == 15
+        assert result.data["stop_reason"] == "completed all intervals"
+
+    @pytest.mark.asyncio
+    async def test_instability_path_reports_last_known_safe_burst(self) -> None:
+        """On first instability, report LAST-KNOWN-SAFE burst, not the unstable value."""
+        ok_resp = MagicMock()
+        ok_resp.status_code = 200
+
+        cool_gpu = MagicMock()
+        cool_gpu.temperature_c = 50   # below cutoff (90)
+        hot_gpu = MagicMock()
+        hot_gpu.temperature_c = 95    # above cutoff -> instability
+
+        # First interval (3 swaps) stays cool -> last-known-safe burst = 3.
+        # Next interval's first swap goes hot -> cutoff fires (consecutive would be 4).
+        temps = [cool_gpu, cool_gpu, cool_gpu, hot_gpu]
+
+        with (
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock, return_value=ok_resp),
+            patch(
+                "bastion.stress.query_gpu_status",
+                new_callable=AsyncMock,
+                side_effect=temps,
+            ),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            result = await swap_ramp_phase(
+                bastion_url="http://localhost:11434",
+                models=["a:latest", "b:latest"],
+                thermal_ceiling=100,
+            )
+
+        assert result.phase == "swap_ramp"
+        assert result.success
+        assert "safe_burst_depth" in result.data
+        # Last-known-safe is 3 (the completed cool interval), NOT 4 (the unstable swap).
+        assert result.data["safe_burst_depth"] == 3
+        assert result.data["safe_burst_depth"] != 4
+        assert "thermal cutoff" in result.data["stop_reason"]
