@@ -25,9 +25,10 @@ from bastion.models import (
 # and the dedicated S2 wiring tests). min-spacing 0 + a huge bucket make the
 # brake non-throttling, so the startup "just-swapped" seed never blocks a swap.
 _NEUTRAL_BRAKE = SwapBrakeConfig(min_spacing_seconds=0.0, bucket_capacity=1_000_000.0)
+from bastion import audit
 from bastion.queue import AffinityQueue
 from bastion.scheduler import Scheduler
-from bastion.swapbrake import BrakeDecision
+from bastion.swapbrake import BrakeDecision, BrakeState, SwapBrake
 from bastion.vram import VRAMManager, VRAMTracker
 from tests.conftest import make_request
 
@@ -267,7 +268,12 @@ class TestGPUGatingMidSwap:
                  new_callable=AsyncMock, return_value=(True, "OK"),
              ), \
              patch.object(tracker, "log_vram_snapshot", new_callable=AsyncMock), \
-             patch.object(tracker, "get_loaded_vram_gb", new_callable=AsyncMock, return_value=0.0):
+             patch.object(tracker, "get_loaded_vram_gb", new_callable=AsyncMock, return_value=0.0), \
+             patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=24.0)):
+            # F-2 — supply a plausible free-VRAM reading so the cold-swap reserve
+            # (is_swap=True) actually SUCCEEDS; otherwise it would fail closed before
+            # the GPU gate, leaving the reservation never made and this abort-release
+            # path untested (vacuous pass).
             sched = Scheduler(sched_config, queue, tracker, dispatch_fn, vram_manager=mgr)
             sched._last_swap_time = 0.0
 
@@ -682,6 +688,15 @@ class TestHandleSwapDispatch:
         """Pin the mid-swap GPU gate safe — these tests target the
         reservation lifecycle, not GPU gating (see TestGPUGatingMidSwap)."""
         with patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))):
+            yield
+
+    @pytest.fixture(autouse=True)
+    def _hw_free(self):
+        """F-2 — the scheduler now reserves with is_swap=True (cold-swap path), so a
+        missing nvidia-smi reading fails CLOSED. These reservation-lifecycle tests
+        assume a healthy hardware gate, so pin a plausible free-VRAM reading; the
+        deliberate fail-closed/degrade path is covered by TestColdSwapFailClosed."""
+        with patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=24.0)):
             yield
 
     @pytest.fixture
@@ -1359,6 +1374,50 @@ class TestPinAwareInfeasibleLatch:
         assert sched.swap_brake.is_latched("qwen3:14b") is False
 
     @pytest.mark.asyncio
+    async def test_behavioral_latch_fires_without_pin_metadata(
+        self, sched_config: BrokerConfig,
+    ) -> None:
+        """F-3: on Ollama builds without parseable expires_at, vram._pinned is
+        empty — yet the version-independent evict↔reload oscillation signature
+        must STILL latch (degrade to the behavioral signature, never to no
+        protection). Without the fallback, the :628 _pinned_resident early-return
+        AND _pinned_oscillation_count's pinned-only loop strand the history."""
+        cfg = sched_config.model_copy(deep=True)
+        cfg.scheduler.swap_brake = SwapBrakeConfig(
+            min_spacing_seconds=0.0, bucket_capacity=1000.0,
+            infeasible_evict_reload_threshold=3, infeasible_window_seconds=120.0,
+        )
+        sched = _make_sched(cfg)
+        sched.vram._pinned = set()  # NO parseable expires_at → pin set invisible
+        loaded = [LoadedModel(name="qwen3:14b", vram_gb=9.3)]
+        now = time.monotonic()
+        # A model BASTION evicted that keeps reappearing — the pin-fight fingerprint.
+        sched._evict_reload_history["qwen3:14b"] = deque([now, now, now])
+
+        candidate = make_request(model="mistral-nemo:12b")
+        assert sched._maybe_latch_infeasible(candidate, loaded) is True
+        assert sched.swap_brake.is_latched("mistral-nemo:12b") is True
+
+    @pytest.mark.asyncio
+    async def test_no_latch_without_pins_below_threshold(
+        self, sched_config: BrokerConfig,
+    ) -> None:
+        """F-3 guard: empty pin set + oscillation below threshold ⇒ NO latch — the
+        fallback must not false-positive on benign one-off churn."""
+        cfg = sched_config.model_copy(deep=True)
+        cfg.scheduler.swap_brake = SwapBrakeConfig(
+            min_spacing_seconds=0.0, bucket_capacity=1000.0,
+            infeasible_evict_reload_threshold=3, infeasible_window_seconds=120.0,
+        )
+        sched = _make_sched(cfg)
+        sched.vram._pinned = set()
+        loaded = [LoadedModel(name="qwen3:14b", vram_gb=9.3)]
+        now = time.monotonic()
+        sched._evict_reload_history["qwen3:14b"] = deque([now, now])  # only 2 < 3
+        candidate = make_request(model="mistral-nemo:12b")
+        assert sched._maybe_latch_infeasible(candidate, loaded) is False
+
+    @pytest.mark.asyncio
     async def test_latch_clears_on_residency_delta_only(
         self, sched_config: BrokerConfig,
     ) -> None:
@@ -1504,21 +1563,311 @@ class TestHardwareGateBlindForward:
         sched = Scheduler(cfg, queue, tracker, dispatch, vram_manager=mgr)
         full_refill = sched.swap_brake._refill_rate_per_sec()
 
-        with patch.object(tracker, "get_loaded_models", AsyncMock(return_value=[])), \
+        # F-2 — the scheduler now reserves with is_swap=True, so the blind signal must
+        # arise THROUGH the real cold-swap reserve, not by hand-setting the flag (a
+        # plausible reading would otherwise reset it). Drive it via the degraded verdict.
+        free = {"gb": None}
+
+        async def _free():
+            return free["gb"]
+
+        with patch("bastion.vram.get_vram_free_gb", _free), \
+             patch.object(tracker, "get_loaded_models", AsyncMock(return_value=[])), \
              patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))), \
              patch.object(tracker, "can_load_model", AsyncMock(return_value=(True, "OK"))), \
              patch.object(tracker, "log_vram_snapshot", AsyncMock()), \
              patch.object(tracker, "get_loaded_vram_gb", AsyncMock(return_value=0.0)):
-            # Hardware gate blind -> brake refill HALVES.
+            # Blind: sensor returns no reading (miss). Pre-load the streak so the
+            # cold-swap reserve DEGRADES to blind and ADMITS (hands the floor to the
+            # velocity brake), which the scheduler forwards as a HALVED refill.
+            free["gb"] = None
+            mgr._hw_miss_streak = mgr._miss_degrade_after
             mgr._hardware_gate_blind = True
             queue.enqueue(make_request(model="qwen3:14b"))
             await sched._handle_swap_dispatch(queue.pick_next(None))
             assert sched.swap_brake.snapshot()["hardware_gate_blind"] is True
             assert sched.swap_brake._refill_rate_per_sec() == pytest.approx(full_refill * 0.5)
 
-            # Recovery -> full refill restored.
-            mgr._hardware_gate_blind = False
+            # Recovery: a plausible reading resets the gate; full refill restored.
+            free["gb"] = 24.0
             queue.enqueue(make_request(model="qwen3:14b"))
             await sched._handle_swap_dispatch(queue.pick_next(None))
             assert sched.swap_brake.snapshot()["hardware_gate_blind"] is False
             assert sched.swap_brake._refill_rate_per_sec() == pytest.approx(full_refill)
+
+
+# ---------------------------------------------------------------------------
+# F-1 [BLOCKER] — scheduler aborts an orphaned HALF_OPEN probe on dispatch failure
+# ---------------------------------------------------------------------------
+
+
+class _FakeClock:
+    def __init__(self, t: float = 1000.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, dt: float) -> None:
+        self.t += dt
+
+
+def _brake_primed_for_probe(model: str) -> tuple[SwapBrake, _FakeClock]:
+    """A SwapBrake driven to OPEN and advanced past its cooloff with a healthy
+    bucket, so the NEXT acquire() (the one inside _handle_swap_dispatch's load
+    serializer) transitions OPEN→HALF_OPEN and grants the single probe."""
+    clk = _FakeClock(1000.0)
+    cfg = SwapBrakeConfig(
+        min_spacing_seconds=0.0, bucket_capacity=3.0, refill_per_minute=0.0,
+        cooloff_seconds=30.0, min_state_hold_seconds=5.0, release_rate_per_minute=3.0,
+    )
+    b = SwapBrake(cfg, clock=clk)
+    for _ in range(3):
+        b.acquire(model)
+        b.record_load(model)
+    for _ in range(60):
+        b.acquire(model)
+        clk.advance(0.1)
+    assert b.snapshot()["state"] == BrakeState.OPEN
+    clk.advance(31.0)
+    clk.advance(60.0)  # past cooloff + window prune
+    # refill is 0 in this drive; prime the bucket so the pre-gate peek() proceeds
+    # to the serializer where the authoritative acquire() grants the probe.
+    b._tokens = float(cfg.bucket_capacity)
+    return b, clk
+
+
+class TestAbortProbeWiring:
+    """F-1 [BLOCKER]: when the in-serializer acquire() grants a HALF_OPEN probe but
+    dispatch then fails (result False) or raises, _handle_swap_dispatch must call
+    brake.abort_probe() so the brake re-OPENs instead of wedging forever at
+    'half-open probe in flight' (a real post-storm liveness outage)."""
+
+    def _build(self, sched_config: BrokerConfig, dispatch):
+        cfg = sched_config.model_copy(deep=True)
+        queue = AffinityQueue(cfg.scheduler)
+        tracker = VRAMTracker(cfg)
+        mgr = VRAMManager(tracker, 32 * 1024 * 1024 * 1024, safety_margin_pct=10.0)
+        sched = Scheduler(cfg, queue, tracker, dispatch, vram_manager=mgr)
+        sched._last_swap_time = 0.0
+        b, _clk = _brake_primed_for_probe("qwen3:14b")
+        sched._brake = b
+        queue.enqueue(make_request(model="qwen3:14b"))
+        return sched, queue, tracker, b
+
+    @pytest.mark.asyncio
+    async def test_failed_dispatch_aborts_orphan_probe(self, sched_config: BrokerConfig) -> None:
+        async def failing_dispatch(request, needs_swap=True) -> None:
+            # _dispatch_for_model catches this and returns False (else branch).
+            raise RuntimeError("dispatch failed")
+
+        sched, queue, tracker, b = self._build(sched_config, failing_dispatch)
+        with patch.object(tracker, "get_loaded_models", AsyncMock(return_value=[])), \
+             patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))), \
+             patch.object(tracker, "log_vram_snapshot", AsyncMock()), \
+             patch.object(tracker, "get_loaded_vram_gb", AsyncMock(return_value=0.0)), \
+             patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=30.0)):
+            result = await sched._handle_swap_dispatch(queue.pick_next(None))
+
+        assert result is False
+        # acquire() granted the probe; dispatch failed so record_load never fired.
+        # Without abort_probe the brake stays HALF_OPEN with the probe outstanding
+        # (every future acquire → 'half-open probe in flight'); the wiring re-OPENs.
+        assert b._probe_outstanding is False
+        assert b.snapshot()["state"] == BrakeState.OPEN
+
+    @pytest.mark.asyncio
+    async def test_raised_dispatch_aborts_orphan_probe(self, sched_config: BrokerConfig) -> None:
+        async def ok_dispatch(request, needs_swap=True) -> None:
+            pass
+
+        sched, queue, tracker, b = self._build(sched_config, ok_dispatch)
+
+        async def boom(model, needs_swap=True):
+            raise RuntimeError("boom after acquire")  # except branch
+
+        sched._dispatch_for_model = boom  # type: ignore[assignment]
+        with patch.object(tracker, "get_loaded_models", AsyncMock(return_value=[])), \
+             patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))), \
+             patch.object(tracker, "log_vram_snapshot", AsyncMock()), \
+             patch.object(tracker, "get_loaded_vram_gb", AsyncMock(return_value=0.0)), \
+             patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=30.0)):
+            with pytest.raises(RuntimeError, match="boom after acquire"):
+                await sched._handle_swap_dispatch(queue.pick_next(None))
+
+        # The except branch must abort the orphaned probe before re-raising.
+        assert b._probe_outstanding is False
+        assert b.snapshot()["state"] == BrakeState.OPEN
+
+
+# ---------------------------------------------------------------------------
+# F-4 — fail-LOUD brake observability is wired (gauges, engage counter, audit)
+# ---------------------------------------------------------------------------
+
+
+class _FakeBrake:
+    """Minimal brake double exposing only snapshot() (all _update_brake_engage_snapshot reads)."""
+
+    def __init__(self, snap: dict) -> None:
+        self._snap = snap
+
+    def snapshot(self) -> dict:
+        return dict(self._snap)
+
+
+def _brake_snap(state: str, **over) -> dict:
+    base = {
+        "state": state, "reason": state, "cooloff_remaining_s": 0.0,
+        "windowed_rate_per_min": 5.0, "backoff_level": 1, "tokens": 0.0,
+        "hardware_gate_blind": False, "drain_active": False, "latched": [],
+        "force_release_active": False, "force_engage_active": False,
+    }
+    base.update(over)
+    return base
+
+
+class TestBrakeObservabilityWiring:
+    """F-4 — the fail-LOUD brake observability is wired (was zero runtime callers):
+    gauges pushed every tick, engage edge counted once, one audit event on engage
+    and on release (with duration + swaps-during-brake), latch WARNING heartbeat."""
+
+    def test_engage_release_edges_push_gauges_count_and_audit(
+        self, sched_config: BrokerConfig,
+    ) -> None:
+        sched = _make_sched(sched_config)
+        fake = _FakeBrake(_brake_snap("open"))
+        sched._brake = fake
+        with patch("bastion.scheduler.record_swap_brake_engaged") as rec, \
+             patch("bastion.scheduler.update_swap_brake_state") as ust, \
+             patch("bastion.scheduler.update_pinned_vram_gb") as upg, \
+             patch("bastion.audit.emit") as aem:
+            sched._update_brake_engage_snapshot()      # CLOSED→engaged edge
+            sched._update_brake_engage_snapshot()      # still engaged (no new edge)
+            sched._swaps_during_brake = 2              # pretend two probes succeeded
+            fake._snap = _brake_snap("closed")
+            sched._update_brake_engage_snapshot()      # engaged→released edge
+
+        assert rec.call_count == 1                     # engage counted exactly once
+        assert ust.call_count == 3                     # state gauge pushed each tick
+        assert upg.call_count == 3                     # pinned gauge pushed each tick
+        sb = [c for c in aem.call_args_list if c.args and c.args[0] == audit.EVENT_SWAP_BRAKE]
+        assert [c.args[1]["transition"] for c in sb] == ["engaged", "released"]
+        released = sb[1].args[1]
+        assert released["swaps_during_brake"] == 2
+        assert "duration_seconds" in released
+
+    def test_latched_infeasible_logs_warning_heartbeat(
+        self, sched_config: BrokerConfig, caplog,
+    ) -> None:
+        sched = _make_sched(sched_config)
+        sched._brake = _FakeBrake(_brake_snap("open", latched=["big27b"]))
+        with patch("bastion.scheduler.record_swap_brake_engaged"), \
+             patch("bastion.scheduler.update_swap_brake_state"), \
+             patch("bastion.scheduler.update_pinned_vram_gb"), \
+             caplog.at_level("WARNING"):
+            sched._update_brake_engage_snapshot()
+        assert any("big27b" in r.message for r in caplog.records)
+
+    def test_force_active_gauge_pushed_each_tick(
+        self, sched_config: BrokerConfig,
+    ) -> None:
+        """F-5 — bastion_swap_brake_force_active is held high for the override
+        window so an operator can see the backstop is disabled (1.0 active, 0.0 not)."""
+        sched = _make_sched(sched_config)
+        with patch("bastion.scheduler.update_swap_brake_force_active") as gfa, \
+             patch("bastion.scheduler.record_swap_brake_engaged"), \
+             patch("bastion.scheduler.update_swap_brake_state"), \
+             patch("bastion.scheduler.update_pinned_vram_gb"):
+            sched._brake = _FakeBrake(_brake_snap("closed", force_release_active=True))
+            sched._update_brake_engage_snapshot()
+            sched._brake = _FakeBrake(_brake_snap("closed", force_release_active=False))
+            sched._update_brake_engage_snapshot()
+        assert gfa.call_args_list[0].args[0] == 1.0
+        assert gfa.call_args_list[1].args[0] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# F-2 — the F5 cold-swap fail-CLOSED path is reachable from the live swap path
+# ---------------------------------------------------------------------------
+
+
+class TestColdSwapFailClosed:
+    """F-2: the scheduler reserves with is_swap=True, so a transient nvidia-smi miss
+    on the dangerous cold-swap path fails CLOSED (refuse the swap), and after K
+    consecutive misses degrades to blind — handing the floor to the velocity brake
+    (set_hw_degraded) instead of converting a sensor outage into a permanent swap
+    outage. Before F-2 the scheduler reserved without is_swap, so this entire path
+    was inert (steady-state fail-OPEN)."""
+
+    @pytest.mark.asyncio
+    async def test_transient_miss_fails_closed_then_degrades_after_k(
+        self, sched_config: BrokerConfig,
+    ) -> None:
+        cfg = sched_config.model_copy(deep=True)
+        cfg.scheduler.swap_brake = SwapBrakeConfig(min_spacing_seconds=0.0, bucket_capacity=100.0)
+        queue = AffinityQueue(cfg.scheduler)
+        tracker = VRAMTracker(cfg)
+        mgr = VRAMManager(tracker, 32 * 1024 * 1024 * 1024, safety_margin_pct=10.0)
+        dispatched: list = []
+
+        async def dispatch(request, needs_swap=True) -> None:
+            dispatched.append(request)
+
+        sched = Scheduler(cfg, queue, tracker, dispatch, vram_manager=mgr)
+        sched._last_swap_time = 0.0
+        k = mgr._miss_degrade_after  # default 3
+
+        with patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=None)), \
+             patch.object(tracker, "get_loaded_models", AsyncMock(return_value=[])), \
+             patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))), \
+             patch.object(tracker, "log_vram_snapshot", AsyncMock()), \
+             patch.object(tracker, "get_loaded_vram_gb", AsyncMock(return_value=0.0)), \
+             patch("bastion.vram.record_hardware_gate_blind") as blind_metric:
+            # The first K-1 cold-swap attempts fail CLOSED: blind on the dangerous
+            # path = STOP. No dispatch, gate not yet degraded. (The fail-closed reserve
+            # returns before _dispatch_for_model dequeues, so the request stays queued.)
+            for _ in range(k - 1):
+                queue.enqueue(make_request(model="qwen3:14b"))
+                result = await sched._handle_swap_dispatch(queue.pick_next(None))
+                assert result is False
+            assert dispatched == []
+            assert mgr.hardware_gate_blind is False
+
+            # The K-th consecutive miss DEGRADES: stop fail-closing, hand the floor
+            # to the sensor-independent velocity brake (admit), set blind, fire the
+            # metric, and forward the blind signal to the brake.
+            queue.enqueue(make_request(model="qwen3:14b"))
+            result = await sched._handle_swap_dispatch(queue.pick_next(None))
+            assert result is True
+            assert dispatched  # the K-th swap was admitted
+            assert mgr.hardware_gate_blind is True
+            assert blind_metric.called
+            assert sched.swap_brake.snapshot()["hardware_gate_blind"] is True
+
+    @pytest.mark.asyncio
+    async def test_successful_swap_during_brake_increments_counter(
+        self, sched_config: BrokerConfig,
+    ) -> None:
+        cfg = sched_config.model_copy(deep=True)
+        queue = AffinityQueue(cfg.scheduler)
+        tracker = VRAMTracker(cfg)
+        mgr = VRAMManager(tracker, 32 * 1024 * 1024 * 1024, safety_margin_pct=10.0)
+
+        async def ok_dispatch(request, needs_swap=True) -> None:
+            pass
+
+        sched = Scheduler(cfg, queue, tracker, ok_dispatch, vram_manager=mgr)
+        sched._last_swap_time = 0.0
+        b, _clk = _brake_primed_for_probe("qwen3:14b")
+        sched._brake = b
+        sched._engage_ranking = {}  # mark engaged so the during-brake counter is active
+        queue.enqueue(make_request(model="qwen3:14b"))
+        with patch.object(tracker, "get_loaded_models", AsyncMock(return_value=[])), \
+             patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))), \
+             patch.object(tracker, "log_vram_snapshot", AsyncMock()), \
+             patch.object(tracker, "get_loaded_vram_gb", AsyncMock(return_value=0.0)), \
+             patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=30.0)):
+            result = await sched._handle_swap_dispatch(queue.pick_next(None))
+
+        assert result is True
+        assert sched._swaps_during_brake == 1

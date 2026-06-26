@@ -360,12 +360,14 @@ class TestSwapBrakeMetricObjectsExist:
             HARDWARE_GATE_BLIND_TOTAL,
             PINNED_VRAM_GB,
             SWAP_BRAKE_ENGAGED_TOTAL,
+            SWAP_BRAKE_FORCE_ACTIVE,
             SWAP_BRAKE_STATE,
             SWAP_RATE_PER_MIN,
         )
 
         assert SWAP_BRAKE_STATE is not None
         assert SWAP_BRAKE_ENGAGED_TOTAL is not None
+        assert SWAP_BRAKE_FORCE_ACTIVE is not None
         assert SWAP_RATE_PER_MIN is not None
         assert PINNED_VRAM_GB is not None
         assert HARDWARE_GATE_BLIND_TOTAL is not None
@@ -380,12 +382,15 @@ class TestSwapBrakeMetricObjectsExist:
             update_gpu_power_cap_watts,
             update_gpu_power_watts,
             update_pinned_vram_gb,
+            update_swap_brake_force_active,
             update_swap_brake_state,
             update_swap_rate_per_min,
         )
 
         update_swap_brake_state(2.0)
         record_swap_brake_engaged()
+        update_swap_brake_force_active(1.0)
+        update_swap_brake_force_active(0.0)
         update_swap_rate_per_min(4.5)
         update_pinned_vram_gb(gpu_index="0", gb=7.0)
         record_hardware_gate_blind()
@@ -398,6 +403,7 @@ class TestSwapBrakeMetricObjectsExist:
         for name in (
             "SWAP_BRAKE_STATE",
             "SWAP_BRAKE_ENGAGED_TOTAL",
+            "SWAP_BRAKE_FORCE_ACTIVE",
             "SWAP_RATE_PER_MIN",
             "PINNED_VRAM_GB",
             "HARDWARE_GATE_BLIND_TOTAL",
@@ -405,6 +411,7 @@ class TestSwapBrakeMetricObjectsExist:
             "GPU_POWER_CAP_WATTS",
             "update_swap_brake_state",
             "record_swap_brake_engaged",
+            "update_swap_brake_force_active",
             "update_swap_rate_per_min",
             "update_pinned_vram_gb",
             "record_hardware_gate_blind",

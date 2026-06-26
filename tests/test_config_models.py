@@ -38,6 +38,9 @@ class TestSwapBrakeConfigDefaults:
         assert b.infeasible_evict_reload_threshold == 3
         assert b.infeasible_window_seconds == 120.0
         assert b.degraded_refill_factor == 0.5
+        # F-5 — bound on the force-release override so the backstop can never be
+        # silently disabled by an unbounded ttl_s.
+        assert b.force_release_max_ttl_seconds == 600.0
 
     def test_pin_detection_defaults(self) -> None:
         p = SchedulerConfig().pin_detection
@@ -74,5 +77,7 @@ class TestBrokerStatusSwapVelocityFields:
             "brake_state", "brake_reason", "cooloff_remaining_s",
             "windowed_rate_per_min", "backoff_level", "pinned_models",
             "pinned_vram_gb", "hardware_gate_blind",
+            # F-5 — force-release visibility on /broker/status.
+            "force_release_active", "force_release_remaining_s",
         ):
             assert getattr(s, field) is None

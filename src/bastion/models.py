@@ -126,6 +126,8 @@ class SwapBrakeConfig(BaseModel):
     infeasible_evict_reload_threshold: int = 3
     infeasible_window_seconds: float = 120.0
     degraded_refill_factor: float = 0.5        # tighten refill when hardware gate blind (F5)
+    force_release_max_ttl_seconds: float = 600.0  # F5 — cap force-release so the backstop
+    #                                              can never be SILENTLY left disabled
 
 
 class PinDetectionConfig(BaseModel):
@@ -750,6 +752,9 @@ class BrokerStatus(BaseModel):
     pinned_models: list[str] | None = None
     pinned_vram_gb: float | None = None
     hardware_gate_blind: bool | None = None
+    # F5 — force-release override visibility (the backstop is OFF while active).
+    force_release_active: bool | None = None
+    force_release_remaining_s: float | None = None
 
 
 # ---------------------------------------------------------------------------

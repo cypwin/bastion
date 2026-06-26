@@ -21,10 +21,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 import bastion.server as srv
-from bastion.models import BrokerConfig
+from bastion.models import BrokerConfig, SwapBrakeConfig
 from bastion.ratelimit import RateLimitMiddleware
 from bastion.server import create_admin_app, create_app
-from bastion.swapbrake import BrakeDecision
+from bastion.swapbrake import BrakeDecision, BrakeState, SwapBrake
 
 # ── lightweight fakes ──────────────────────────────────────────────────
 
@@ -264,3 +264,107 @@ def test_coresident_and_unload_posts_are_not_flagged():
         {"model": "hot", "keep_alive": 0, "increasing": False, "serializer_locked": False},
     ]
     assert _unguarded_residency_increases(records) == []
+
+
+# ── F-1 — the preload funnel is the SECOND acquire() site; it must also abort an
+#         orphaned HALF_OPEN probe when a load doesn't record (else the brake wedges)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class _FlipTracker:
+    """Tracker whose can_load_model returns a scripted sequence of verdicts, so the
+    cheap pre-check (1st call) can pass while the in-serializer re-check (2nd) fails."""
+
+    def __init__(self, results: list[bool]) -> None:
+        self._results = list(results)
+        self._pinned: set[str] = set()
+        self._resident: set[str] = set()
+
+    async def can_load_model(self, model: str) -> tuple[bool, str]:
+        ok = self._results.pop(0) if self._results else True
+        return (ok, "" if ok else "no room")
+
+
+class _FakeClock:
+    def __init__(self, t: float = 1000.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, dt: float) -> None:
+        self.t += dt
+
+
+def _primed_halfopen_brake() -> SwapBrake:
+    """A real SwapBrake driven to OPEN past its cooloff with a healthy bucket, so the
+    NEXT acquire() (the one inside the preload serializer) grants the single probe."""
+    clk = _FakeClock()
+    cfg = SwapBrakeConfig(
+        min_spacing_seconds=0.0, bucket_capacity=3.0, refill_per_minute=0.0,
+        cooloff_seconds=30.0, min_state_hold_seconds=5.0, release_rate_per_minute=3.0,
+    )
+    b = SwapBrake(cfg, clock=clk)
+    for _ in range(3):
+        b.acquire("m")
+        b.record_load("m")
+    for _ in range(60):
+        b.acquire("m")
+        clk.advance(0.1)
+    assert b.snapshot()["state"] == BrakeState.OPEN
+    clk.advance(31.0)
+    clk.advance(60.0)
+    b._tokens = float(cfg.bucket_capacity)
+    return b
+
+
+@pytest.mark.parametrize("factory", [create_app, create_admin_app])
+def test_preload_no_fit_recheck_aborts_orphan_probe(factory):
+    """The in-serializer no-fit re-check returns 409 AFTER acquire() granted the
+    HALF_OPEN probe. Without abort_probe the probe is orphaned and every later
+    acquire() (scheduler swaps AND preloads) wedges at 'half-open probe in flight'."""
+    brake = _primed_halfopen_brake()
+    srv._scheduler = _FakeScheduler(brake)  # type: ignore[assignment]
+    srv._vram_tracker = _FlipTracker([True, False])  # pre-check ok, re-check no-fit
+    srv._vram_manager = None
+    client = TestClient(factory(BrokerConfig()))
+
+    resp = client.post("/broker/preload", json={"model": "qwen3:14b"})
+
+    assert resp.status_code == 409
+    # The granted probe must be aborted, not orphaned → brake re-OPENed, not wedged.
+    assert brake._probe_outstanding is False
+    assert brake.snapshot()["state"] == BrakeState.OPEN
+    # And a subsequent acquire is not stuck at 'half-open probe in flight'.
+    assert brake.acquire("qwen3:14b").reason != "half-open probe in flight"
+
+
+@pytest.mark.parametrize("factory", [create_app, create_admin_app])
+def test_preload_post_failure_aborts_orphan_probe(factory, monkeypatch):
+    """The cold-load httpx POST raises (Ollama down/timeout) AFTER acquire() granted
+    the probe. The orphaned probe must still be aborted before the error propagates."""
+    brake = _primed_halfopen_brake()
+    srv._scheduler = _FakeScheduler(brake)  # type: ignore[assignment]
+    srv._vram_tracker = _FlipTracker([True, True])  # both fit checks pass
+    srv._vram_manager = None
+
+    class _RaisingClient:
+        def __init__(self, *_a, **_k) -> None:
+            pass
+
+        async def __aenter__(self) -> "_RaisingClient":
+            return self
+
+        async def __aexit__(self, *_a) -> bool:
+            return False
+
+        async def post(self, *_a, **_k):
+            raise srv.httpx.ConnectError("Ollama unreachable")
+
+    monkeypatch.setattr(srv.httpx, "AsyncClient", _RaisingClient)
+    client = TestClient(factory(BrokerConfig()), raise_server_exceptions=False)
+
+    client.post("/broker/preload", json={"model": "qwen3:14b"})
+
+    assert brake._probe_outstanding is False
+    assert brake.snapshot()["state"] == BrakeState.OPEN

@@ -325,6 +325,31 @@ class TestForceOverride:
         clk.advance(11.0)
         assert b.acquire("m").action == "proceed"
 
+    def test_force_release_ttl_is_clamped_to_max(self) -> None:
+        # F-5 — an absurd ttl_s must NOT disable the backstop indefinitely; the
+        # brake clamps force-release to force_release_max_ttl_seconds (defence in
+        # depth: the backstop protects itself even if the server clamp is bypassed).
+        clk = FakeClock()
+        b = _brake(clk, min_spacing_seconds=0.0, bucket_capacity=100.0,
+                   force_release_max_ttl_seconds=600.0)
+        b.force(release=True, ttl_s=1e12)  # ~31000 years — would silently disarm
+        snap = b.snapshot()
+        assert snap["force_release_active"] is True
+        assert snap["force_release_remaining_s"] <= 600.0
+        assert snap["force_release_remaining_s"] > 599.0
+        # the override still auto-expires at the clamped horizon
+        clk.advance(601.0)
+        assert b.snapshot()["force_release_active"] is False
+
+    def test_force_engage_ttl_is_not_clamped(self) -> None:
+        # Force-ENGAGE (keeps the brake on) fails SAFE; only force-RELEASE is bounded.
+        clk = FakeClock()
+        b = _brake(clk, min_spacing_seconds=0.0, bucket_capacity=100.0,
+                   force_release_max_ttl_seconds=600.0)
+        b.force(release=False, ttl_s=5000.0)
+        clk.advance(601.0)  # past the release cap, but engage is not clamped
+        assert b.acquire("m").reason == "force-engaged"
+
 
 class TestSnapshot:
     def test_snapshot_exposes_observability_fields(self) -> None:
@@ -334,8 +359,19 @@ class TestSnapshot:
         for key in (
             "state", "reason", "cooloff_remaining_s", "windowed_rate_per_min",
             "backoff_level", "tokens", "hardware_gate_blind", "latched",
+            "force_release_active", "force_release_remaining_s",
         ):
             assert key in snap
+
+    def test_snapshot_force_release_remaining_counts_down(self) -> None:
+        # F-5 — operators need to see HOW LONG the backstop stays disabled.
+        clk = FakeClock()
+        b = _brake(clk, min_spacing_seconds=0.0, bucket_capacity=100.0)
+        assert b.snapshot()["force_release_remaining_s"] == 0.0  # no override
+        b.force(release=True, ttl_s=300.0)
+        assert abs(b.snapshot()["force_release_remaining_s"] - 300.0) < 0.5
+        clk.advance(100.0)
+        assert abs(b.snapshot()["force_release_remaining_s"] - 200.0) < 0.5
 
 
 class TestRestartSeeding:
@@ -347,3 +383,74 @@ class TestRestartSeeding:
         assert b.acquire("m").action == "stall"
         clk.advance(8.0)
         assert b.acquire("m").action == "proceed"
+
+
+# ---------------------------------------------------------------------------
+# F-1 [BLOCKER] — abort_probe recovers a wedged HALF_OPEN probe
+# ---------------------------------------------------------------------------
+
+
+class TestAbortProbe:
+    """A granted HALF_OPEN probe whose load never records (queue swept by TTL →
+    dequeue None, or _dispatch raised) must NOT wedge the brake forever: only
+    record_load/_open clear _probe_outstanding, so without recovery every later
+    acquire short-circuits at 'half-open probe in flight' and all swaps brick
+    until restart. abort_probe() re-OPENs so the cooloff ladder re-arms a fresh
+    probe (fails SAFE — stalled swaps = no inrush — while restoring liveness)."""
+
+    def _grant_orphan_probe(self, clk: FakeClock, b: SwapBrake) -> None:
+        # Drive CLOSED→OPEN (drain bucket, then sustained empty demand).
+        for _ in range(3):
+            b.acquire("m")
+            b.record_load("m")
+        for _ in range(60):
+            b.acquire("m")
+            clk.advance(0.1)
+        assert b.snapshot()["state"] == BrakeState.OPEN
+        # Past cooloff + window prune → HALF_OPEN grants the single probe.
+        clk.advance(31.0)
+        clk.advance(60.0)
+        assert b.acquire("m").action == "proceed"  # probe granted; _probe_outstanding=True
+
+    def test_abort_probe_recovers_a_wedged_halfopen_probe(self) -> None:
+        clk = FakeClock()
+        b = _brake(
+            clk, min_spacing_seconds=0.0, bucket_capacity=3.0, refill_per_minute=0.0,
+            cooloff_seconds=30.0, min_state_hold_seconds=5.0, release_rate_per_minute=3.0,
+        )
+        self._grant_orphan_probe(clk, b)
+        # The probe's load never records → every later acquire is wedged.
+        assert b.acquire("m").reason == "half-open probe in flight"
+        # Recover: abort the orphaned probe → re-OPEN (not stuck in HALF_OPEN).
+        b.abort_probe()
+        assert b.snapshot()["state"] == BrakeState.OPEN
+        # After another cooloff the brake re-arms a fresh probe — liveness restored.
+        clk.advance(91.0)
+        assert b.acquire("m").action == "proceed"
+
+    def test_abort_probe_is_safe_noop_without_outstanding_probe(self) -> None:
+        clk = FakeClock()
+        b = _brake(clk, min_spacing_seconds=0.0, bucket_capacity=3.0)
+        # CLOSED, no probe in flight → abort_probe must not perturb a healthy brake.
+        b.abort_probe()
+        assert b.snapshot()["state"] == BrakeState.CLOSED
+        assert b.acquire("m").action == "proceed"
+
+
+# ---------------------------------------------------------------------------
+# F-4 — numeric brake-state gauge mapping (feeds bastion_swap_brake_state)
+# ---------------------------------------------------------------------------
+
+
+class TestBrakeStateGauge:
+    def test_gauge_value_is_severity_ascending(self) -> None:
+        # Higher = more engaged, so a dashboard can alert by thresholding the gauge.
+        assert BrakeState.CLOSED.gauge_value == 0.0
+        assert BrakeState.THROTTLED.gauge_value == 1.0
+        assert BrakeState.HALF_OPEN.gauge_value == 2.0
+        assert BrakeState.OPEN.gauge_value == 3.0
+        vals = [
+            BrakeState.CLOSED.gauge_value, BrakeState.THROTTLED.gauge_value,
+            BrakeState.HALF_OPEN.gauge_value, BrakeState.OPEN.gauge_value,
+        ]
+        assert vals == sorted(vals)  # strictly increasing with engagement severity

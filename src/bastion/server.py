@@ -1843,25 +1843,39 @@ async def _funnel_preload(request: Request, config: BrokerConfig) -> Any:
                 headers={"Retry-After": str(retry_after)},
             )
 
-        # Re-check fit INSIDE the serializer — another load may have landed
-        # while we awaited the semaphore (the fit TOCTOU the spec calls out).
-        can_load, reason = await _vram_tracker.can_load_model(model)
-        if not can_load:
-            return JSONResponse({"error": reason, "reason_code": "vram_no_fit"}, status_code=409)
+        # F-1 — acquire() above may have granted the single HALF_OPEN probe
+        # (this funnel is the SECOND acquire() site on the shared brake). If the
+        # load then fails to record (no-fit re-check returns 409, or the cold-load
+        # POST raises), the orphaned probe would wedge the brake at "half-open probe
+        # in flight" forever — bricking ALL scheduler swaps AND preloads until
+        # restart/force-release. Abort the probe on every exit that does not record.
+        loaded_ok = False
+        try:
+            # Re-check fit INSIDE the serializer — another load may have landed
+            # while we awaited the semaphore (the fit TOCTOU the spec calls out).
+            can_load, reason = await _vram_tracker.can_load_model(model)
+            if not can_load:
+                return JSONResponse({"error": reason, "reason_code": "vram_no_fit"}, status_code=409)
 
-        # Trigger the cold load via a minimal generate request.
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            await client.post(
-                f"{config.ollama.base_url}/api/generate",
-                json={
-                    "model": model,
-                    "prompt": "",
-                    "keep_alive": -1,  # Keep loaded indefinitely
-                    "options": {"use_mmap": False},
-                },
-            )
-        # Debit the brake token at the true GPU-I/O point.
-        brake.record_load(model)
+            # Trigger the cold load via a minimal generate request.
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                await client.post(
+                    f"{config.ollama.base_url}/api/generate",
+                    json={
+                        "model": model,
+                        "prompt": "",
+                        "keep_alive": -1,  # Keep loaded indefinitely
+                        "options": {"use_mmap": False},
+                    },
+                )
+            # Debit the brake token at the true GPU-I/O point.
+            brake.record_load(model)
+            loaded_ok = True
+        finally:
+            if not loaded_ok:
+                # No-op unless a probe is genuinely outstanding (record_load above
+                # already cleared it on the success path); re-OPENs an orphaned probe.
+                brake.abort_probe()
 
     return {"status": "loaded", "model": model}
 
@@ -1881,6 +1895,10 @@ def _embed_brake_snapshot(result: dict[str, Any], loaded: list[Any]) -> None:
     result["cooloff_remaining_s"] = snap["cooloff_remaining_s"]
     result["windowed_rate_per_min"] = snap["windowed_rate_per_min"]
     result["backoff_level"] = snap["backoff_level"]
+    # F5 — force-release visibility: the backstop is OFF while active, so surface
+    # it (and how long it stays off) on /broker/status, not just on the gauge.
+    result["force_release_active"] = snap["force_release_active"]
+    result["force_release_remaining_s"] = snap["force_release_remaining_s"]
     # The VRAMManager hardware gate is the authoritative blind signal; fall
     # back to the brake's own degraded flag when the manager is absent.
     if _vram_manager is not None:
@@ -1916,6 +1934,21 @@ async def _force_swap_brake(request: Request) -> Any:
         return JSONResponse({"error": "ttl_s must be >= 0"}, status_code=400)
 
     brake = _scheduler.swap_brake
+    # F5 — clamp a force-RELEASE ttl to the configured cap so the velocity backstop
+    # can NEVER be silently left disabled by an unbounded ttl_s; emit a LOUD audit
+    # whenever we clamp so the override (and its reduction) is visible. Force-engage
+    # keeps the brake ON (fails safe) and is therefore not capped.
+    if release and _config is not None:
+        cap = _config.scheduler.swap_brake.force_release_max_ttl_seconds
+        if ttl_s > cap:
+            logger.warning(
+                "Force-release ttl_s=%.1f exceeds the %.1fs cap — clamping so the "
+                "swap-brake backstop cannot be silently disabled.", ttl_s, cap,
+            )
+            audit.emit("swap_brake_override_clamped", {
+                "requested_ttl_s": ttl_s, "clamped_ttl_s": cap,
+            })
+            ttl_s = cap
     brake.force(release=release, ttl_s=ttl_s)
     action = "force_release" if release else "force_engage"
     audit.emit("swap_brake_override", {"action": action, "ttl_s": ttl_s})

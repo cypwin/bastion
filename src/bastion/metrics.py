@@ -304,12 +304,12 @@ THERMAL_HEADROOM_CELSIUS = Gauge(
 # carries the single bounded ``gpu_index`` label (multi-GPU is a non-breaking
 # future extension; single-GPU deployments emit gpu_index="0").
 
-# Current brake state as a numeric enum (e.g. 0=open/passing, 1=cooling,
-# 2=engaged). Pure gauge — the human-readable state name stays on the JSON /
-# TUI surfaces only.
+# Current brake state as a numeric enum, severity-ASCENDING (higher = more
+# engaged): 0=closed, 1=throttled, 2=half_open, 3=open. Pure gauge — the
+# human-readable state name stays on the JSON / TUI surfaces only.
 SWAP_BRAKE_STATE = Gauge(
     "bastion_swap_brake_state",
-    "Current swap-brake state as a numeric enum (0=open, 1=cooling, 2=engaged)",
+    "Current swap-brake state, severity-ascending (0=closed 1=throttled 2=half_open 3=open)",
 )
 
 # Rising-edge counter: incremented each time the brake transitions into the
@@ -317,6 +317,14 @@ SWAP_BRAKE_STATE = Gauge(
 SWAP_BRAKE_ENGAGED_TOTAL = Counter(
     "bastion_swap_brake_engaged_total",
     "Cumulative count of swap-brake engagements (transitions into blocking)",
+)
+
+# 1 while a force-RELEASE admin override is active (the backstop is DISABLED),
+# else 0. Held high for the override window so the disabled state is visible on a
+# dashboard, not just at the moment the override is issued (F5). Pure gauge.
+SWAP_BRAKE_FORCE_ACTIVE = Gauge(
+    "bastion_swap_brake_force_active",
+    "1 while a force-release override has the swap brake disabled, else 0",
 )
 
 # Windowed model-swap rate in swaps/min, as measured by the brake. Pure gauge.
@@ -625,6 +633,18 @@ def record_swap_brake_engaged() -> None:
     SWAP_BRAKE_ENGAGED_TOTAL.inc()
 
 
+def update_swap_brake_force_active(active: float) -> None:
+    """Update the force-release gauge — 1.0 while the backstop is admin-disabled.
+
+    Parameters
+    ----------
+    active : float
+        ``1.0`` while a force-release override is active (brake DISABLED), else
+        ``0.0``. Pushed each tick so the disabled window is visible on a dashboard.
+    """
+    SWAP_BRAKE_FORCE_ACTIVE.set(active)
+
+
 def update_swap_rate_per_min(rate: float) -> None:
     """Update the windowed model-swap-rate gauge.
 
@@ -928,6 +948,7 @@ __all__ = [
     # Swap-velocity circuit breaker (swap brake) — additive
     "SWAP_BRAKE_STATE",
     "SWAP_BRAKE_ENGAGED_TOTAL",
+    "SWAP_BRAKE_FORCE_ACTIVE",
     "SWAP_RATE_PER_MIN",
     "PINNED_VRAM_GB",
     "HARDWARE_GATE_BLIND_TOTAL",
@@ -957,6 +978,7 @@ __all__ = [
     # Swap-brake helpers (swap-velocity circuit breaker design)
     "update_swap_brake_state",
     "record_swap_brake_engaged",
+    "update_swap_brake_force_active",
     "update_swap_rate_per_min",
     "update_pinned_vram_gb",
     "record_hardware_gate_blind",

@@ -47,6 +47,21 @@ class BrakeState(StrEnum):
     OPEN = "open"            # hard pause for the cooloff window
     HALF_OPEN = "half_open"  # post-cooloff; grants exactly one probe
 
+    @property
+    def gauge_value(self) -> float:
+        """Numeric for the ``bastion_swap_brake_state`` gauge, severity-ASCENDING
+        (higher = more engaged) so a dashboard alerts by thresholding upward:
+        CLOSED 0 < THROTTLED 1 < HALF_OPEN 2 < OPEN 3."""
+        return _BRAKE_STATE_GAUGE[self]
+
+
+_BRAKE_STATE_GAUGE: dict[BrakeState, float] = {
+    BrakeState.CLOSED: 0.0,
+    BrakeState.THROTTLED: 1.0,
+    BrakeState.HALF_OPEN: 2.0,
+    BrakeState.OPEN: 3.0,
+}
+
 
 @dataclass
 class BrakeDecision:
@@ -330,6 +345,25 @@ class SwapBrake:
         self._window.append(now)
         self._prune_window(now)
 
+    def abort_probe(self) -> None:
+        """Recover a granted HALF_OPEN probe whose load never recorded.
+
+        ``acquire`` grants the single HALF_OPEN probe by setting
+        ``_probe_outstanding``; ONLY ``record_load`` (or ``_open``) clears it. The
+        scheduler records a load only on dispatch *success*, so a probe whose load
+        is swept (queue emptied by TTL ⇒ ``dequeue_for_model`` None ⇒ result False)
+        or whose ``_dispatch`` raises would leave ``_probe_outstanding`` True
+        forever — short-circuiting every later ``acquire`` at "half-open probe in
+        flight" and wedging ALL swaps until restart/force-release. Re-OPEN so the
+        cooloff + backoff ladder re-arms a fresh probe instead of bricking.
+
+        Idempotent and safe to call unconditionally on the no-``record_load`` path:
+        a no-op unless a probe is genuinely outstanding. Fails SAFE either way (a
+        stalled swap = no inrush); this restores liveness on the post-storm path.
+        """
+        if self._state == BrakeState.HALF_OPEN and self._probe_outstanding:
+            self._open(self._clock())
+
     # ── infeasible-set latch (F4) ──────────────────────────────────────
 
     def note_infeasible(self, model: str) -> None:
@@ -363,9 +397,16 @@ class SwapBrake:
         self._drain_active = active
 
     def force(self, release: bool, ttl_s: float) -> None:
-        """Auto-expiring admin override. force-release cannot be left on silently."""
+        """Auto-expiring admin override. force-release cannot be left on silently.
+
+        The force-RELEASE ttl is clamped to ``force_release_max_ttl_seconds`` here
+        too (defence in depth): the backstop protects ITSELF so an unbounded ttl
+        cannot disarm it even if a caller bypasses the server-side clamp. Force-
+        ENGAGE keeps the brake ON (fails safe) and is therefore not capped.
+        """
         now = self._clock()
         if release:
+            ttl_s = min(ttl_s, self._cfg.force_release_max_ttl_seconds)
             self._force_release_until = now + ttl_s
             self._force_engage_until = 0.0
         else:
@@ -391,5 +432,9 @@ class SwapBrake:
             "drain_active": self._drain_active,
             "latched": sorted(m for m, ttl in self._infeasible.items() if now < ttl),
             "force_release_active": bool(self._force_release_until and now < self._force_release_until),
+            "force_release_remaining_s": (
+                max(0.0, self._force_release_until - now)
+                if (self._force_release_until and now < self._force_release_until) else 0.0
+            ),
             "force_engage_active": bool(self._force_engage_until and now < self._force_engage_until),
         }

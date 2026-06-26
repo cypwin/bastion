@@ -29,6 +29,9 @@ _BRAKE_STATUS_KEYS = (
     "pinned_models",
     "pinned_vram_gb",
     "hardware_gate_blind",
+    # F-5 — force-release visibility (was dropped by _embed_brake_snapshot).
+    "force_release_active",
+    "force_release_remaining_s",
 )
 
 
@@ -122,3 +125,37 @@ def test_swap_brake_rejects_negative_ttl(factory):
     with _client(factory) as client:
         resp = client.post("/broker/swap-brake", json={"release": False, "ttl_s": -1.0})
     assert resp.status_code == 400
+
+
+@pytest.mark.parametrize("factory", [create_app, create_admin_app])
+def test_force_release_clamps_excessive_ttl_and_audits(factory):
+    """F-5 — an absurd force-release ttl_s must be CLAMPED to the configured max
+    (not honoured for ~31000 years) AND emit a loud audit so the clamp is visible."""
+    with _client(factory) as client:
+        cap = srv._config.scheduler.swap_brake.force_release_max_ttl_seconds
+        resp = client.post("/broker/swap-brake", json={"release": True, "ttl_s": 1e12})
+        assert resp.status_code == 200
+        body = resp.json()
+        # The effective ttl is the clamp, never the absurd request.
+        assert body["ttl_s"] <= cap
+        # Status surfaces the active override + its (clamped) remaining window.
+        status = client.get("/broker/status").json()
+        assert status["force_release_active"] is True
+        assert status["force_release_remaining_s"] <= cap
+        events = audit.recent_events(50)
+    assert any(e.get("event") == "swap_brake_override_clamped" for e in events)
+
+
+@pytest.mark.parametrize("factory", [create_app, create_admin_app])
+def test_force_release_within_cap_is_not_clamped(factory):
+    from unittest.mock import patch
+    with _client(factory) as client:
+        cap = srv._config.scheduler.swap_brake.force_release_max_ttl_seconds
+        # Request-scoped audit capture (the global ring buffer leaks across tests).
+        with patch("bastion.audit.emit") as emit:
+            resp = client.post("/broker/swap-brake", json={"release": True, "ttl_s": cap - 1.0})
+        assert resp.status_code == 200
+        assert resp.json()["ttl_s"] == cap - 1.0
+    emitted = [c.args[0] for c in emit.call_args_list if c.args]
+    assert "swap_brake_override_clamped" not in emitted  # within cap → no clamp
+    assert "swap_brake_override" in emitted               # normal override still audited
