@@ -46,6 +46,11 @@ from bastion.watchdog import notify_watchdog
 
 logger = logging.getLogger(__name__)
 
+# S4 — queued-work tiering ceilings (scheduler-local; distinct from the proxy's
+# queue_timeout_seconds 504 bound). Conservative floors for an unknown card.
+_SWAP_STARVATION_CEILING_SECONDS = 60.0  # a starved swap earns the next freed slot
+_BRAKE_BACKLOG_CEILING = 256             # shed swap attempts past this under a long brake
+
 
 class Scheduler:
     """Background scheduling loop for the BASTION broker.
@@ -130,6 +135,27 @@ class Scheduler:
         # 0 models" log spam when all resident models are in-flight (system
         # genuinely stuck — operator should know once, not every tick).
         self._eviction_stuck_streak: dict[str, int] = {}
+
+        # F4 — behavioral evict↔reload oscillation detector (PRIMARY infeasible
+        # signal; version-independent). Fed when _unload_model succeeds and the
+        # model REAPPEARS resident on a later tick — the fingerprint of an
+        # externally pinned working set BASTION keeps fighting (last-writer-wins
+        # against the caller's keep_alive=-1). Promotes _eviction_stuck_streak.
+        self._evict_reload_history: dict[str, deque[float]] = {}
+        self._recently_unloaded: dict[str, float] = {}  # model -> monotonic unload time
+
+        # S4 — priority-aging snapshot captured on the CLOSED→engaged edge so the
+        # single swap granted at release does NOT load a background model that only
+        # age-inflated past a foreground one DURING the brake. None ⇒ not engaged.
+        self._engage_ranking: dict[str, float] | None = None
+        # S4 — backlog ceiling: shed swap attempts past a bound under a long brake.
+        self._brake_backlog_count: int = 0
+        self._brake_backlog_ceiling: int = _BRAKE_BACKLOG_CEILING
+        # S4 — swap-starvation ceiling (distinct from queue_timeout): a swap-needing
+        # request that starves behind ungated Phase-1 traffic eventually earns the
+        # next freed in-flight slot to evict for it.
+        self._swap_starve_since: dict[str, float] = {}
+        self._swap_starvation_ceiling: float = _SWAP_STARVATION_CEILING_SECONDS
 
     @property
     def current_model(self) -> str | None:
@@ -352,6 +378,14 @@ class Scheduler:
                 self._last_stall_time = time.time()
             return False
 
+        # F4 — clear any infeasible latch on a real residency delta (each tick;
+        # never on a pure time advance), feed the behavioral evict↔reload detector,
+        # and maintain the S4 priority-aging snapshot across brake engage/release.
+        if self._brake is not None:
+            self._brake.clear_on_residency_delta(resident_models)
+        self._detect_evict_reload_oscillation(resident_models)
+        self._update_brake_engage_snapshot()
+
         dispatch_delay = self.config.scheduler.concurrent_dispatch_delay_seconds
 
         while current_inflight < max_concurrent:
@@ -406,7 +440,7 @@ class Scheduler:
         # Phase 2: If there's still room and a non-resident model needs dispatch,
         # handle the swap case (blocking, serialized)
         if current_inflight < max_concurrent and not self.queue.is_empty:
-            candidate = self.queue.pick_next(self._current_model)
+            candidate = await self._select_swap_candidate(resident_models)
             if candidate is not None:
                 is_resident = candidate.model in resident_models
                 # Re-check residency from cache (may have changed)
@@ -523,6 +557,167 @@ class Scheduler:
         """Timestamp when current stall reason was first detected."""
         return self._last_stall_time
 
+    # ── F4 / S4 — pin-aware infeasible detection + queued-work tiering ──────
+
+    def _detect_evict_reload_oscillation(self, resident_models: set[str]) -> None:
+        """Feed the behavioral evict↔reload detector (F4 PRIMARY signal).
+
+        A model BASTION unloaded that REAPPEARS resident is a same-model
+        oscillation — the version-independent fingerprint of an externally pinned
+        working set BASTION is fighting. Expired watches/history are pruned to the
+        configured window so a one-off churn never accumulates into a false latch.
+        """
+        now = time.monotonic()
+        window = self.config.scheduler.swap_brake.infeasible_window_seconds
+        for model, t in list(self._recently_unloaded.items()):
+            if model in resident_models:
+                self._evict_reload_history.setdefault(model, deque()).append(now)
+                self._recently_unloaded.pop(model, None)
+            elif (now - t) > window:
+                self._recently_unloaded.pop(model, None)
+        for model, hist in list(self._evict_reload_history.items()):
+            while hist and (now - hist[0]) > window:
+                hist.popleft()
+            if not hist:
+                self._evict_reload_history.pop(model, None)
+
+    def _pinned_resident(self, resident_loaded: list) -> list:
+        """Resident LoadedModels that are externally pinned (caller keep_alive)."""
+        return [m for m in resident_loaded if m.name in self.vram._pinned]
+
+    def _candidate_vram_gb(self, model: str) -> float:
+        info = registry_lookup(self.config.models, model)
+        return info.vram_gb if info else self.config.gpu.default_vram_estimate_gb
+
+    def _pinned_overflow(self, candidate_model: str, resident_loaded: list) -> bool:
+        """True when the pinned resident set + candidate overruns the VRAM budget.
+
+        This is the set-level "would require evicting a pinned model" condition: a
+        candidate that cannot fit alongside the pinned set provably demands evicting
+        one of those caller pins — which BASTION refuses to do (it sheds instead).
+        """
+        if candidate_model in self.vram._pinned:
+            return False
+        pinned = self._pinned_resident(resident_loaded)
+        if not pinned:
+            return False
+        budget = self.config.gpu.max_vram_gb
+        if budget <= 0:
+            return False
+        pinned_vram = sum(m.vram_gb for m in pinned)
+        return (pinned_vram + self._candidate_vram_gb(candidate_model)) > budget
+
+    def _pinned_oscillation_count(self, resident_loaded: list) -> int:
+        now = time.monotonic()
+        window = self.config.scheduler.swap_brake.infeasible_window_seconds
+        total = 0
+        for m in self._pinned_resident(resident_loaded):
+            hist = self._evict_reload_history.get(m.name)
+            if hist:
+                while hist and (now - hist[0]) > window:
+                    hist.popleft()
+                total += len(hist)
+        return total
+
+    def _maybe_latch_infeasible(self, candidate: QueuedRequest, resident_loaded: list) -> bool:
+        """Latch the CANDIDATE (never the pinned victim) when its load would require
+        evicting an externally pinned model, OR the pinned set's evict↔reload
+        oscillation count crosses the behavioral threshold (set-level freeze)."""
+        if not self.config.scheduler.pin_detection.enabled:
+            return False
+        if not self._pinned_resident(resident_loaded):
+            return False
+        threshold = self.config.scheduler.swap_brake.infeasible_evict_reload_threshold
+        overflow = self._pinned_overflow(candidate.model, resident_loaded)
+        behavioral = self._pinned_oscillation_count(resident_loaded) >= threshold
+        if overflow or behavioral:
+            self._brake.note_infeasible(candidate.model)
+            return True
+        return False
+
+    def _is_feasible_candidate(self, model: str, resident_loaded: list) -> bool:
+        """S4 HALF_OPEN feasible-probe filter: skip latched / pinned-evicting candidates."""
+        if self._brake.is_latched(model):
+            return False
+        return not self._pinned_overflow(model, resident_loaded)
+
+    def _peek_request_for_model(self, model: str) -> QueuedRequest | None:
+        """Highest-priority queued request for a model WITHOUT dequeuing (read-only).
+
+        Mirrors AffinityQueue.dequeue_for_model's selection without mutating the
+        queue, so the S4 release-probe can present a specific feasible model's
+        request to the swap path (which re-dequeues authoritatively downstream).
+        """
+        queues = getattr(self.queue, "_model_queues", None)
+        if not queues:
+            return None
+        q = queues.get(model)
+        if not q:
+            return None
+        now = time.time()
+        return max(q, key=lambda r: r.effective_priority(self.config.scheduler.aging_rate, now=now))
+
+    def _best_priority_for_model(self, model: str, now: float) -> float:
+        req = self._peek_request_for_model(model)
+        if req is None:
+            return 0.0
+        return req.effective_priority(self.config.scheduler.aging_rate, now=now)
+
+    def _update_brake_engage_snapshot(self) -> None:
+        """S4 — snapshot the priority-aging baseline on the CLOSED→engaged edge.
+
+        At release exactly one swap is granted; without this snapshot a low-base
+        background request that merely aged DURING the brake could outrank the
+        foreground request and reload a stale model, re-triggering the storm. The
+        engage transition is observed via ``brake.snapshot()['state']``.
+        """
+        state = self._brake.snapshot()["state"]
+        engaged = state in ("open", "half_open")
+        if engaged and self._engage_ranking is None:
+            now = time.time()
+            self._engage_ranking = {
+                m: self._best_priority_for_model(m, now)
+                for m in self.queue.get_models_with_requests()
+            }
+        elif not engaged and self._engage_ranking is not None:
+            self._engage_ranking = None
+            self._brake_backlog_count = 0
+
+    async def _select_swap_candidate(self, resident_models: set[str]) -> QueuedRequest | None:
+        """Pick the swap target. While the brake is engaged, prefer a feasible,
+        non-latched model ranked by the ENGAGE-time priority snapshot (S4) instead
+        of the age-inflated live ranking, never spending the probe evicting a pin."""
+        base = self.queue.pick_next(self._current_model)
+        if base is None or self._engage_ranking is None:
+            return base
+        resident_loaded = await self.vram.get_loaded_models()
+        if resident_loaded is None:
+            return base
+        nonres = [m for m in self.queue.get_models_with_requests() if m not in resident_models]
+        feasible = [m for m in nonres if self._is_feasible_candidate(m, resident_loaded)]
+        if not feasible:
+            return base
+        feasible.sort(key=lambda m: self._engage_ranking.get(m, 0.0), reverse=True)
+        chosen = feasible[0]
+        if base.model == chosen:
+            return base
+        return self._peek_request_for_model(chosen) or base
+
+    def _brake_backlog_exceeded(self) -> bool:
+        """S4 backlog ceiling — under a long brake, shed rather than accumulate."""
+        return self._brake_backlog_count > self._brake_backlog_ceiling
+
+    def _note_swap_starvation(self, model: str) -> None:
+        self._swap_starve_since.setdefault(model, time.monotonic())
+
+    def _clear_swap_starvation(self, model: str) -> None:
+        self._swap_starve_since.pop(model, None)
+
+    def _swap_starved(self, model: str) -> bool:
+        """S4 — has a swap-needing model starved past the ceiling behind Phase-1 traffic?"""
+        t = self._swap_starve_since.get(model)
+        return t is not None and (time.monotonic() - t) >= self._swap_starvation_ceiling
+
     async def _handle_swap_dispatch(self, candidate: QueuedRequest) -> bool:
         """Handle dispatch for a non-resident model that requires a swap.
 
@@ -550,11 +745,38 @@ class Scheduler:
                 return await self._dispatch_for_model(self._current_model, needs_swap=False)
             if pre.action == "stall":
                 record_cooldown_wait()
+                # S4 — clock starvation: a swap-needing request held off behind
+                # ungated Phase-1 traffic must eventually earn a freed slot.
+                self._note_swap_starvation(candidate.model)
             logger.debug(
                 "Swap brake %s for '%s' (pre-gate): %s",
                 pre.action, candidate.model, pre.reason,
             )
             return False
+
+        # F4 — set-level infeasible detection BEFORE any reservation / eviction:
+        # if satisfying this candidate would require evicting an externally pinned
+        # model (pinned set overruns budget OR the pinned set is oscillating), LATCH
+        # THE CANDIDATE (not the pinned victim) and surface it — the request stays
+        # queued, the proxy 503s, and next tick the brake sheds. We must never issue
+        # keep_alive=0 against a caller's pin (the actual storm-stopper).
+        resident_loaded = await self.vram.get_loaded_models()
+        if resident_loaded is not None and self._maybe_latch_infeasible(candidate, resident_loaded):
+            logger.warning(
+                "Infeasible swap latched: '%s' would evict an externally pinned "
+                "model (pinned set overruns the %.1f GB budget); refusing eviction",
+                candidate.model, self.config.gpu.max_vram_gb,
+            )
+            return False
+
+        # S4 — backlog ceiling: under a sustained brake, shed swap attempts past a
+        # bound rather than accumulate stale, age-inflated work.
+        if self._engage_ranking is not None:
+            self._brake_backlog_count += 1
+            if self._brake_backlog_exceeded():
+                record_cooldown_wait()
+                logger.debug("Swap backlog ceiling hit for '%s' — shedding", candidate.model)
+                return False
 
         # Log VRAM state before swap decision
         await self.vram.log_vram_snapshot("pre_swap", {
@@ -630,6 +852,13 @@ class Scheduler:
         from_model = self._current_model or "none"
 
         async with self._load_serializer:
+            # S5/R1-2 — forward the F5 hardware-gate-blind signal to the sensor-
+            # independent brake at the chokepoint, so refill HALVES exactly when
+            # nvidia-smi goes dark; recovery (blind False) restores full refill.
+            # (vram.py never imports swapbrake — this scheduler forward is the only
+            # cross-layer link.)
+            if self.vram_manager is not None:
+                self._brake.set_hw_degraded(self.vram_manager.hardware_gate_blind)
             auth = self._brake.acquire(candidate.model)
             if auth.action != "proceed":
                 # Lost the race / brake opened or latched in the await window —
@@ -671,6 +900,8 @@ class Scheduler:
                 excess = [
                     m for m in resident_after
                     if m.name != candidate.model
+                    # F4 — never proactively evict an externally pinned model.
+                    and m.name not in self.vram._pinned
                     and not (
                         (info := registry_lookup(self.config.models, m.name))
                         and info.always_allowed
@@ -697,6 +928,8 @@ class Scheduler:
                 if result:
                     # Debit the brake token at the true GPU-I/O point.
                     self._brake.record_load(candidate.model)
+                    # S4 — the swap was granted: this model is no longer starving.
+                    self._clear_swap_starvation(candidate.model)
                     if self.vram_manager is not None and reservation is not None:
                         await self.vram_manager.commit(reservation)
                 else:
@@ -728,6 +961,10 @@ class Scheduler:
         evictable = [
             m for m in resident
             if m.name != candidate.model
+            # F4 — never evict an externally pinned model (caller keep_alive=-1);
+            # fighting the pin with keep_alive=0 is exactly the storm BASTION must
+            # stop. The candidate is latched INFEASIBLE upstream instead.
+            and m.name not in self.vram._pinned
             # Tag-aware: an always_allowed model resident as 'name:latest'
             # must not become evictable because the registry key is untagged.
             and not (
@@ -867,6 +1104,9 @@ class Scheduler:
             # transition / power event (count_evictions). External (Ollama-timeout)
             # unloads are NOT recorded here — only ones BASTION drove.
             self._brake.record_unload(model)
+            # F4 — watch for a same-model REAPPEARANCE next tick (evict↔reload
+            # oscillation = an externally pinned working set BASTION is fighting).
+            self._recently_unloaded[model] = time.monotonic()
             # Vision C: count the eviction as a model transition with
             # reason="eviction" (no to_model in the strict sense; we use
             # "_none" to signal the unloaded slot, mirroring the from_model
@@ -925,6 +1165,10 @@ class Scheduler:
             )
 
         record_model_swap(from_model=model, to_model="_none", reason="eviction")
+        # F4 — pair operator force-unload with "refuse this model's next loads" so
+        # the keep_alive=0 force isn't instantly re-pinned by a caller's
+        # last-writer-wins keep_alive=-1.
+        self._brake.note_infeasible(model)
         if self._current_model == model:
             self._current_model = None
         if self.vram_manager is not None:

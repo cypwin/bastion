@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -1275,3 +1276,249 @@ class TestSwapBrakeWiring:
         assert result is True
         assert len(dispatched) == 1
         assert sched.swap_brake.snapshot()["tokens"] == before - 1.0
+
+
+# ---------------------------------------------------------------------------
+# S3 — pinned-exclusion + behavioral infeasible latch (F4)
+# ---------------------------------------------------------------------------
+
+
+def _make_sched(config, **kw) -> Scheduler:
+    queue = AffinityQueue(config.scheduler)
+    tracker = VRAMTracker(config)
+
+    async def _d(request, needs_swap=True) -> None:
+        pass
+
+    return Scheduler(config, queue, tracker, _d, **kw)
+
+
+class TestPinAwareInfeasibleLatch:
+    """F4 — externally pinned models are never evicted; the demanding CANDIDATE
+    (not the pinned victim) is latched INFEASIBLE; latch clears only on a real
+    residency delta; clear_on_residency_delta runs every tick."""
+
+    @pytest.mark.asyncio
+    async def test_pinned_model_never_evicted(self, sched_config: BrokerConfig) -> None:
+        unloaded: list[str] = []
+        sched = _make_sched(sched_config)
+        sched.vram._pinned = {"qwen3:14b"}  # caller keep_alive=-1 pin
+        loaded = [
+            LoadedModel(name="qwen3:14b", vram_gb=9.3),
+            LoadedModel(name="mistral-nemo:12b", vram_gb=8.1),
+        ]
+
+        async def mock_can_load(model):
+            return (True, "OK")
+
+        async def mock_unload(model):
+            unloaded.append(model)
+            return True
+
+        with patch.object(sched.vram, "get_loaded_models", AsyncMock(return_value=loaded)), \
+             patch.object(sched.vram, "can_load_model", side_effect=mock_can_load), \
+             patch.object(sched.vram, "unload_model", side_effect=mock_unload):
+            result = await sched._evict_for_model(make_request(model="llama3.1:8b"))
+
+        assert result is True
+        assert "qwen3:14b" not in unloaded         # pinned victim protected
+        assert "mistral-nemo:12b" in unloaded       # non-pinned freely evicted
+
+    @pytest.mark.asyncio
+    async def test_behavioral_latch_fires_on_candidate_not_victim(
+        self, sched_config: BrokerConfig,
+    ) -> None:
+        cfg = sched_config.model_copy(deep=True)
+        cfg.scheduler.swap_brake = SwapBrakeConfig(
+            min_spacing_seconds=0.0, bucket_capacity=1000.0,
+            infeasible_evict_reload_threshold=3, infeasible_window_seconds=120.0,
+        )
+        sched = _make_sched(cfg)
+        sched.vram._pinned = {"qwen3:14b"}
+        # Budget (26 GB) NOT overflowed -> only the behavioral signal can trip.
+        loaded = [LoadedModel(name="qwen3:14b", vram_gb=9.3)]
+        now = time.monotonic()
+        sched._evict_reload_history["qwen3:14b"] = deque([now, now, now])  # 3 oscillations
+
+        candidate = make_request(model="mistral-nemo:12b")
+        assert sched._maybe_latch_infeasible(candidate, loaded) is True
+        assert sched.swap_brake.is_latched("mistral-nemo:12b") is True   # CANDIDATE latched
+        assert sched.swap_brake.is_latched("qwen3:14b") is False         # victim NOT latched
+
+    @pytest.mark.asyncio
+    async def test_proactive_overflow_latches_candidate(
+        self, sched_config: BrokerConfig,
+    ) -> None:
+        sched = _make_sched(sched_config)
+        sched.vram._pinned = {"qwen3:14b"}
+        # Pinned 22 GB + candidate 8.1 GB = 30.1 > 26 GB budget -> proactive latch.
+        loaded = [LoadedModel(name="qwen3:14b", vram_gb=22.0)]
+        candidate = make_request(model="mistral-nemo:12b")
+        assert sched._maybe_latch_infeasible(candidate, loaded) is True
+        assert sched.swap_brake.is_latched("mistral-nemo:12b") is True
+        assert sched.swap_brake.is_latched("qwen3:14b") is False
+
+    @pytest.mark.asyncio
+    async def test_latch_clears_on_residency_delta_only(
+        self, sched_config: BrokerConfig,
+    ) -> None:
+        sched = _make_sched(sched_config)
+        sched.vram._pinned = {"qwen3:14b"}
+        loaded = [LoadedModel(name="qwen3:14b", vram_gb=22.0)]
+        sched.swap_brake.clear_on_residency_delta({"qwen3:14b"})  # establish baseline
+        sched._maybe_latch_infeasible(make_request(model="mistral-nemo:12b"), loaded)
+        assert sched.swap_brake.is_latched("mistral-nemo:12b") is True
+        # A pure residency delta clears it (TTL aside).
+        sched.swap_brake.clear_on_residency_delta({"qwen3:14b", "llama3.1:8b"})
+        assert sched.swap_brake.is_latched("mistral-nemo:12b") is False
+
+    @pytest.mark.asyncio
+    async def test_clear_on_residency_delta_called_each_tick(
+        self, sched_config: BrokerConfig,
+    ) -> None:
+        sched = _make_sched(sched_config)
+        sched.queue.enqueue(make_request(model="qwen3:14b"))
+        loaded = [LoadedModel(name="qwen3:14b", vram_gb=9.3)]
+        with patch.object(
+                 sched.vram.residency_cache, "get_resident_models",
+                 AsyncMock(return_value={"qwen3:14b"}),
+             ), \
+             patch.object(sched.vram, "get_loaded_models", AsyncMock(return_value=loaded)), \
+             patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))), \
+             patch.object(sched._brake, "clear_on_residency_delta") as mock_clear:
+            await sched._process_tick()
+            mock_clear.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_force_unload_refuses_next_loads(self, sched_config: BrokerConfig) -> None:
+        sched = _make_sched(sched_config)
+        with patch.object(sched.vram, "unload_model", AsyncMock(return_value=True)):
+            status, _ = await sched.unload_model_admin("qwen3:14b")
+        assert status == "unloaded"
+        assert sched.swap_brake.is_latched("qwen3:14b") is True
+
+    @pytest.mark.asyncio
+    async def test_unload_feeds_oscillation_watch(self, sched_config: BrokerConfig) -> None:
+        """A BASTION-driven unload that REAPPEARS resident next tick is recorded."""
+        sched = _make_sched(sched_config)
+        with patch.object(sched.vram, "unload_model", AsyncMock(return_value=True)):
+            assert await sched._unload_model("qwen3:14b") is True
+        assert "qwen3:14b" in sched._recently_unloaded
+        # reappears resident -> one oscillation recorded, watch cleared
+        sched._detect_evict_reload_oscillation({"qwen3:14b"})
+        assert "qwen3:14b" not in sched._recently_unloaded
+        assert len(sched._evict_reload_history["qwen3:14b"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# S4 — queued-work tiering (aging snapshot, feasible probe, ceilings)
+# ---------------------------------------------------------------------------
+
+
+class TestQueuedWorkTiering:
+    @pytest.mark.asyncio
+    async def test_feasible_probe_skips_latched_and_pinned(
+        self, sched_config: BrokerConfig,
+    ) -> None:
+        sched = _make_sched(sched_config)
+        sched.vram._pinned = {"qwen3:14b"}
+        # pinned 22 GB + mistral 8.1 = 30.1 > 26 budget -> pinned-evicting -> infeasible
+        loaded_big = [LoadedModel(name="qwen3:14b", vram_gb=22.0)]
+        assert sched._is_feasible_candidate("mistral-nemo:12b", loaded_big) is False
+        # latched model -> infeasible
+        sched.swap_brake.note_infeasible("nomic-embed-text")
+        assert sched._is_feasible_candidate("nomic-embed-text", loaded_big) is False
+        # fits + not latched -> feasible
+        loaded_small = [LoadedModel(name="qwen3:14b", vram_gb=2.0)]
+        assert sched._is_feasible_candidate("mistral-nemo:12b", loaded_small) is True
+
+    @pytest.mark.asyncio
+    async def test_aging_snapshot_prefers_engage_ranked_model(
+        self, sched_config: BrokerConfig,
+    ) -> None:
+        """At release, the ENGAGE-time ranking governs — a background model that
+        merely aged during the brake does not get loaded over the foreground one."""
+        sched = _make_sched(sched_config)
+        sched.queue.enqueue(make_request(model="qwen3:14b"))
+        sched.queue.enqueue(make_request(model="mistral-nemo:12b"))
+        # Engage snapshot favors mistral even if live aging would favor qwen.
+        sched._engage_ranking = {"mistral-nemo:12b": 1000.0, "qwen3:14b": 1.0}
+        with patch.object(sched.vram, "get_loaded_models", AsyncMock(return_value=[])):
+            chosen = await sched._select_swap_candidate(set())
+        assert chosen is not None
+        assert chosen.model == "mistral-nemo:12b"
+
+    @pytest.mark.asyncio
+    async def test_select_returns_base_when_not_engaged(
+        self, sched_config: BrokerConfig,
+    ) -> None:
+        sched = _make_sched(sched_config)
+        req = make_request(model="qwen3:14b")
+        sched.queue.enqueue(req)
+        chosen = await sched._select_swap_candidate(set())  # _engage_ranking None
+        assert chosen is not None
+        assert chosen.model == "qwen3:14b"
+
+    @pytest.mark.asyncio
+    async def test_backlog_ceiling_sheds(self, sched_config: BrokerConfig) -> None:
+        cfg = sched_config.model_copy(deep=True)
+        cfg.scheduler.swap_brake = SwapBrakeConfig(min_spacing_seconds=0.0, bucket_capacity=1000.0)
+        sched = _make_sched(cfg)
+        sched._engage_ranking = {"qwen3:14b": 1.0}  # engaged
+        sched._brake_backlog_ceiling = 2
+        sched._brake_backlog_count = 3  # already past the ceiling
+        with patch.object(sched.vram, "get_loaded_models", AsyncMock(return_value=[])), \
+             patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))), \
+             patch.object(sched.vram, "log_vram_snapshot", AsyncMock()):
+            result = await sched._handle_swap_dispatch(make_request(model="qwen3:14b"))
+        assert result is False
+
+    def test_swap_starvation_ceiling(self, sched_config: BrokerConfig) -> None:
+        sched = _make_sched(sched_config)
+        sched._swap_starvation_ceiling = 0.0
+        sched._note_swap_starvation("qwen3:14b")
+        assert sched._swap_starved("qwen3:14b") is True
+        sched._clear_swap_starvation("qwen3:14b")
+        assert sched._swap_starved("qwen3:14b") is False
+
+
+# ---------------------------------------------------------------------------
+# S5 — forward hardware-gate-blind to the brake (R1-2 wiring seam)
+# ---------------------------------------------------------------------------
+
+
+class TestHardwareGateBlindForward:
+    @pytest.mark.asyncio
+    async def test_blind_halves_refill_recovery_restores(
+        self, sched_config: BrokerConfig,
+    ) -> None:
+        cfg = sched_config.model_copy(deep=True)
+        cfg.scheduler.swap_brake = SwapBrakeConfig(min_spacing_seconds=0.0, bucket_capacity=100.0)
+        queue = AffinityQueue(cfg.scheduler)
+        tracker = VRAMTracker(cfg)
+        mgr = VRAMManager(tracker, 32 * 1024 * 1024 * 1024, safety_margin_pct=10.0)
+
+        async def dispatch(request, needs_swap=True) -> None:
+            pass
+
+        sched = Scheduler(cfg, queue, tracker, dispatch, vram_manager=mgr)
+        full_refill = sched.swap_brake._refill_rate_per_sec()
+
+        with patch.object(tracker, "get_loaded_models", AsyncMock(return_value=[])), \
+             patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))), \
+             patch.object(tracker, "can_load_model", AsyncMock(return_value=(True, "OK"))), \
+             patch.object(tracker, "log_vram_snapshot", AsyncMock()), \
+             patch.object(tracker, "get_loaded_vram_gb", AsyncMock(return_value=0.0)):
+            # Hardware gate blind -> brake refill HALVES.
+            mgr._hardware_gate_blind = True
+            queue.enqueue(make_request(model="qwen3:14b"))
+            await sched._handle_swap_dispatch(queue.pick_next(None))
+            assert sched.swap_brake.snapshot()["hardware_gate_blind"] is True
+            assert sched.swap_brake._refill_rate_per_sec() == pytest.approx(full_refill * 0.5)
+
+            # Recovery -> full refill restored.
+            mgr._hardware_gate_blind = False
+            queue.enqueue(make_request(model="qwen3:14b"))
+            await sched._handle_swap_dispatch(queue.pick_next(None))
+            assert sched.swap_brake.snapshot()["hardware_gate_blind"] is False
+            assert sched.swap_brake._refill_rate_per_sec() == pytest.approx(full_refill)
