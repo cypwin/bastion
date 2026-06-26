@@ -76,6 +76,15 @@ def load_config(path: Path | None = None) -> BrokerConfig:
     # Remember which GPU fields the user explicitly set
     user_gpu = raw.get("gpu", {}) if isinstance(raw.get("gpu"), dict) else {}
 
+    # Remember which scheduler.swap_brake fields the operator explicitly set —
+    # auto-calibration may tighten these but must never relax them (CF1).
+    user_scheduler = raw.get("scheduler", {}) if isinstance(raw.get("scheduler"), dict) else {}
+    user_brake = (
+        user_scheduler.get("swap_brake", {})
+        if isinstance(user_scheduler.get("swap_brake"), dict)
+        else {}
+    )
+
     # Transform models section: convert nested dicts to ModelInfo
     if "models" in raw and isinstance(raw["models"], dict):
         raw["models"] = {
@@ -96,7 +105,12 @@ def load_config(path: Path | None = None) -> BrokerConfig:
     # Apply calibrated GPU profile if available
     gpu_profile = _load_gpu_profile()
     if gpu_profile:
-        _apply_gpu_profile(config, gpu_profile)
+        _apply_gpu_profile(
+            config,
+            gpu_profile,
+            explicit_brake_keys=set(user_brake.keys()),
+            detected_gpu_name=_detect_gpu_name(),
+        )
 
     if not config.models:
         logger.info(
@@ -314,24 +328,144 @@ def _load_gpu_profile(path: Path | None = None) -> dict | None:
     return None
 
 
-def _apply_gpu_profile(config: BrokerConfig, profile: dict) -> None:
+def _detect_gpu_name() -> str | None:
+    """Query ``nvidia-smi`` for the detected GPU name.
+
+    Used to verify a calibrated ``gpu-profile.yaml`` was recorded on the card
+    that is actually present. Returns ``None`` when no card can be detected
+    (no driver / container / non-NVIDIA host) — in which case staleness cannot
+    be proven and the profile is NOT refused on name grounds.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        name = result.stdout.strip().split("\n")[0].strip()
+        return name or None
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+
+
+def _gpu_names_match(recorded: str, detected: str) -> bool:
+    """Case-insensitive, whitespace-tolerant GPU-name equality."""
+    return recorded.strip().casefold() == detected.strip().casefold()
+
+
+def _apply_tighten(
+    target: object,
+    attr: str,
+    candidate: float,
+    explicit_keys: set[str],
+) -> None:
+    """Set ``target.attr = candidate`` under ONLY-TIGHTEN precedence.
+
+    For swap-brake velocity fields a LOWER value is *tighter* (more
+    restrictive). Auto-derivation may tighten a value the operator set
+    explicitly, but must NEVER relax it: if ``attr`` is operator-explicit and
+    the calibrated ``candidate`` would loosen it, we keep the operator value and
+    emit a loud audit line. Non-explicit fields are always overridden (the
+    calibrated value simply replaces the portable-floor default).
+    """
+    current = getattr(target, attr)
+    if attr in explicit_keys and candidate > current:
+        logger.warning(
+            "Calibrated GPU profile would RELAX operator-set %s (%s → %s); "
+            "refusing per only-tighten precedence "
+            "(auto-derivation may tighten, never relax).",
+            attr, current, candidate,
+        )
+        return
+    setattr(target, attr, candidate)
+
+
+def _apply_gpu_profile(
+    config: BrokerConfig,
+    profile: dict,
+    explicit_brake_keys: set[str] | None = None,
+    detected_gpu_name: str | None = None,
+) -> None:
     """Apply calibrated GPU profile values to config.
 
-    Calibrated values override defaults but NOT explicit user config.
+    Calibrated values override portable-floor defaults but NOT explicit user
+    config, and only ever *tighten* (never relax) a value the operator set in
+    ``broker.yaml`` (ONLY-TIGHTEN precedence, threaded via
+    ``explicit_brake_keys`` for the ``scheduler.swap_brake`` block).
+
+    A profile whose recorded GPU name differs from ``detected_gpu_name`` is
+    REFUSED wholesale — running the conservative portable floor is safer than
+    trusting numbers calibrated on another card (the sensor-independent brake
+    stays enabled regardless, so protection never depends on calibration).
+
+    Calibrator invariants are enforced after mapping: ``refill_per_minute >= 1``
+    (no divide-by-zero) and
+    ``swap_rate_warn_threshold < swap_rate_critical_threshold``
+    (preserve hysteresis).
     """
+    explicit_brake = explicit_brake_keys or set()
+
+    # --- Staleness guard: refuse a profile recorded on a different card -------
+    recorded_name = ""
+    gpu_section = profile.get("gpu")
+    if isinstance(gpu_section, dict):
+        recorded_name = str(gpu_section.get("name") or "").strip()
+    if (
+        detected_gpu_name
+        and recorded_name
+        and not _gpu_names_match(recorded_name, detected_gpu_name)
+    ):
+        logger.warning(
+            "GPU profile stale for detected GPU: profile was calibrated on %r but "
+            "the detected card is %r — REFUSING to apply; running on the "
+            "conservative portable floor (swap brake stays enabled).",
+            recorded_name, detected_gpu_name,
+        )
+        return
+
     cal = profile.get("calibrated", {})
+    brake = config.scheduler.swap_brake
 
     if "cooldown_seconds" in cal:
         config.scheduler.cooldown_seconds = float(cal["cooldown_seconds"])
+
     if "safe_swap_rate_per_min" in cal:
-        config.scheduler.swap_rate_warn_threshold = max(1, cal["safe_swap_rate_per_min"] - 1)
-        config.scheduler.swap_rate_critical_threshold = cal["safe_swap_rate_per_min"]
+        rate = float(cal["safe_swap_rate_per_min"])
+        # Invariant: refill_per_minute >= 1 (no divide-by-zero in the bucket).
+        refill = max(1.0, rate)
+        _apply_tighten(brake, "refill_per_minute", refill, explicit_brake)
+        # Legacy advisory swap-rate thresholds; preserve hysteresis (warn < critical).
+        critical = max(2, int(round(rate)))
+        config.scheduler.swap_rate_critical_threshold = critical
+        config.scheduler.swap_rate_warn_threshold = max(1, critical - 1)
+
+    if "safe_burst_depth" in cal:
+        # Burst tolerance is at least one token, else no swap could ever proceed.
+        burst = max(1.0, float(cal["safe_burst_depth"]))
+        _apply_tighten(brake, "bucket_capacity", burst, explicit_brake)
+
     if "max_concurrent_requests" in cal:
         config.scheduler.max_concurrent_dispatches = cal["max_concurrent_requests"]
     if "thermal_ceiling_c" in cal:
         config.gpu.max_temperature_c = cal["thermal_ceiling_c"]
     if "vram_headroom_mb" in cal:
         config.gpu.headroom_gb = cal["vram_headroom_mb"] / 1024.0
+
+    # --- Final invariant clamps (cover operator-explicit + only-tighten cases) -
+    if brake.refill_per_minute < 1.0:
+        brake.refill_per_minute = 1.0
+    if brake.bucket_capacity < 1.0:
+        brake.bucket_capacity = 1.0
+    if (
+        config.scheduler.swap_rate_warn_threshold
+        >= config.scheduler.swap_rate_critical_threshold
+    ):
+        config.scheduler.swap_rate_warn_threshold = max(
+            1, config.scheduler.swap_rate_critical_threshold - 1
+        )
 
     logger.info("Applied calibrated GPU profile overrides")
 
