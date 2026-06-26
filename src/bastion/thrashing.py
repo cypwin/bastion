@@ -1,8 +1,17 @@
 """Per-agent swap thrashing detection (M58).
 
-Tracks model swap patterns per agent and detects poorly-batched pipelines
-that cause GPU-damaging swap thrashing. Thresholds derived from RTX 5090
-crash investigation: crash zone >8 swaps/min.
+Tracks model swap patterns per agent and flags poorly-batched pipelines. This
+is a *request-admission*, per-agent detector (keyed by X-Agent-Id or source
+IP): it can only see the swaps attributable to one caller. It is therefore
+structurally blind to a SYSTEM-WIDE swap-velocity / power event caused by many
+well-behaved callers (or a single calibration loop) in aggregate — the
+swap-velocity circuit breaker in ``swapbrake.py`` is that backstop. Thresholds
+here are a portable conservative floor, not a per-card crash constant; operators
+calibrate the real ceiling for their hardware via ``--stress-test``.
+
+Division of labor: HALT (the ``mode=="strict"`` gates) stays unchanged and
+remains scoped to per-agent admission control — it does NOT act as the
+system-wide crash backstop.
 
 Design: sliding window of recent requests per agent (keyed by X-Agent-Id
 or source IP). Computes swap ratio and returns a verdict (ok/warn/halt).
