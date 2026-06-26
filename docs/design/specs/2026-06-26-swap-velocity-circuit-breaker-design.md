@@ -1,7 +1,8 @@
 # BASTION Swap-Velocity Circuit Breaker + F1–F6 Defense-in-Depth — Design
 
-> **Status:** Implemented on `feat/swap-velocity-circuit-breaker` (20 commits, 496 tests green);
-> adversarially reviewed → ship-after-must-fix (5 fail-safe follow-ups, see §9)
+> **Status:** Implemented on `feat/swap-velocity-circuit-breaker`; all 5 §9 must-fixes + 1
+> review-found follow-up landed test-first (see §9.1), full suite 1972 passed / 0 new regressions —
+> ready to merge/PR.
 > **Date:** 2026-06-26
 > **Trigger:** Host hard-lockup 2026-06-26 ~15:20–15:21 during a model-swap storm.
 > **Scope decision:** Full F1–F6 sweep in a single PR (in-memory state only; no on-disk breadcrumb).
@@ -476,10 +477,52 @@ several are the exact "defined-but-unwired guardrail" anti-pattern §0 was writt
    (~600) + clamp/reject server-side with a loud audit; surface `force_release_active` + remaining TTL in
    `BrokerStatus`/`_embed_brake_snapshot` + a `bastion_swap_brake_force_active` gauge held for the window.
 
-**NICE-TO-HAVE:** min-spacing advances only on dispatch success (same root as #1 — stamp `_last_load_t`
-at the GPU-I/O issue point); latched-infeasible models on the normal *inference* path aren't fast-shed
-(503 + Retry-After + `throttle` in the proxy/queue grant path); backoff cap/reset under-tested; keep the
-infeasible shed even during force-release (don't re-authorize evicting a caller's pin); force-release is
-reachable unauthenticated when `auth.enabled=False` (gate behind a key / loopback); document the
-serializer-held-through-inference duration and the proxy-passthrough (unscheduled) unbraked path.
-```
+**NICE-TO-HAVE (still open):** min-spacing advances only on dispatch success (same root as #1 — stamp
+`_last_load_t` at the GPU-I/O issue point); latched-infeasible models on the normal *inference* path
+aren't fast-shed (503 + Retry-After + `throttle` in the proxy/queue grant path); backoff cap/reset
+under-tested; keep the infeasible shed even during force-release (don't re-authorize evicting a caller's
+pin); force-release is reachable unauthenticated when `auth.enabled=False` (gate behind a key /
+loopback); document the serializer-held-through-inference duration and the proxy-passthrough
+(unscheduled) unbraked path.
+
+### 9.1 Resolution — all 5 must-fixes + 1 review-found follow-up landed (2026-06-27)
+
+All five MUST-FIX items implemented test-first on `feat/swap-velocity-circuit-breaker`; a second
+adversarial 5-lens review (concurrency, spec-correctness, GPU-safety, storm-trace, test-quality) of the
+diff returned **3 lenses pass-with-nits** and surfaced **one genuine HIGH** — a sixth item below — which
+was then fixed. Full suite: **1972 passed**, 6 pre-existing env-only failures (no live Ollama/GPU in the
+sandbox; identical on the pre-change baseline), **0 new regressions**. The test-quality reviewer
+empirically reverted each fix and confirmed the matching test fails — the tests are behavioral.
+
+1. **[BLOCKER] HALF_OPEN probe wedge — DONE.** `SwapBrake.abort_probe()` (re-OPENs an orphaned probe,
+   guarded to `HALF_OPEN ∧ _probe_outstanding`, idempotent) + wired on the `else` (result False) and
+   `except` branches of `_handle_swap_dispatch`. Tests: `test_swapbrake.py::TestAbortProbe`,
+   `test_scheduler.py::TestAbortProbeWiring` (both else + except branches).
+2. **[HIGH] F5 cold-swap fail mode unreachable — DONE.** `reserve(is_swap=True)` on both scheduler
+   reserve sites. New integration test drives transient-miss→fail-closed and K-misses→degrade-to-blind +
+   `set_hw_degraded(True)`; the 3 fail-open-dependent tests were given a mocked free-VRAM reading and the
+   blind-forward test reworked through the degraded verdict (a naive stub would have reset the flag).
+   Tests: `test_scheduler.py::TestColdSwapFailClosed`, fixed `TestHandleSwapDispatch`/`TestGPUGatingMidSwap`/`TestHardwareGateBlindForward`.
+3. **[HIGH] F4 latch version-independence — DONE.** `_max_oscillation_count()` (raw same-model
+   evict↔reload count, unfiltered by `vram._pinned`) backs `_maybe_latch_infeasible` when the pin set is
+   invisible; the pinned-present branch is unchanged. Tests:
+   `test_scheduler.py::TestPinAwareInfeasibleLatch::test_behavioral_latch_fires_without_pin_metadata` (+ below-threshold guard).
+4. **[HIGH] Fail-LOUD observability wired — DONE.** `_update_brake_engage_snapshot` now pushes the
+   state + pinned gauges each tick, counts the engage edge, emits one audit (`EVENT_SWAP_BRAKE`) on
+   engage + release (duration + swaps-during-brake), and re-logs a latch at WARNING on a throttled
+   heartbeat; `BrakeState.gauge_value` is severity-ascending. Tests:
+   `test_scheduler.py::TestBrakeObservabilityWiring`, `test_swapbrake.py::TestBrakeStateGauge`.
+5. **[HIGH] Force-release bound + surfaced — DONE.** `SwapBrakeConfig.force_release_max_ttl_seconds=600`,
+   clamped in **both** `SwapBrake.force()` (self-protecting) and the server handler (loud
+   `swap_brake_override_clamped` audit); `force_release_active` + `force_release_remaining_s` on
+   `/broker/status` and a `bastion_swap_brake_force_active` gauge held each tick. Force-engage stays
+   uncapped (fails safe). Tests across `test_swapbrake.py`, `test_server_swapbrake.py`,
+   `test_obs_vram_metrics.py`, `test_config_models.py`.
+6. **[HIGH — found in this review] F-1 wedge on the `/broker/preload` path — DONE.** `_funnel_preload`
+   is the SECOND `acquire()` site on the shared brake; its no-fit 409 re-check and a raising cold-load
+   POST both skipped `record_load`, orphaning the probe (the same wedge as #1, on the recovery path). Now
+   a `try/finally` calls `abort_probe()` on every non-recording exit. Tests:
+   `test_funnel.py::test_preload_no_fit_recheck_aborts_orphan_probe`, `::test_preload_post_failure_aborts_orphan_probe`.
+
+**Remaining:** only the NICE-TO-HAVE list above (none blocking merge). The branch as-is prevents the
+originating crash and closes every must-fix.
