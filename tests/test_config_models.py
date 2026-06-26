@@ -8,6 +8,7 @@ implementation plan's test-file ownership map.
 from __future__ import annotations
 
 from bastion.models import (
+    LoadedModel,
     PinDetectionConfig,
     SchedulerConfig,
     SwapBrakeConfig,
@@ -40,3 +41,15 @@ class TestSwapBrakeConfigDefaults:
         p = SchedulerConfig().pin_detection
         assert p.enabled is True
         assert p.expires_horizon_seconds == 3600.0
+
+
+class TestLoadedModelF4Fields:
+    def test_loadedmodel_carries_expires_and_size_vram(self) -> None:
+        m = LoadedModel(name="x:7b", expires_at="2026-06-26T15:30:00Z", size_vram=123456)
+        assert m.expires_at == "2026-06-26T15:30:00Z"
+        assert m.size_vram == 123456
+
+    def test_loadedmodel_f4_defaults(self) -> None:
+        m = LoadedModel(name="x:7b")
+        assert m.expires_at is None
+        assert m.size_vram == 0

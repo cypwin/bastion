@@ -501,9 +501,12 @@ class QueuedRequest(BaseModel):
 class LoadedModel(BaseModel):
     """A model currently loaded in Ollama's VRAM."""
     name: str
-    size_bytes: int = 0
+    size_bytes: int = 0  # disk size from /api/ps (NOT runtime VRAM — see size_vram)
     vram_gb: float = 0.0
     details: dict[str, Any] = Field(default_factory=dict)
+    # F4 fields parsed from /api/ps (both currently dropped by get_loaded_models):
+    expires_at: str | None = None  # RFC3339 keep_alive expiry; far-future ⇒ keep_alive=-1 pin
+    size_vram: int = 0  # actual GPU-resident bytes Ollama measured; preferred over disk size_bytes
 
 
 class ResidencyState(BaseModel):
