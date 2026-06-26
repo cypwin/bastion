@@ -1,6 +1,7 @@
 # BASTION Swap-Velocity Circuit Breaker + F1–F6 Defense-in-Depth — Design
 
-> **Status:** Proposed (awaiting spec review → implementation plan)
+> **Status:** Implemented on `feat/swap-velocity-circuit-breaker` (20 commits, 496 tests green);
+> adversarially reviewed → ship-after-must-fix (5 fail-safe follow-ups, see §9)
 > **Date:** 2026-06-26
 > **Trigger:** Host hard-lockup 2026-06-26 ~15:20–15:21 during a model-swap storm.
 > **Scope decision:** Full F1–F6 sweep in a single PR (in-memory state only; no on-disk breadcrumb).
@@ -425,4 +426,60 @@ before the next.
 - **On-disk brake breadcrumb** (backoff persistence across restart): excluded by D3 (in-memory mandate).
   Revisit only if a flapping-host restart loop is observed in practice.
 - **Multi-GPU swap accounting:** single-GPU seam today (`gpu_index=0`); the brake is per-process.
+
+---
+
+## 9. Post-implementation adversarial review — follow-ups (2026-06-26)
+
+The full F1–F6 sweep was implemented on `feat/swap-velocity-circuit-breaker` (20 commits, 496 tests
+green). A 5-lens adversarial review (concurrency, spec-correctness, completeness, safety, storm-trace)
+returned **ship-after-must-fix**. **No finding is an active crash hole** — every defect fails safe
+toward GPU safety, and the core 3-layer velocity brake (min-spacing + bucket + state machine) is sound
+and unit-tested. The must-fixes harden *secondary* guarantees the spec treats as load-bearing — and
+several are the exact "defined-but-unwired guardrail" anti-pattern §0 was written to prevent. Turnkey:
+
+**MUST-FIX (1 blocker + 4 high):**
+1. **[BLOCKER] HALF_OPEN probe can permanently wedge the brake.** `_probe_outstanding` is reset only by
+   `record_load`/`_open`; the scheduler calls `record_load` only on dispatch *success* (`scheduler.py:928`).
+   If a granted probe's load doesn't record (queue swept by TTL → `dequeue_for_model` None → result False,
+   or `_dispatch` raises), `_probe_outstanding` stays True forever and `acquire()` short-circuits at
+   "half-open probe in flight" → swaps bricked until restart/force-release. Fails SAFE (stalled swaps =
+   no inrush) but a real liveness outage on the post-storm path. **Fix:** add `SwapBrake.abort_probe()`
+   (reset `_probe_outstanding`, re-enter `_open(now)`); call it from `scheduler.py` else/except branches
+   (935–942) when `auth.action=="proceed"` but no `record_load`. + unit test (grant probe, no record,
+   advance clock, assert recovery).
+2. **[HIGH] F5 cold-swap fail mode is unreachable from the live path.** The scheduler reserves WITHOUT
+   `is_swap=True` (`scheduler.py:797,807`) → default steady-state branch fails OPEN → the cold-swap
+   fail-closed + degrade-after-K + `hardware_gate_blind` + `set_hw_degraded` are all silently inert
+   (`vram.py:494`'s own comment says the fail-closed path lives in `reserve(is_swap=True)`). **Fix:**
+   pass `is_swap=True` on both reserve calls + an integration test (transient miss on a swap fails closed;
+   K misses set blind + drive `set_hw_degraded(True)`). NOTE: this flips the fail-closed path on, so
+   scheduler/integration tests that rely on absent-nvidia-smi fail-open need a mocked free-VRAM reading.
+3. **[HIGH] F4 latch is not version-independent.** Both branches of `_maybe_latch_infeasible` are gated
+   behind `_pinned_resident` (`scheduler.py:628`), which is filtered by `vram._pinned` — populated
+   EXCLUSIVELY from `expires_at` (`vram.py:373/384`). On Ollama builds without parseable `expires_at`,
+   `vram._pinned` is empty → latch never fires, contradicting the spec + `PinDetectionConfig`'s own
+   docstring ("degrades to the behavioral signature, never to no protection"). The version-independent
+   `_evict_reload_history` is fed but then dead. **Fix:** when `_pinned_resident` is empty, fall back to
+   latching on raw same-model evict↔reload oscillation count ≥ threshold. + test with no `expires_at`.
+4. **[HIGH] Fail-LOUD-on-infeasible observability is not wired** (the incident's own failure mode).
+   `update_swap_brake_state` / `record_swap_brake_engaged` / `update_pinned_vram_gb` are defined +
+   exported + unit-tested but have ZERO runtime callers; the infeasible latch logs ONE `warning` then
+   sheds at `debug`; no engage/release audit event exists. **Fix:** from `_update_brake_engage_snapshot`
+   (edges already detected) push the brake/pinned gauges each tick, `record_swap_brake_engaged` on the
+   engage edge, emit one audit event on engage+release (duration + swaps-during-brake), and re-log the
+   latch at WARNING on a throttled heartbeat. + test.
+5. **[HIGH] Force-release override defeats two invariants.** No upper bound on `ttl_s` (a single
+   `POST /broker/swap-brake {release:true, ttl_s:1e12}` disables the backstop ~31000 yrs), and it's
+   invisible on `/broker/status` (`force_release_active` exists in `snapshot()` but is dropped by
+   `_embed_brake_snapshot`; no gauge). **Fix:** add `SwapBrakeConfig.force_release_max_ttl_seconds`
+   (~600) + clamp/reject server-side with a loud audit; surface `force_release_active` + remaining TTL in
+   `BrokerStatus`/`_embed_brake_snapshot` + a `bastion_swap_brake_force_active` gauge held for the window.
+
+**NICE-TO-HAVE:** min-spacing advances only on dispatch success (same root as #1 — stamp `_last_load_t`
+at the GPU-I/O issue point); latched-infeasible models on the normal *inference* path aren't fast-shed
+(503 + Retry-After + `throttle` in the proxy/queue grant path); backoff cap/reset under-tested; keep the
+infeasible shed even during force-release (don't re-authorize evicting a caller's pin); force-release is
+reachable unauthenticated when `auth.enabled=False` (gate behind a key / loopback); document the
+serializer-held-through-inference duration and the proxy-passthrough (unscheduled) unbraked path.
 ```
