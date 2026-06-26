@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -84,6 +86,128 @@ class TestGetLoadedModels:
             models = await tracker.get_loaded_models()
 
         assert models is None
+
+
+def _ps_response(models: list[dict]) -> httpx.Response:
+    return httpx.Response(
+        200, json={"models": models},
+        request=httpx.Request("GET", "http://mock"),
+    )
+
+
+class TestPinParseAndLedgerAccuracy:
+    """V1 — F4 pin parse + F5 size_vram ledger accuracy in get_loaded_models."""
+
+    @pytest.mark.asyncio
+    async def test_captures_expires_at_and_size_vram(self, vram_config: BrokerConfig) -> None:
+        """expires_at and size_vram from /api/ps land on the LoadedModel."""
+        tracker = VRAMTracker(vram_config)
+        resp = _ps_response([
+            {
+                "name": "qwen3:14b",
+                "size": 9_965_000_000,
+                "size_vram": 9_965_000_000,
+                "expires_at": "2030-01-01T00:00:00Z",
+                "details": {},
+            },
+        ])
+        with patch.object(tracker._http, "get", new_callable=AsyncMock, return_value=resp):
+            models = await tracker.get_loaded_models()
+
+        assert models is not None
+        assert models[0].expires_at == "2030-01-01T00:00:00Z"
+        assert models[0].size_vram == 9_965_000_000
+
+    @pytest.mark.asyncio
+    async def test_vram_gb_prefers_size_vram(self, vram_config: BrokerConfig) -> None:
+        """When size_vram > 0 it wins over the config estimate / disk size."""
+        tracker = VRAMTracker(vram_config)
+        # qwen3:14b is known as 9.3 GB, but Ollama measured 11 GiB resident.
+        eleven_gib = 11 * 1024 ** 3
+        resp = _ps_response([
+            {"name": "qwen3:14b", "size": 500, "size_vram": eleven_gib, "details": {}},
+        ])
+        with patch.object(tracker._http, "get", new_callable=AsyncMock, return_value=resp):
+            models = await tracker.get_loaded_models()
+
+        assert models is not None
+        assert models[0].vram_gb == pytest.approx(11.0)
+
+    @pytest.mark.asyncio
+    async def test_size_vram_absent_falls_back_to_config(self, vram_config: BrokerConfig) -> None:
+        """No size_vram → known config estimate is still used (regression)."""
+        tracker = VRAMTracker(vram_config)
+        resp = _ps_response([{"name": "qwen3:14b", "size": 0, "details": {}}])
+        with patch.object(tracker._http, "get", new_callable=AsyncMock, return_value=resp):
+            models = await tracker.get_loaded_models()
+
+        assert models is not None
+        assert models[0].vram_gb == pytest.approx(9.3)
+        assert models[0].size_vram == 0
+
+    @pytest.mark.asyncio
+    async def test_pinned_reflects_far_future_expiry(self, vram_config: BrokerConfig) -> None:
+        """A far-future expires_at (keep_alive=-1) marks the model _pinned."""
+        tracker = VRAMTracker(vram_config)
+        near = (datetime.now(UTC) + timedelta(minutes=5)).isoformat()
+        resp = _ps_response([
+            {"name": "qwen3:14b", "size": 0, "expires_at": "2999-01-01T00:00:00Z", "details": {}},
+            {"name": "mistral-nemo:12b", "size": 0, "expires_at": near, "details": {}},
+        ])
+        with patch.object(tracker._http, "get", new_callable=AsyncMock, return_value=resp):
+            await tracker.get_loaded_models()
+
+        # Far-future (beyond 1h horizon) is pinned; the 5-minute expiry is not.
+        assert tracker._pinned == {"qwen3:14b"}
+
+    @pytest.mark.asyncio
+    async def test_unparseable_expires_at_degrades_gracefully(
+        self, vram_config: BrokerConfig,
+    ) -> None:
+        """Garbage / absent expires_at => not pinned, never crashes."""
+        tracker = VRAMTracker(vram_config)
+        resp = _ps_response([
+            {"name": "qwen3:14b", "size": 0, "expires_at": "not-a-timestamp", "details": {}},
+            {"name": "mistral-nemo:12b", "size": 0, "details": {}},  # absent
+        ])
+        with patch.object(tracker._http, "get", new_callable=AsyncMock, return_value=resp):
+            models = await tracker.get_loaded_models()
+
+        assert models is not None  # did not crash
+        assert tracker._pinned == set()
+
+    @pytest.mark.asyncio
+    async def test_pinned_rebuilt_each_call(self, vram_config: BrokerConfig) -> None:
+        """_pinned is rebuilt per poll — a now-unpinned model drops out."""
+        tracker = VRAMTracker(vram_config)
+        pinned_resp = _ps_response([
+            {"name": "qwen3:14b", "size": 0, "expires_at": "2999-01-01T00:00:00Z", "details": {}},
+        ])
+        with patch.object(tracker._http, "get", new_callable=AsyncMock, return_value=pinned_resp):
+            await tracker.get_loaded_models()
+        assert tracker._pinned == {"qwen3:14b"}
+
+        near = (datetime.now(UTC) + timedelta(minutes=5)).isoformat()
+        unpinned_resp = _ps_response([
+            {"name": "qwen3:14b", "size": 0, "expires_at": near, "details": {}},
+        ])
+        with patch.object(tracker._http, "get", new_callable=AsyncMock, return_value=unpinned_resp):
+            await tracker.get_loaded_models()
+        assert tracker._pinned == set()
+
+
+class TestNoSwapBrakeImport:
+    """vram.py must NOT import or reference bastion.swapbrake (layering)."""
+
+    def test_vram_module_does_not_import_swapbrake(self) -> None:
+        import re
+
+        vram_py = Path(__file__).resolve().parents[1] / "src" / "bastion" / "vram.py"
+        source = vram_py.read_text()
+        assert not re.search(r"import.*swapbrake", source), (
+            "vram.py must not import bastion.swapbrake — the brake wiring is the "
+            "scheduler's job; vram only exposes hardware_gate_blind"
+        )
 
 
 class TestCanLoadModel:

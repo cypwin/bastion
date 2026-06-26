@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -318,6 +318,156 @@ class TestVRAMContention:
 # ---------------------------------------------------------------------------
 # Lock discipline: reclaim must run INSIDE the ledger lock everywhere
 # ---------------------------------------------------------------------------
+
+
+GIB = 1024 ** 3
+
+
+def _make_manager(
+    *,
+    total_gb: float = 32.0,
+    safety_margin_pct: float = 10.0,
+    hardware_margin_gb: float = 2.0,
+    non_ollama_reserve_gb: float = 0.0,
+    hardware_gate_fail_mode: str = "closed_on_swap",
+    hardware_gate_miss_degrade_after: int = 3,
+) -> VRAMManager:
+    config = BrokerConfig(
+        gpu=GPUConfig(
+            total_vram_gb=total_gb,
+            headroom_gb=6.0,
+            hardware_margin_gb=hardware_margin_gb,
+            non_ollama_reserve_gb=non_ollama_reserve_gb,
+            hardware_gate_fail_mode=hardware_gate_fail_mode,
+            hardware_gate_miss_degrade_after=hardware_gate_miss_degrade_after,
+        ),
+        models={"test:7b": ModelInfo(vram_gb=5.0)},
+    )
+    tracker = VRAMTracker(config)
+    return VRAMManager(tracker, int(total_gb * GIB), safety_margin_pct=safety_margin_pct)
+
+
+class TestUnifiedMarginAndReserve:
+    """V2 — single unified margin (no stacking) + non-Ollama reserve subtracted."""
+
+    def test_single_unified_margin_takes_the_max_not_the_sum(self) -> None:
+        # pct margin = 1% of 100 GiB = 1 GiB; hardware margin = 4 GiB.
+        # Unified budget must subtract max(1, 4) = 4 GiB, NOT 1 + 4 = 5 GiB.
+        mgr = _make_manager(
+            total_gb=100.0, safety_margin_pct=1.0, hardware_margin_gb=4.0,
+        )
+        expected = int(100 * GIB) - 4 * GIB
+        assert mgr.available_vram == expected
+
+    def test_percentage_margin_wins_when_larger(self) -> None:
+        # pct margin = 10% of 32 GiB = 3.2 GiB > hardware 2 GiB.
+        mgr = _make_manager(total_gb=32.0, safety_margin_pct=10.0, hardware_margin_gb=2.0)
+        expected = int(32 * GIB) - int(32 * GIB * 0.10)
+        assert mgr.available_vram == expected
+
+    def test_non_ollama_reserve_subtracted(self) -> None:
+        base = _make_manager(total_gb=32.0, non_ollama_reserve_gb=0.0).available_vram
+        with_reserve = _make_manager(total_gb=32.0, non_ollama_reserve_gb=3.0).available_vram
+        assert base - with_reserve == 3 * GIB
+
+
+class TestHardwareGateFailMode:
+    """V2 — path-split fail mode + consecutive-miss degrade (F5)."""
+
+    @pytest.mark.asyncio
+    async def test_steady_state_miss_opens(self) -> None:
+        """Steady-state reserve (is_swap=False): a None reading fails OPEN."""
+        mgr = _make_manager()
+        with patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=None)):
+            r = await mgr.reserve("test:7b", 1 * GIB, is_swap=False)
+        assert mgr.reserved_bytes == 1 * GIB
+        assert mgr.hardware_gate_blind is False
+        await mgr.release(r)
+
+    @pytest.mark.asyncio
+    async def test_cold_swap_transient_miss_closes(self) -> None:
+        """Cold-swap reserve (is_swap=True): a transient miss fails CLOSED."""
+        mgr = _make_manager(hardware_gate_miss_degrade_after=3)
+        with patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=None)), \
+             pytest.raises(ValueError, match="BLIND on cold swap"):
+            await mgr.reserve("test:7b", 1 * GIB, is_swap=True)
+        assert mgr.hardware_gate_blind is False  # not yet degraded
+        assert mgr.reserved_bytes == 0
+
+    @pytest.mark.asyncio
+    async def test_kth_consecutive_miss_degrades(self) -> None:
+        """After K consecutive cold-swap misses: stop fail-closing, flag + counter."""
+        mgr = _make_manager(hardware_gate_miss_degrade_after=3)
+        blind_metric = Mock()
+        with patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=None)), \
+             patch("bastion.vram.record_hardware_gate_blind", blind_metric):
+            # Misses 1 and 2 fail closed.
+            for _ in range(2):
+                with pytest.raises(ValueError, match="BLIND on cold swap"):
+                    await mgr.reserve("test:7b", 1 * GIB, is_swap=True)
+            assert mgr.hardware_gate_blind is False
+            # 3rd consecutive miss degrades: admits, sets flag, bumps counter.
+            r = await mgr.reserve("test:7b", 1 * GIB, is_swap=True)
+
+        assert mgr.hardware_gate_blind is True
+        blind_metric.assert_called_once()
+        assert mgr.reserved_bytes == 1 * GIB
+        await mgr.release(r)
+
+    @pytest.mark.asyncio
+    async def test_gate_recovers_resets_flag(self) -> None:
+        """A plausible reading after degrade resets the blind flag + streak."""
+        mgr = _make_manager(hardware_gate_miss_degrade_after=1)
+        with patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=None)), \
+             patch("bastion.vram.record_hardware_gate_blind", Mock()):
+            r1 = await mgr.reserve("test:7b", 1 * GIB, is_swap=True)
+        assert mgr.hardware_gate_blind is True
+        await mgr.release(r1)
+
+        # A healthy reading with plenty of free VRAM recovers the gate.
+        with patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=25.0)):
+            r2 = await mgr.reserve("test:7b", 1 * GIB, is_swap=True)
+        assert mgr.hardware_gate_blind is False
+        assert mgr._hw_miss_streak == 0
+        await mgr.release(r2)
+
+    @pytest.mark.asyncio
+    async def test_fail_mode_open_disables_fail_closed(self) -> None:
+        """hardware_gate_fail_mode='open' admits cold-swap misses (no fail-closed)."""
+        mgr = _make_manager(hardware_gate_fail_mode="open")
+        with patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=None)):
+            r = await mgr.reserve("test:7b", 1 * GIB, is_swap=True)
+        assert mgr.reserved_bytes == 1 * GIB
+        assert mgr.hardware_gate_blind is False
+        await mgr.release(r)
+
+    @pytest.mark.asyncio
+    async def test_stale_reading_treated_as_miss(self) -> None:
+        """A reading claiming far less free than the ledger uses is a miss."""
+        # degrade_after high so a single stale reading fails CLOSED, not degrades.
+        mgr = _make_manager(hardware_gate_miss_degrade_after=5)
+        # Seed the ledger with 20 GiB allocated (steady-state reserve + commit).
+        with patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=None)):
+            seed = await mgr.reserve("test:7b", 20 * GIB, is_swap=False)
+            await mgr.commit(seed)
+        assert mgr.allocated_bytes == 20 * GIB
+
+        # nvidia-smi reports only 3 GiB free while the ledger says 20 GiB is in
+        # use — implausibly stale (sensor not caught up) → treated as a miss.
+        with patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=3.0)), \
+             pytest.raises(ValueError, match="BLIND on cold swap"):
+            await mgr.reserve("test:7b", 1 * GIB, is_swap=True)
+        assert mgr._hw_miss_streak == 1
+
+    @pytest.mark.asyncio
+    async def test_plausible_insufficient_reading_blocks_with_backstop_message(self) -> None:
+        """A plausible reading that is genuinely too low blocks via the backstop."""
+        mgr = _make_manager(hardware_margin_gb=2.0)
+        # Ledger empty, so 4 GiB free is plausible (not stale), but a 5 GiB model
+        # + 2 GiB margin needs 7 GiB free → backstop refuses.
+        with patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=4.0)), \
+             pytest.raises(ValueError, match="nvidia-smi backstop"):
+            await mgr.reserve("test:7b", 5 * GIB, is_swap=True)
 
 
 class TestLockDiscipline:

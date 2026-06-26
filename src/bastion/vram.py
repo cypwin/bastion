@@ -13,7 +13,7 @@ import json
 import logging
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -21,6 +21,7 @@ import httpx
 from bastion import audit
 from bastion.health import get_vram_free_gb, query_gpu_status
 from bastion.metrics import (
+    record_hardware_gate_blind,
     record_vram_reconcile_import,
     record_vram_reconcile_stale,
     update_vram_used_mb,
@@ -29,7 +30,15 @@ from bastion.models import BrokerConfig, LoadedModel, ModelInfo
 
 logger = logging.getLogger(__name__)
 
-HARDWARE_MARGIN_GB = 2.0  # nvidia-smi free-VRAM safety margin (KV/compute/fragmentation)
+# Conservative default nvidia-smi free-VRAM safety margin (KV/compute/
+# fragmentation). The live value is config-driven (``GPUConfig.hardware_margin_gb``,
+# F5); this constant is only the fallback when no config is available.
+HARDWARE_MARGIN_GB = 2.0
+
+# A hardware free-VRAM reading is treated as stale/implausible (a "miss") when it
+# claims LESS free than the ledger believes is in use, beyond this tolerance —
+# the classic sensor-not-caught-up-after-unload signature (F5).
+HARDWARE_STALE_TOLERANCE_GB = 1.0
 
 # Sentinel reason returned by can_load_model() when residency state is
 # unknown. Callers (scheduler eviction loop) compare against this to stop
@@ -287,6 +296,36 @@ class VRAMTracker:
         # Initialize residency cache with configured TTL
         cache_ttl = getattr(config.scheduler, "residency_cache_ttl_seconds", 1.0)
         self.residency_cache = ResidencyCache(self, ttl_seconds=cache_ttl)
+        # F4: names whose /api/ps ``expires_at`` parses to a time beyond the pin
+        # horizon (externally pinned via ``keep_alive=-1``). Rebuilt on every
+        # get_loaded_models() call; the scheduler reads it to exclude pinned
+        # models from the evictable set.
+        self._pinned: set[str] = set()
+
+    @staticmethod
+    def _is_pinned(expires_at: Any, now_dt: datetime, horizon_seconds: float) -> bool:
+        """Decide whether an ``/api/ps`` ``expires_at`` denotes an external pin.
+
+        Returns ``True`` when ``expires_at`` parses to a wall-clock time beyond
+        ``now + horizon_seconds`` (Ollama renders ``keep_alive=-1`` as a
+        far-future RFC3339 timestamp). Absent or unparseable values degrade
+        gracefully to ``False`` (not pinned) and NEVER raise — the behavioral
+        oscillation detector is the version-independent primary signal (F4).
+        """
+        if not expires_at or not isinstance(expires_at, str):
+            return False
+        try:
+            dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        except (ValueError, TypeError, OverflowError):
+            return False
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        try:
+            return dt > now_dt + timedelta(seconds=horizon_seconds)
+        except (OverflowError, ValueError):
+            # A timestamp so far out the horizon arithmetic overflows is, by
+            # definition, beyond the horizon → pinned.
+            return True
 
     async def get_loaded_models(self) -> list[LoadedModel] | None:
         """Query Ollama /api/ps for currently loaded models.
@@ -308,18 +347,41 @@ class VRAMTracker:
             resp.raise_for_status()
             data = resp.json()
             models = []
+            pinned: set[str] = set()
+            now_dt = datetime.now(UTC)
+            horizon = getattr(
+                getattr(self.config.scheduler, "pin_detection", None),
+                "expires_horizon_seconds",
+                3600.0,
+            )
             for m in data.get("models", []):
-                size_bytes = m.get("size", 0)
+                size_bytes = m.get("size", 0) or 0
+                size_vram = m.get("size_vram", 0) or 0
+                expires_at = m.get("expires_at")
                 name = m.get("name", "unknown")
-                # Look up known VRAM, fall back to size-based estimate
+                # VRAM accuracy (F5): Ollama's ``size_vram`` is the actual
+                # GPU-resident byte count it measured — prefer it over both the
+                # config estimate and the disk ``size``. Fall back to the known
+                # config value, then the disk-size estimate.
                 known = self.config.models.get(name)
-                vram_gb = known.vram_gb if known else (size_bytes / (1024**3))
+                if size_vram > 0:
+                    vram_gb = size_vram / (1024**3)
+                elif known:
+                    vram_gb = known.vram_gb
+                else:
+                    vram_gb = size_bytes / (1024**3)
+                if self._is_pinned(expires_at, now_dt, horizon):
+                    pinned.add(name)
                 models.append(LoadedModel(
                     name=name,
                     size_bytes=size_bytes,
                     vram_gb=vram_gb,
                     details=m.get("details", {}),
+                    expires_at=expires_at,
+                    size_vram=size_vram,
                 ))
+            # Rebuild the pinned set every successful poll (F4).
+            self._pinned = pinned
             return models
         except Exception as e:
             logger.warning("Failed to query Ollama /api/ps: %s", e)
@@ -426,10 +488,14 @@ class VRAMTracker:
                 f"{self.config.gpu.max_vram_gb:.1f}GB limit"
             )
 
-        # nvidia-smi hard gate: cross-check actual free VRAM (shared helper)
-        hw_ok, free_gb = await _hardware_admits(int(model_vram * (1024 ** 3)))
+        # nvidia-smi hard gate: cross-check actual free VRAM (shared helper).
+        # STEADY-STATE read — config-driven margin (F5); fails OPEN on a missing
+        # reading (a flaky sensor must not DoS the broker). The cold-swap
+        # fail-closed path lives in VRAMManager.reserve(is_swap=True).
+        margin_gb = getattr(self.config.gpu, "hardware_margin_gb", HARDWARE_MARGIN_GB)
+        hw_ok, free_gb = await _hardware_admits(int(model_vram * (1024 ** 3)), margin_gb)
         if not hw_ok:
-            required_free = model_vram + HARDWARE_MARGIN_GB
+            required_free = model_vram + margin_gb
             await self.log_vram_snapshot("hard_gate_blocked", {
                 "model": model_name,
                 # free_gb is non-None whenever hw_ok is False (fail-open
@@ -440,7 +506,7 @@ class VRAMTracker:
             return False, (
                 f"nvidia-smi: only {free_gb:.1f}GB free, "
                 f"need {required_free:.1f}GB ({model_vram:.1f}GB model "
-                f"+ {HARDWARE_MARGIN_GB:.1f}GB margin)"
+                f"+ {margin_gb:.1f}GB margin)"
             )
 
         await self.log_vram_snapshot("model_load_approved", {
@@ -610,7 +676,28 @@ class VRAMManager:
     ) -> None:
         self._tracker = vram_tracker
         self._total = total_vram_bytes
-        self._safety_margin = int(total_vram_bytes * safety_margin_pct / 100.0)
+
+        # F5 — config-driven gate parameters (sane defaults if no config).
+        gpu_cfg = getattr(getattr(vram_tracker, "config", None), "gpu", None)
+        self._hardware_margin_gb: float = getattr(
+            gpu_cfg, "hardware_margin_gb", HARDWARE_MARGIN_GB
+        )
+        self._non_ollama_reserve_gb: float = getattr(gpu_cfg, "non_ollama_reserve_gb", 0.0)
+        self._fail_mode: str = getattr(gpu_cfg, "hardware_gate_fail_mode", "closed_on_swap")
+        self._miss_degrade_after: int = getattr(gpu_cfg, "hardware_gate_miss_degrade_after", 3)
+
+        # UNIFIED margin (F5): the ledger keeps ONE safety cushion — the larger
+        # of the percentage margin and the physical hardware margin — rather
+        # than stacking both. The non-Ollama reserve (compositor/framebuffer)
+        # is a separate, additive subtraction from the usable budget.
+        pct_bytes = int(total_vram_bytes * safety_margin_pct / 100.0)
+        hw_bytes = int(self._hardware_margin_gb * (1024 ** 3))
+        self._safety_margin = max(pct_bytes, hw_bytes)
+        self._non_ollama_reserve_bytes = int(self._non_ollama_reserve_gb * (1024 ** 3))
+
+        # F5 cold-swap fail-mode state (sensor-blindness tracking).
+        self._hw_miss_streak: int = 0
+        self._hardware_gate_blind: bool = False
 
         self._allocated: int = 0      # Confirmed (model loaded successfully)
         self._reserved: int = 0       # Pending (loading in progress)
@@ -620,16 +707,44 @@ class VRAMManager:
         self._load_semaphore = asyncio.Semaphore(1)  # Serialize GPU I/O
 
         logger.info(
-            "VRAMManager initialized: total=%dMB, safety_margin=%dMB (%.0f%%)",
+            "VRAMManager initialized: total=%dMB, safety_margin=%dMB "
+            "(unified max(%.0f%%, %.1fGB hw)), non_ollama_reserve=%dMB",
             total_vram_bytes // (1024 * 1024),
             self._safety_margin // (1024 * 1024),
             safety_margin_pct,
+            self._hardware_margin_gb,
+            self._non_ollama_reserve_bytes // (1024 * 1024),
         )
 
     @property
+    def hardware_gate_blind(self) -> bool:
+        """Read-only flag: the cold-swap hardware gate has degraded to blind.
+
+        Set ``True`` after ``hardware_gate_miss_degrade_after`` consecutive
+        cold-swap nvidia-smi misses (the physical gate has stopped fail-closing
+        and handed the floor to the sensor-independent swap-velocity brake).
+        Reset to ``False`` the moment a plausible reading returns. The scheduler
+        reads this and forwards it to ``SwapBrake.set_hw_degraded`` (later task);
+        this module never imports the brake.
+        """
+        return self._hardware_gate_blind
+
+    @property
     def available_vram(self) -> int:
-        """Available VRAM after allocations, reservations, and safety margin."""
-        return max(0, self._total - self._safety_margin - self._allocated - self._reserved)
+        """Available VRAM after allocations, reservations, margins, and reserve.
+
+        Single unified margin (no stacking) plus the non-Ollama reserve
+        (compositor/framebuffer VRAM held outside Ollama) subtracted from the
+        usable budget (F5).
+        """
+        return max(
+            0,
+            self._total
+            - self._safety_margin
+            - self._non_ollama_reserve_bytes
+            - self._allocated
+            - self._reserved,
+        )
 
     @property
     def allocated_bytes(self) -> int:
@@ -639,7 +754,70 @@ class VRAMManager:
     def reserved_bytes(self) -> int:
         return self._reserved
 
-    async def reserve(self, model: str, vram_bytes: int, ttl: float = 120.0) -> VRAMReservation:
+    def _hardware_miss(self, free_gb: float | None) -> bool:
+        """Is this nvidia-smi reading a miss (absent OR stale/implausible)?
+
+        A reading is a miss when there is no value at all, OR when it claims
+        LESS free than the ledger believes is currently in use (beyond a
+        tolerance) — the classic "sensor hasn't caught up after an unload"
+        signature. Such a reading is routed like a blind sensor rather than
+        trusted (F5).
+        """
+        if free_gb is None:
+            return True
+        ledger_used_gb = (self._allocated + self._reserved) / (1024 ** 3)
+        return free_gb < ledger_used_gb - HARDWARE_STALE_TOLERANCE_GB
+
+    def _register_cold_swap_reading(self, miss: bool) -> str:
+        """Update miss streak + blind flag for a COLD-SWAP reading (sync).
+
+        Returns one of:
+          ``"ok"``       — plausible reading (or fail-mode "open"); proceed,
+                           hardware verdict applies.
+          ``"block"``    — transient miss; fail CLOSED (refuse the swap).
+          ``"degraded"`` — K-th consecutive miss; STOP fail-closing, hand the
+                           floor to the velocity brake (admit).
+        """
+        if not miss:
+            # Gate recovered: reset streak + blind flag.
+            if self._hw_miss_streak or self._hardware_gate_blind:
+                logger.info(
+                    "hardware VRAM gate recovered after %d miss(es) — resuming "
+                    "fail-closed cold-swap protection",
+                    self._hw_miss_streak,
+                )
+            self._hw_miss_streak = 0
+            self._hardware_gate_blind = False
+            return "ok"
+
+        # Operator opted out of fail-closed behavior entirely.
+        if self._fail_mode == "open":
+            return "ok"
+
+        self._hw_miss_streak += 1
+        if self._hw_miss_streak >= self._miss_degrade_after:
+            if not self._hardware_gate_blind:
+                logger.error(
+                    "================ DEGRADED: hardware VRAM gate blind "
+                    "================\n"
+                    "nvidia-smi gave %d consecutive unreadable/implausible "
+                    "cold-swap readings — STOPPING fail-closed and handing the "
+                    "floor to the sensor-independent swap-velocity brake. The "
+                    "physical VRAM gate is now best-effort only.",
+                    self._hw_miss_streak,
+                )
+                record_hardware_gate_blind()
+                self._hardware_gate_blind = True
+            return "degraded"
+        return "block"
+
+    async def reserve(
+        self,
+        model: str,
+        vram_bytes: int,
+        ttl: float = 120.0,
+        is_swap: bool = False,
+    ) -> VRAMReservation:
         """Atomically reserve VRAM for a pending model load.
 
         This is the critical section -- NO await points between check and deduction.
@@ -648,15 +826,29 @@ class VRAMManager:
 
         The nvidia-smi hardware backstop is queried BEFORE the lock so the await
         never enters the atomic critical section; its verdict is evaluated inside
-        the lock. It fails open (a missing reading trusts the logical ledger).
+        the lock.
+
+        Parameters
+        ----------
+        is_swap : bool
+            ``True`` marks the COLD-SWAP path (F5): a transient nvidia-smi miss
+            fails CLOSED (blind on the dangerous path = stop), but after
+            ``hardware_gate_miss_degrade_after`` consecutive misses the gate
+            degrades to blind (``hardware_gate_blind`` set, loud banner, blind
+            counter) and admits — handing the floor to the velocity brake so a
+            permanent sensor outage cannot become a permanent swap outage.
+            Steady-state reserves (``is_swap=False``) fail OPEN as before.
 
         Raises
         ------
         ValueError
-            If insufficient VRAM (logical ledger) or nvidia-smi reports
-            insufficient free VRAM (hardware backstop).
+            If insufficient VRAM (logical ledger), nvidia-smi reports
+            insufficient free VRAM (hardware backstop), or a cold-swap read is
+            blind on a transient miss.
         """
-        hw_ok, free_gb = await _hardware_admits(vram_bytes)
+        margin_gb = self._hardware_margin_gb
+        hw_ok, free_gb = await _hardware_admits(vram_bytes, margin_gb)
+        miss = self._hardware_miss(free_gb)
         async with self._lock:
             # Reclaim runs INSIDE the lock so reclaim+check+deduct
             # is atomic against concurrent reservers. Outside the
@@ -676,12 +868,31 @@ class VRAMManager:
                     f"reserved={self._reserved // (1024*1024)}MB)"
                 )
 
-            if not hw_ok:
-                raise ValueError(
-                    f"nvidia-smi backstop: only {free_gb:.1f}GB free, need "
-                    f"{vram_bytes / (1024 ** 3):.1f}GB + {HARDWARE_MARGIN_GB:.1f}GB "
-                    f"margin for model '{model}'"
-                )
+            # Hardware backstop — path-split fail mode (F5).
+            if is_swap:
+                decision = self._register_cold_swap_reading(miss)
+                if decision == "block":
+                    raise ValueError(
+                        f"nvidia-smi backstop BLIND on cold swap (transient miss "
+                        f"{self._hw_miss_streak}/{self._miss_degrade_after}) — "
+                        f"failing closed for model '{model}'"
+                    )
+                if decision == "ok" and not miss and not hw_ok:
+                    raise ValueError(
+                        f"nvidia-smi backstop: only {free_gb:.1f}GB free, need "
+                        f"{vram_bytes / (1024 ** 3):.1f}GB + {margin_gb:.1f}GB "
+                        f"margin for model '{model}'"
+                    )
+                # decision == "degraded" → admit (brake owns safety now).
+            else:
+                # Steady-state reserve: fail OPEN on a miss; only a plausible
+                # reading that the backstop rejects blocks the load.
+                if not miss and not hw_ok:
+                    raise ValueError(
+                        f"nvidia-smi backstop: only {free_gb:.1f}GB free, need "
+                        f"{vram_bytes / (1024 ** 3):.1f}GB + {margin_gb:.1f}GB "
+                        f"margin for model '{model}'"
+                    )
 
             reservation = VRAMReservation(
                 reservation_id=uuid.uuid4().hex[:12],
