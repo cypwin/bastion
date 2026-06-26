@@ -739,6 +739,17 @@ class BrokerStatus(BaseModel):
     a2a_tasks: list[dict] = Field(default_factory=list)
     active_leases: list[dict] = Field(default_factory=list)
     recent_audit_events: list[dict] = Field(default_factory=list)
+    # --- Swap-velocity circuit breaker observability (F1/F2/F4/F5) -----------
+    # All Optional/None-default for backward compat; populated from
+    # Scheduler.swap_brake.snapshot() + the VRAM hardware-gate flag.
+    brake_state: str | None = None
+    brake_reason: str | None = None
+    cooloff_remaining_s: float | None = None
+    windowed_rate_per_min: float | None = None
+    backoff_level: int | None = None
+    pinned_models: list[str] | None = None
+    pinned_vram_gb: float | None = None
+    hardware_gate_blind: bool | None = None
 
 
 # ---------------------------------------------------------------------------

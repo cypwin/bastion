@@ -8,6 +8,7 @@ implementation plan's test-file ownership map.
 from __future__ import annotations
 
 from bastion.models import (
+    BrokerStatus,
     GPUConfig,
     LoadedModel,
     PinDetectionConfig,
@@ -64,3 +65,14 @@ class TestLoadedModelF4Fields:
         m = LoadedModel(name="x:7b")
         assert m.expires_at is None
         assert m.size_vram == 0
+
+
+class TestBrokerStatusSwapVelocityFields:
+    def test_swap_velocity_fields_default_none(self) -> None:
+        s = BrokerStatus()
+        for field in (
+            "brake_state", "brake_reason", "cooloff_remaining_s",
+            "windowed_rate_per_min", "backoff_level", "pinned_models",
+            "pinned_vram_gb", "hardware_gate_blind",
+        ):
+            assert getattr(s, field) is None
