@@ -16,9 +16,17 @@ from bastion.models import (
     ModelInfo,
     PriorityTier,
     SchedulerConfig,
+    SwapBrakeConfig,
 )
+
+# Brake-neutral config for tests that exercise dispatch/swap mechanics rather
+# than the brake itself (the brake's behavior is covered by test_swapbrake.py
+# and the dedicated S2 wiring tests). min-spacing 0 + a huge bucket make the
+# brake non-throttling, so the startup "just-swapped" seed never blocks a swap.
+_NEUTRAL_BRAKE = SwapBrakeConfig(min_spacing_seconds=0.0, bucket_capacity=1_000_000.0)
 from bastion.queue import AffinityQueue
 from bastion.scheduler import Scheduler
+from bastion.swapbrake import BrakeDecision
 from bastion.vram import VRAMManager, VRAMTracker
 from tests.conftest import make_request
 
@@ -43,6 +51,7 @@ def sched_config() -> BrokerConfig:
             model_affinity_bonus=10.0,
             aging_rate=2.0,
             max_queue_size=32,
+            swap_brake=_NEUTRAL_BRAKE,
         ),
         models={
             "qwen3:14b": ModelInfo(vram_gb=9.3),
@@ -301,6 +310,7 @@ class TestConcurrentDispatch:
                 aging_rate=2.0,
                 max_queue_size=32,
                 max_concurrent_dispatches=3,
+                swap_brake=_NEUTRAL_BRAKE,
             ),
             models={
                 "granite3.1-dense:8b": ModelInfo(vram_gb=5.2),
@@ -1198,3 +1208,70 @@ class TestStopTimeout:
             await sched.stop()
 
         assert sched._task is None
+
+
+class TestSwapBrakeWiring:
+    """S2 — the SwapBrake is actually wired into the swap path (not inert)."""
+
+    def _make(self, config, vram_manager=None, dispatch=None) -> Scheduler:
+        queue = AffinityQueue(config.scheduler)
+        tracker = VRAMTracker(config)
+
+        async def _default(request, needs_swap=True) -> None:
+            pass
+
+        return Scheduler(config, queue, tracker, dispatch or _default, vram_manager=vram_manager)
+
+    @pytest.mark.asyncio
+    async def test_drain_holds_brake_state(self, sched_config: BrokerConfig) -> None:
+        sched = self._make(sched_config)
+        await sched.drain()
+        assert sched.swap_brake.snapshot()["drain_active"] is True
+        await sched.resume()
+        assert sched.swap_brake.snapshot()["drain_active"] is False
+
+    @pytest.mark.asyncio
+    async def test_sync_seeds_brake_just_swapped(self, sched_config: BrokerConfig) -> None:
+        cfg = sched_config.model_copy(deep=True)
+        cfg.scheduler.swap_brake = SwapBrakeConfig(min_spacing_seconds=8.0)
+        sched = self._make(cfg)
+        with patch.object(sched.vram, "get_loaded_models", AsyncMock(return_value=[])):
+            await sched._sync_current_model()
+        # the startup seed denies a free first swap (closes the _last_swap_time=0.0 hole)
+        assert sched.swap_brake.peek("qwen3:14b").action == "stall"
+
+    @pytest.mark.asyncio
+    async def test_braked_pregate_skips_eviction(self, sched_config: BrokerConfig) -> None:
+        sched = self._make(sched_config)
+        # force the cheap pre-gate to stall -> a doomed swap must NOT evict
+        sched._brake.peek = lambda model: BrakeDecision("stall", "test-hold", 0.0)
+        sched._evict_for_model = AsyncMock(return_value=False)
+        result = await sched._handle_swap_dispatch(make_request(model="qwen3:14b"))
+        assert result is False
+        sched._evict_for_model.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_vram_manager_swap_debits_brake(self, sched_config: BrokerConfig) -> None:
+        # R2-1: the no-VRAMManager branch must still acquire the serializer and
+        # debit the brake — else velocity is unbounded on uncalibrated hosts.
+        cfg = sched_config.model_copy(deep=True)
+        cfg.scheduler.swap_brake = SwapBrakeConfig(min_spacing_seconds=0.0, bucket_capacity=5.0)
+        dispatched: list = []
+
+        async def dispatch(request, needs_swap=True) -> None:
+            dispatched.append(request)
+
+        sched = self._make(cfg, dispatch=dispatch)  # vram_manager=None
+        req = make_request(model="qwen3:14b")
+        sched.queue.enqueue(req)
+        with (
+            patch.object(sched.vram, "can_load_model", AsyncMock(return_value=(True, "ok"))),
+            patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))),
+            patch.object(sched.vram, "get_loaded_vram_gb", AsyncMock(return_value=0.0)),
+            patch.object(sched.vram, "get_loaded_models", AsyncMock(return_value=[])),
+        ):
+            before = sched.swap_brake.snapshot()["tokens"]
+            result = await sched._handle_swap_dispatch(req)
+        assert result is True
+        assert len(dispatched) == 1
+        assert sched.swap_brake.snapshot()["tokens"] == before - 1.0
