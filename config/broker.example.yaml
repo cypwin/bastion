@@ -35,6 +35,22 @@ scheduler:
   aging_rate: 2.0          # Priority points gained per second waiting
   max_queue_size: 512      # Reject with 503 above this
 
+  # Swap-velocity circuit breaker — the sensor-independent crash backstop.
+  # Bounds how fast BASTION cold-loads models (rapid loads cause the GPU power
+  # transients that hard-lock the host). Defaults are a conservative floor for
+  # an unknown card; run `bastion --stress-test` to calibrate refill/bucket up.
+  swap_brake:
+    enabled: true              # hard to disable; the backstop for fail-open gates
+    min_spacing_seconds: 8.0   # min seconds between cold loads (inrush floor)
+    bucket_capacity: 3.0       # burst tolerance (calibrated: safe_burst_depth)
+    refill_per_minute: 5.0     # sustained safe velocity (calibrated: safe_swap_rate_per_min)
+    count_evictions: true      # an evict+load swap spends ~2 tokens
+
+  # Detect Ollama keep_alive=-1 pins so BASTION stops fighting (evicting) them.
+  pin_detection:
+    enabled: true
+    expires_horizon_seconds: 3600.0  # /api/ps expires_at beyond now+this ⇒ pinned
+
 # ── Proxy settings ──────────────────────────────────────────────────
 proxy:
   inference_timeout_seconds: 300  # Max time for a single inference call
