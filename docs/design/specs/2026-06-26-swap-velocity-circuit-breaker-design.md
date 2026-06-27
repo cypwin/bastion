@@ -477,13 +477,10 @@ several are the exact "defined-but-unwired guardrail" anti-pattern §0 was writt
    (~600) + clamp/reject server-side with a loud audit; surface `force_release_active` + remaining TTL in
    `BrokerStatus`/`_embed_brake_snapshot` + a `bastion_swap_brake_force_active` gauge held for the window.
 
-**NICE-TO-HAVE (still open):** min-spacing advances only on dispatch success (same root as #1 — stamp
-`_last_load_t` at the GPU-I/O issue point); latched-infeasible models on the normal *inference* path
-aren't fast-shed (503 + Retry-After + `throttle` in the proxy/queue grant path); backoff cap/reset
-under-tested; keep the infeasible shed even during force-release (don't re-authorize evicting a caller's
-pin); force-release is reachable unauthenticated when `auth.enabled=False` (gate behind a key /
-loopback); document the serializer-held-through-inference duration and the proxy-passthrough
-(unscheduled) unbraked path.
+**NICE-TO-HAVE — ALL RESOLVED (2026-06-27, see §9.2):** min-spacing advances only on dispatch success;
+latched-infeasible models on the normal *inference* path aren't fast-shed; backoff cap/reset
+under-tested; keep the infeasible shed even during force-release; force-release reachable unauthenticated;
+document the serializer-held-through-inference duration and the proxy-passthrough unbraked path.
 
 ### 9.1 Resolution — all 5 must-fixes + 1 review-found follow-up landed (2026-06-27)
 
@@ -524,5 +521,33 @@ empirically reverted each fix and confirmed the matching test fails — the test
    a `try/finally` calls `abort_probe()` on every non-recording exit. Tests:
    `test_funnel.py::test_preload_no_fit_recheck_aborts_orphan_probe`, `::test_preload_post_failure_aborts_orphan_probe`.
 
-**Remaining:** only the NICE-TO-HAVE list above (none blocking merge). The branch as-is prevents the
-originating crash and closes every must-fix.
+**Remaining (after §9.1):** only the NICE-TO-HAVE list above — now also resolved in §9.2.
+
+### 9.2 Nice-to-have resolution + a second review-found hardening (2026-06-27)
+
+All six NICE-TO-HAVE items landed test-first; a focused 3-lens adversarial review (safety/spec,
+missed-second-site, concurrency/test-quality) of the diff surfaced **one genuine HIGH** in the NH-5 fix
+itself (item 5 below), now fixed. Full suite after: **1987 passed**, 6 pre-existing env-only failures, 0
+new regressions.
+
+1. **NH-1 — min-spacing advances at the GPU-I/O issue point.** `SwapBrake.note_load_issued()` stamps
+   `_last_load_t` at issue (spacing only, no token); called before `_dispatch_for_model` and the preload
+   POST, so a load that is issued then FAILS still spaces the next attempt (`record_load` re-stamps on
+   success, so the success path is unchanged).
+2. **NH-2 — fast-shed latched models on the inference path.** The proxy consults the brake at admission
+   (`_latch_retry_after_fn` → `swap_brake.peek`) and returns `503 + Retry-After` (latch-derived) for a
+   latched-infeasible model instead of enqueuing doomed work that would block to the 504 timeout.
+3. **NH-3 — backoff cap + reset now tested** (`test_cooloff_is_capped_at_backoff_max`,
+   `test_backoff_resets_after_clean_closed_window`).
+4. **NH-4 — infeasible shed holds even under force-release.** Dropped the `not forced_release` guard in
+   `acquire()`/`peek()`: force-release disables the velocity brake but no longer re-authorizes evicting a
+   caller's pin (the eviction path independently refuses `vram._pinned`, so pins are doubly protected).
+5. **NH-5 — force-release loopback-gated when admin auth is not enforced.** A force-RELEASE from a
+   non-loopback peer is refused (403) unless auth is actually enforced. *Review catch:* the first cut
+   keyed on `auth.enabled` alone, but `make_admin_key_dependency` only enforces when `enabled AND
+   api_keys` is non-empty — so the realistic `enabled=True, api_keys=[]` misconfig left the surface open
+   AND bypassed the gate. Fixed to gate on `auth_enforced = enabled AND api_keys` (and a missing config
+   now fails safe to loopback-required). Force-engage/drain/unload TIGHTEN safety and stay open.
+6. **NH-6 — docs.** The load serializer is held through the *blocking inference* (not just the cold
+   load), so a long swap-in delays the next swap + both preload routes (documented at the serializer
+   block); passthrough endpoints are an intentionally UNBRAKED path (documented on `_handle_passthrough`).
