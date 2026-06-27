@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import logging
 import os
@@ -1614,6 +1615,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     # continue to serve).
     if _proxy is not None:
         _proxy._is_draining_fn = lambda: _scheduler is not None and _scheduler.is_draining
+        # NH-2 — wire latch-aware admission: the proxy fast-sheds inference requests
+        # for a model whose swap is latched infeasible, instead of queuing doomed work.
+        _proxy._latch_retry_after_fn = _swap_brake_latch_retry_after
     _start_time = time.time()
     _reset_epoch = datetime.now(UTC).isoformat()
 
@@ -1857,6 +1861,9 @@ async def _funnel_preload(request: Request, config: BrokerConfig) -> Any:
             if not can_load:
                 return JSONResponse({"error": reason, "reason_code": "vram_no_fit"}, status_code=409)
 
+            # NH-1 — stamp the min-spacing floor at the issue point so a load that
+            # is issued then fails (POST raises) still spaces the next attempt.
+            brake.note_load_issued(model)
             # Trigger the cold load via a minimal generate request.
             async with httpx.AsyncClient(timeout=60.0) as client:
                 await client.post(
@@ -1915,6 +1922,29 @@ def _embed_brake_snapshot(result: dict[str, Any], loaded: list[Any]) -> None:
     )
 
 
+def _swap_brake_latch_retry_after(model: str) -> float | None:
+    """NH-2 — Retry-After (seconds) for a model whose swap is latched INFEASIBLE,
+    else None. The proxy uses this to fast-shed doomed inference requests at
+    admission with a latch-authoritative Retry-After (not a token-refill estimate).
+    Uses the side-effect-free ``peek`` so admission never mutates brake state."""
+    if _scheduler is None:
+        return None
+    decision = _scheduler.swap_brake.peek(model)
+    return decision.retry_after_s if decision.action == "shed" else None
+
+
+def _peer_is_loopback(request: Request) -> bool:
+    """True when the request's SOCKET peer is loopback (ignores X-Forwarded-For,
+    which is client-spoofable — the loopback gate must trust the real peer only)."""
+    host = request.client.host if request.client else None
+    if not host:
+        return False
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
+
+
 async def _force_swap_brake(request: Request) -> Any:
     """Shared body for BOTH ``POST /broker/swap-brake`` admin routes (SRV2).
 
@@ -1932,6 +1962,29 @@ async def _force_swap_brake(request: Request) -> Any:
         return JSONResponse({"error": "ttl_s must be a number"}, status_code=400)
     if ttl_s < 0:
         return JSONResponse({"error": "ttl_s must be >= 0"}, status_code=400)
+
+    # NH-5 — force-RELEASE disarms the crash backstop. When admin auth is not
+    # actually ENFORCED, restrict it to a loopback peer so a remote caller cannot
+    # silently disable the velocity brake. Auth is enforced only when enabled AND a
+    # key is configured: make_admin_key_dependency passes through when api_keys is
+    # empty, so keying on enabled alone would leave the realistic enabled-but-no-keys
+    # misconfig wide open. A missing _config also requires loopback (fail safe).
+    # Force-ENGAGE keeps the brake ON (fails safe) and is intentionally not gated.
+    auth_enforced = bool(_config and _config.auth.enabled and _config.auth.api_keys)
+    if release and not auth_enforced and not _peer_is_loopback(request):
+        host = request.client.host if request.client else "unknown"
+        logger.warning(
+            "Refused remote force-release from %s on an unauthenticated admin "
+            "surface — enable auth or issue it from loopback.", host,
+        )
+        audit.emit("swap_brake_release_refused_remote", {"client": host})
+        return JSONResponse(
+            {
+                "error": "force-release requires loopback or enabled auth",
+                "reason_code": "force_release_forbidden",
+            },
+            status_code=403,
+        )
 
     brake = _scheduler.swap_brake
     # F5 — clamp a force-RELEASE ttl to the configured cap so the velocity backstop

@@ -264,8 +264,12 @@ class SwapBrake:
             return self._dec("stall", "force-engaged", max(0.0, self._force_engage_until - now))
         forced_release = bool(self._force_release_until and now < self._force_release_until)
 
-        # Set-level infeasible latch — shed the offending candidate.
-        if not forced_release and model in self._infeasible:
+        # Set-level infeasible latch — shed the offending candidate ALWAYS, even
+        # under force-release: force-release disables the VELOCITY brake but must
+        # NOT re-authorize evicting a caller's pin (the actual storm-stopper). A
+        # pin evicted by a force-released swap is the exact storm restart the latch
+        # exists to prevent.
+        if model in self._infeasible:
             return self._dec("shed", "demanded resident set exceeds VRAM capacity",
                              self._latch_retry_after(now, model))
         if forced_release:
@@ -308,7 +312,9 @@ class SwapBrake:
         if self._force_engage_until and now < self._force_engage_until:
             return self._dec("stall", "force-engaged", max(0.0, self._force_engage_until - now))
         forced_release = bool(self._force_release_until and now < self._force_release_until)
-        if not forced_release and model in self._infeasible and now < self._infeasible[model]:
+        # Infeasible shed holds even under force-release (see acquire) — never
+        # re-authorize evicting a pin.
+        if model in self._infeasible and now < self._infeasible[model]:
             return self._dec("shed", "demanded resident set exceeds VRAM capacity",
                              self._latch_retry_after(now, model))
         if forced_release:
@@ -322,6 +328,18 @@ class SwapBrake:
         return self._dec("proceed", "ok", 0.0)
 
     # ── recording API ──────────────────────────────────────────────────
+
+    def note_load_issued(self, model: str) -> None:
+        """Advance the min-spacing floor at the GPU-I/O ISSUE point.
+
+        The inrush power transient happens when a cold load is *issued*, not when
+        it succeeds — so the spacing floor must advance even if the load later FAILS
+        (Ollama error / timeout). ``record_load`` debits the token + window only on
+        SUCCESS; this stamps just the spacing clock at issue, so a failed load still
+        spaces the next attempt instead of permitting an immediate retry inrush. On
+        success ``record_load`` re-stamps ``_last_load_t`` to the (later) completion
+        time, so the success path is unchanged."""
+        self._last_load_t = self._clock()
 
     def record_load(self, model: str) -> None:
         """Debit a token for a completed BASTION-initiated cold load (at the GPU-I/O point)."""

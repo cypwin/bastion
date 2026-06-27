@@ -958,6 +958,15 @@ class Scheduler:
         # racing second task re-checks and stalls) AND keeps the no-VRAMManager
         # path braked. We never sleep inside the serializer on a stall —
         # min-spacing is realized by the scheduler's tick retries.
+        #
+        # DURATION NOTE (NH-6): `_dispatch(..., needs_swap=True)` BLOCKS until the
+        # inference completes (server `_dispatch_request`: serialize Ollama access
+        # across a model transition), so the serializer is held for the whole
+        # load+inference, not just the cold load. This is intentional (no concurrent
+        # Ollama access mid-swap), but a long swap-in inference therefore delays the
+        # next swap and both `/broker/preload` routes (which share this serializer).
+        # Co-resident (Phase-1) dispatch never holds it, so steady-state throughput
+        # is unaffected; only swap-needing work queues behind an in-progress swap.
         logger.info(
             "Model swap: %s -> %s (queue depth for new: %d)",
             self._current_model, candidate.model,
@@ -1036,6 +1045,10 @@ class Scheduler:
                     await self._unload_model(m.name)
 
             swap_start = time.monotonic()
+            # NH-1 — advance the min-spacing floor at the GPU-I/O ISSUE point, so a
+            # load that is issued and then FAILS (record_load never fires) still
+            # spaces the next attempt instead of permitting an immediate retry inrush.
+            self._brake.note_load_issued(candidate.model)
             try:
                 result = await self._dispatch_for_model(candidate.model, needs_swap=True)
                 record_model_swap_duration(candidate.model, time.monotonic() - swap_start)

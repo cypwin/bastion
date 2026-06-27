@@ -33,11 +33,15 @@ class _FakeBrake:
     def __init__(self, decision: BrakeDecision) -> None:
         self._decision = decision
         self.acquired: list[str] = []
+        self.issued: list[str] = []
         self.loaded: list[str] = []
 
     def acquire(self, model: str) -> BrakeDecision:
         self.acquired.append(model)
         return self._decision
+
+    def note_load_issued(self, model: str) -> None:
+        self.issued.append(model)
 
     def record_load(self, model: str) -> None:
         self.loaded.append(model)

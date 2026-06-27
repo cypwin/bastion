@@ -36,15 +36,17 @@ _BRAKE_STATUS_KEYS = (
 
 
 @contextmanager
-def _client(factory):
-    app = factory(BrokerConfig())
+def _client(factory, client_addr: tuple[str, int] = ("127.0.0.1", 50000), config=None):
+    # Default to a loopback peer: force-release is loopback-gated when auth is
+    # not enforced (NH-5), and these tests run with the default (auth-off) config.
+    app = factory(config if config is not None else BrokerConfig())
     with tempfile.TemporaryDirectory() as tmpdir:
         audit_path = os.path.join(tmpdir, "bastion-audit.jsonl")
         from unittest.mock import patch
 
         with (
             patch("bastion.paths.audit_log_path", return_value=audit_path),
-            TestClient(app) as client,
+            TestClient(app, client=client_addr) as client,
         ):
             yield client
 
@@ -125,6 +127,43 @@ def test_swap_brake_rejects_negative_ttl(factory):
     with _client(factory) as client:
         resp = client.post("/broker/swap-brake", json={"release": False, "ttl_s": -1.0})
     assert resp.status_code == 400
+
+
+@pytest.mark.parametrize("factory", [create_app, create_admin_app])
+def test_force_release_from_remote_refused_when_auth_disabled(factory):
+    """NH-5 — force-RELEASE disarms the crash backstop. On the unauthenticated-by-
+    default admin surface (ADR-006), a force-release from a NON-loopback peer must be
+    refused (403). Force-engage (holds the brake — fails safe) is NOT gated."""
+    with _client(factory, client_addr=("10.0.0.5", 1234)) as client:
+        release = client.post("/broker/swap-brake", json={"release": True, "ttl_s": 30.0})
+        engage = client.post("/broker/swap-brake", json={"release": False, "ttl_s": 30.0})
+
+    assert release.status_code == 403
+    assert release.json()["reason_code"] == "force_release_forbidden"
+    # Force-engage from the same remote peer is allowed (it only tightens safety).
+    assert engage.status_code == 200
+
+
+@pytest.mark.parametrize("factory", [create_app, create_admin_app])
+def test_force_release_from_loopback_allowed_when_auth_disabled(factory):
+    with _client(factory, client_addr=("127.0.0.1", 9999)) as client:
+        resp = client.post("/broker/swap-brake", json={"release": True, "ttl_s": 30.0})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "force_release"
+
+
+@pytest.mark.parametrize("factory", [create_app, create_admin_app])
+def test_force_release_loopback_gate_applies_when_auth_enabled_but_no_keys(factory):
+    """NH-5 hardening — auth.enabled=True with EMPTY api_keys leaves the admin
+    surface unauthenticated (make_admin_key_dependency passes through when keys are
+    empty). The loopback gate must key on the REAL enforcement predicate (enabled
+    AND keys), not enabled alone — else a remote peer can still disarm the backstop."""
+    from bastion.models import AuthConfig
+    cfg = BrokerConfig(auth=AuthConfig(enabled=True, api_keys=[]))
+    with _client(factory, client_addr=("10.0.0.5", 1234), config=cfg) as client:
+        resp = client.post("/broker/swap-brake", json={"release": True, "ttl_s": 30.0})
+    assert resp.status_code == 403
+    assert resp.json()["reason_code"] == "force_release_forbidden"
 
 
 @pytest.mark.parametrize("factory", [create_app, create_admin_app])

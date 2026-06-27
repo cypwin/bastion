@@ -54,6 +54,23 @@ class TestMinSpacing:
         b = _brake(clk, min_spacing_seconds=8.0, bucket_capacity=100.0)
         assert b.acquire("m").action == "proceed"
 
+    def test_note_load_issued_advances_spacing_without_token_debit(self) -> None:
+        # NH — the inrush transient happens when a cold load is ISSUED, not when it
+        # succeeds. So the spacing floor must advance at issue even if the load then
+        # FAILS (no token debit on failure → that stays on record_load success).
+        clk = FakeClock()
+        b = _brake(clk, min_spacing_seconds=8.0, bucket_capacity=100.0)
+        tokens_before = b.snapshot()["tokens"]
+        b.note_load_issued("m")
+        # Spacing now in effect — a second issue within the floor stalls.
+        d = b.acquire("m")
+        assert d.action == "stall"
+        assert d.reason == "min-spacing"
+        # No token was debited (only record_load debits).
+        assert b.snapshot()["tokens"] == tokens_before
+        clk.advance(8.0)
+        assert b.acquire("m").action == "proceed"
+
 
 # ---------------------------------------------------------------------------
 # T2 — token bucket (spacing disabled to isolate the bucket)
@@ -148,6 +165,40 @@ class TestStateMachine:
         snap2 = b.snapshot()
         assert snap2["state"] == BrakeState.OPEN
         assert snap2["backoff_level"] >= snap1["backoff_level"]
+
+    def test_cooloff_is_capped_at_backoff_max(self) -> None:
+        # NH-3 — exponential cooloff (cooloff_seconds·2^(n-1)) must saturate at
+        # cooloff_backoff_max_seconds no matter how deep the backoff goes, so a long
+        # storm can't extend the hard pause unboundedly (forgiving recovery).
+        clk = FakeClock()
+        b = _brake(clk, cooloff_seconds=10.0, cooloff_backoff_max_seconds=30.0)
+        for _ in range(8):
+            b._open(clk())  # each re-open deepens backoff: 10, 20, 40→30, 80→30, ...
+        assert b._backoff_level == 8
+        assert (b._brake_until - clk()) <= 30.0
+        assert b.snapshot()["cooloff_remaining_s"] <= 30.0
+
+    def test_backoff_resets_after_clean_closed_window(self) -> None:
+        # NH-3 — after a clean CLOSED window (rate below release for min_state_hold)
+        # the backoff ladder resets to 0, so an isolated past storm doesn't penalize a
+        # later one with a stale-deep cooloff.
+        clk = FakeClock()
+        b = _brake(
+            clk, min_spacing_seconds=0.0, bucket_capacity=2.0, refill_per_minute=0.0,
+            cooloff_seconds=10.0, min_state_hold_seconds=2.0, release_rate_per_minute=3.0,
+        )
+        self._drive_to_open(clk, b)
+        assert b.snapshot()["backoff_level"] >= 1
+        clk.advance(11.0)   # past cooloff
+        clk.advance(60.0)   # prune the window so the rate reads low
+        assert b.acquire("m").action == "proceed"  # HALF_OPEN probe granted
+        b.record_load("m")                          # probe succeeds
+        b._tokens = float(b._cfg.bucket_capacity)   # refill so CLOSE doesn't re-throttle
+        clk.advance(3.0)
+        b.acquire("m")      # probe consumed → CLOSE
+        clk.advance(3.0)
+        b.acquire("m")      # clean CLOSED window → backoff reset
+        assert b.snapshot()["backoff_level"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +331,24 @@ class TestInfeasibleLatch:
         b.note_infeasible("big27b")
         clk.advance(121.0)  # past the TTL backstop
         assert b.acquire("big27b").action == "proceed"
+
+    def test_force_release_does_not_re_authorize_latched_infeasible(self) -> None:
+        # NH — force-release DISABLES the velocity brake but must NOT re-authorize
+        # evicting a caller's pin: a latched-infeasible candidate still SHEDS, on
+        # both acquire() and peek(). (A pin evicted by a force-released swap is the
+        # exact storm restart the latch exists to prevent.)
+        clk = FakeClock()
+        b = _brake(clk, min_spacing_seconds=0.0, bucket_capacity=100.0)
+        b.clear_on_residency_delta({"trio_a", "trio_b"})
+        b.note_infeasible("big27b")
+        b.force(release=True, ttl_s=300.0)
+        # A non-latched model is force-released through (brake disabled)...
+        proceed = b.acquire("small")
+        assert proceed.action == "proceed"
+        assert proceed.reason == "force-released"
+        # ...but the latched-infeasible candidate STILL sheds (pin protection holds).
+        assert b.acquire("big27b").action == "shed"
+        assert b.peek("big27b").action == "shed"
 
 
 # ---------------------------------------------------------------------------

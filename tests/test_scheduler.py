@@ -1699,6 +1699,36 @@ class TestAbortProbeWiring:
         assert b._probe_outstanding is False
         assert b.snapshot()["state"] == BrakeState.OPEN
 
+    @pytest.mark.asyncio
+    async def test_failed_dispatch_advances_min_spacing_at_issue(
+        self, sched_config: BrokerConfig,
+    ) -> None:
+        """NH-1 — a load that is ISSUED then FAILS (record_load never fires) must
+        still advance the min-spacing floor at the issue point, so the next swap
+        attempt is spaced rather than retried into an immediate inrush."""
+        cfg = sched_config.model_copy(deep=True)
+        cfg.scheduler.swap_brake = SwapBrakeConfig(min_spacing_seconds=8.0, bucket_capacity=100.0)
+        queue = AffinityQueue(cfg.scheduler)
+        tracker = VRAMTracker(cfg)
+        mgr = VRAMManager(tracker, 32 * 1024 * 1024 * 1024, safety_margin_pct=10.0)
+
+        async def failing_dispatch(request, needs_swap=True) -> None:
+            raise RuntimeError("dispatch failed")  # _dispatch_for_model → returns False
+
+        sched = Scheduler(cfg, queue, tracker, failing_dispatch, vram_manager=mgr)
+        sched._last_swap_time = 0.0
+        assert sched._brake._last_load_t is None  # fresh brake — nothing issued yet
+        queue.enqueue(make_request(model="qwen3:14b"))
+        with patch.object(tracker, "get_loaded_models", AsyncMock(return_value=[])), \
+             patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))), \
+             patch.object(tracker, "log_vram_snapshot", AsyncMock()), \
+             patch.object(tracker, "get_loaded_vram_gb", AsyncMock(return_value=0.0)), \
+             patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=30.0)):
+            result = await sched._handle_swap_dispatch(queue.pick_next(None))
+
+        assert result is False  # dispatch failed, no record_load
+        assert sched._brake._last_load_t is not None  # spacing advanced at issue
+
 
 # ---------------------------------------------------------------------------
 # F-4 — fail-LOUD brake observability is wired (gauges, engage counter, audit)

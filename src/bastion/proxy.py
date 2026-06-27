@@ -102,6 +102,12 @@ class OllamaProxy:
         # continue to serve.  When None, drain has no effect on passthrough.
         self._is_draining_fn: Callable[[], bool] | None = None
 
+        # NH-2 — latch-aware admission. Returns the Retry-After (seconds) for a
+        # model whose swap is latched INFEASIBLE (the pinned resident set overruns
+        # VRAM), else None. Wired by server.py to the swap brake's peek(). When None,
+        # admission is unchanged (doomed requests block until the queue timeout).
+        self._latch_retry_after_fn: Callable[[str], float | None] | None = None
+
         # Circuit breaker for Ollama backend
         cb_config = config.circuit_breaker
         self.circuit_breaker: CircuitBreaker | None = (
@@ -278,6 +284,26 @@ class OllamaProxy:
         queue_wait_seconds = 0.0
 
         if self._enqueue_fn is not None:
+            # NH-2 — model-aware fast-shed: a latched-INFEASIBLE model is provably
+            # unservable until the pinned resident set changes. Return 503 + a
+            # latch-derived Retry-After immediately rather than enqueuing a doomed
+            # request that would only block until the queue timeout (504). Co-resident
+            # / feasible models are never latched, so they pass straight through.
+            if self._latch_retry_after_fn is not None:
+                latch_retry = self._latch_retry_after_fn(model)
+                if latch_retry is not None:
+                    logger.warning(
+                        "Fast-shedding '%s': demand exceeds VRAM capacity (latched "
+                        "infeasible) — 503 Retry-After %.0fs", model, latch_retry,
+                    )
+                    return JSONResponse(
+                        {
+                            "error": f"model '{model}' demand exceeds VRAM capacity",
+                            "reason_code": "swap_brake_shed",
+                        },
+                        status_code=503,
+                        headers={"Retry-After": str(max(1, int(latch_retry) + 1))},
+                    )
             queued = QueuedRequest(
                 model=model,
                 endpoint=path,
@@ -471,7 +497,18 @@ class OllamaProxy:
     async def _handle_passthrough(
         self, request: Request, path: str, body: bytes,
     ) -> StreamingResponse | JSONResponse:
-        """Forward request to Ollama without scheduling."""
+        """Forward request to Ollama without scheduling.
+
+        UNBRAKED PATH NOTE (NH-6): passthrough endpoints bypass the scheduler, the
+        load serializer, AND the swap-velocity brake by design — they are management
+        / observability calls (``/api/tags``, ``/api/ps``, ``/api/show`` …) that do
+        not increase residency, so there is no cold-load inrush to bound. The brake
+        governs only *scheduled* residency-increasing loads (the swap path + both
+        ``/broker/preload`` routes, which all hold the serializer). A request that
+        *would* trigger a cold load must therefore be a SCHEDULED endpoint, never a
+        passthrough one — the funnel regression test guards that any model-loading
+        ``/api/generate`` holds the serializer.
+        """
         # Drain mode: reject anything not in the operator-configured management
         # set.  This catches inference-adjacent endpoints that fall through to
         # passthrough by default (e.g., /api/embeddings plural), while keeping

@@ -154,6 +154,54 @@ class TestSchedulerIntegration:
         assert enqueue_called is True
 
     @pytest.mark.asyncio
+    async def test_latched_model_fast_sheds_503_without_enqueue(self):
+        """NH-2 — a request for a latched-INFEASIBLE model is provably unservable
+        until the pinned resident set changes; fast-shed it with 503 + a latch-
+        derived Retry-After instead of enqueuing it to block until the queue
+        timeout (504)."""
+        enqueue_called = False
+
+        async def fake_enqueue(queued: QueuedRequest):
+            nonlocal enqueue_called
+            enqueue_called = True
+            event = asyncio.Event()
+            event.set()
+            return event, lambda: None, lambda: None
+
+        proxy = OllamaProxy(BrokerConfig(), enqueue_fn=fake_enqueue)
+        proxy._latch_retry_after_fn = lambda model: 4.0 if model == "qwen3:14b" else None
+
+        req = _make_request(body=b'{"model": "qwen3:14b", "prompt": "hi", "stream": false}')
+        resp = await proxy.handle_request(req)
+
+        assert resp.status_code == 503
+        assert int(resp.headers["Retry-After"]) >= 1
+        assert enqueue_called is False  # shed BEFORE enqueue — no doomed queue entry
+
+    @pytest.mark.asyncio
+    async def test_unlatched_model_still_enqueues(self):
+        """A non-latched model is unaffected by the NH-2 fast-shed check."""
+        enqueue_called = False
+
+        async def fake_enqueue(queued: QueuedRequest):
+            nonlocal enqueue_called
+            enqueue_called = True
+            event = asyncio.Event()
+            event.set()
+            return event, lambda: None, lambda: None
+
+        proxy = OllamaProxy(BrokerConfig(), enqueue_fn=fake_enqueue)
+        proxy._latch_retry_after_fn = lambda model: None  # nothing latched
+
+        mock_resp = httpx.Response(200, json={"response": "ok", "done": True},
+                                   request=httpx.Request("POST", "http://mock"))
+        with patch.object(proxy._http, "post", new_callable=AsyncMock, return_value=mock_resp):
+            req = _make_request(body=b'{"model": "qwen3:14b", "prompt": "hi", "stream": false}')
+            await proxy.handle_request(req)
+
+        assert enqueue_called is True
+
+    @pytest.mark.asyncio
     async def test_passthrough_bypasses_scheduler(self):
         """Passthrough endpoints do NOT call enqueue_fn."""
         enqueue_called = False
