@@ -34,6 +34,7 @@ from bastion.models import (
     QueuedRequest,
     SchedulerConfig,
     ServerConfig,
+    SwapBrakeConfig,
 )
 from bastion.proxy import OllamaProxy
 from bastion.queue import AffinityQueue
@@ -246,6 +247,9 @@ def make_config(
             max_queue_size=max_queue_size,
             loop_interval_seconds=loop_interval,
             shutdown_timeout_seconds=5.0,
+            # Brake-neutral so the startup just-swapped seed doesn't space the
+            # first swap past these tests' windows (brake tests: test_swapbrake.py).
+            swap_brake=SwapBrakeConfig(min_spacing_seconds=0.0, bucket_capacity=1_000_000.0),
         ),
         priorities=PriorityConfig(
             interactive=100.0,
@@ -747,10 +751,15 @@ class TestModelJuggling:
 
     @pytest.mark.asyncio
     async def test_cooldown_enforced(self) -> None:
-        """Non-resident model swaps respect cooldown timing."""
-        cooldown = 0.15
+        """Non-resident model swaps respect the brake's min-spacing floor."""
+        spacing = 0.15
         sim = OllamaSimulator(latency=0.05)
-        config = make_config(cooldown=cooldown)
+        config = make_config(cooldown=spacing)
+        # The swap brake's min-spacing floor — not the legacy cooldown — paces
+        # non-resident swaps under the brake architecture. Set it explicitly so
+        # this test verifies the real spacing mechanism (make_config otherwise
+        # defaults to a brake-neutral config for the other serialization tests).
+        config.scheduler.swap_brake = SwapBrakeConfig(min_spacing_seconds=spacing)
 
         async with running_harness(config, sim, all_resident=False) as harness:
             await harness.send_many([
@@ -761,12 +770,12 @@ class TestModelJuggling:
         assert len(sim.records) == 2
         sim.assert_serialized()
 
-        # Gap between first and second request entering the simulator
-        # should be at least cooldown_seconds (with tolerance for timing)
+        # Gap between first and second request entering the simulator should be
+        # at least the brake's min-spacing (with tolerance for timing).
         gap = sim.records[1].start_time - sim.records[0].start_time
-        assert gap >= cooldown - 0.03, (
-            f"Cooldown not enforced: gap={gap:.3f}s, "
-            f"expected >= {cooldown - 0.03:.3f}s"
+        assert gap >= spacing - 0.03, (
+            f"Swap spacing not enforced: gap={gap:.3f}s, "
+            f"expected >= {spacing - 0.03:.3f}s"
         )
 
 

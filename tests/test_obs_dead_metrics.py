@@ -131,13 +131,13 @@ class TestCooldownWaitWiring:
         tracker = VRAMTracker(cfg)
         sched = Scheduler(cfg, queue, tracker, AsyncMock())
 
-        # Current model has no queued work, so the swap path must wait for
-        # cooldown rather than drain the current model.
+        # Current model has no queued work, so the swap path must wait rather
+        # than drain the current model.
         sched._current_model = "mistral-nemo:12b"
-        # Real time baseline so cooldown is genuinely in effect.
-        import time as _time
-
-        sched._last_swap_time = _time.time()
+        # The brake — not the legacy cooldown — now owns swap go/no-go. Seed it
+        # "just swapped" so the min-spacing floor holds the candidate swap; that
+        # stall is the branch that records a cooldown wait.
+        sched.swap_brake.seed_just_swapped()
 
         candidate = _make_request("qwen3:14b")
 
