@@ -356,7 +356,7 @@ def test_preload_post_failure_aborts_orphan_probe(factory, monkeypatch):
         def __init__(self, *_a, **_k) -> None:
             pass
 
-        async def __aenter__(self) -> "_RaisingClient":
+        async def __aenter__(self) -> _RaisingClient:
             return self
 
         async def __aexit__(self, *_a) -> bool:

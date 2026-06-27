@@ -67,11 +67,13 @@ class GPUConfig(BaseModel):
     default_vram_estimate_gb: float = 10.0  # VRAM estimate for unknown models
     nvidia_smi_timeout_seconds: int = 5  # nvidia-smi subprocess timeout
     # F5 — physical-VRAM hardware gate (best-effort cross-check, NOT the crash boundary).
-    hardware_margin_gb: float = 2.0  # nvidia-smi free-VRAM safety margin; raise to 3-4 for multi-monitor GPUs
+    # nvidia-smi free-VRAM safety margin; raise to 3-4 for multi-monitor GPUs.
+    hardware_margin_gb: float = 2.0
     non_ollama_reserve_gb: float = 0.0  # subtract compositor/framebuffer VRAM from the budget
     hardware_gate_fail_mode: Literal["open", "closed_on_swap"] = "closed_on_swap"
     hardware_gate_miss_degrade_after: int = 3  # consecutive cold-swap misses before degrade-to-open
-    # F6 — optional steady-state power headroom trip (0 = disabled; the brake is the transient backstop).
+    # F6 — optional steady-state power headroom trip (0 = disabled; the brake is
+    # the transient backstop).
     power_headroom_pct: float = 0.0
 
     @property
@@ -116,7 +118,7 @@ class SwapBrakeConfig(BaseModel):
     enabled: bool = True               # hard to disable; backstop for fail-open gates
     min_spacing_seconds: float = 8.0   # cold-LOAD floor; 7.5/min instantaneous ceiling
     bucket_capacity: float = 3.0       # burst tolerance (calibrated: safe_burst_depth)
-    refill_per_minute: float = 5.0     # sustained safe velocity (calibrated: safe_swap_rate_per_min)
+    refill_per_minute: float = 5.0     # sustained velocity (calibrated: safe_swap_rate_per_min)
     count_evictions: bool = True       # BASTION-initiated unloads debit a token (2 events/swap)
     cooloff_seconds: float = 30.0      # base OPEN hold
     cooloff_backoff_max_seconds: float = 60.0  # exponential 30→60 cap (forgiving)

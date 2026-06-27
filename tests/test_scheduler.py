@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from bastion import audit
 from bastion.models import (
     BrokerConfig,
     GPUConfig,
@@ -19,18 +20,17 @@ from bastion.models import (
     SchedulerConfig,
     SwapBrakeConfig,
 )
+from bastion.queue import AffinityQueue
+from bastion.scheduler import Scheduler
+from bastion.swapbrake import BrakeDecision, BrakeState, SwapBrake
+from bastion.vram import VRAMManager, VRAMTracker
+from tests.conftest import make_request
 
 # Brake-neutral config for tests that exercise dispatch/swap mechanics rather
 # than the brake itself (the brake's behavior is covered by test_swapbrake.py
 # and the dedicated S2 wiring tests). min-spacing 0 + a huge bucket make the
 # brake non-throttling, so the startup "just-swapped" seed never blocks a swap.
 _NEUTRAL_BRAKE = SwapBrakeConfig(min_spacing_seconds=0.0, bucket_capacity=1_000_000.0)
-from bastion import audit
-from bastion.queue import AffinityQueue
-from bastion.scheduler import Scheduler
-from bastion.swapbrake import BrakeDecision, BrakeState, SwapBrake
-from bastion.vram import VRAMManager, VRAMTracker
-from tests.conftest import make_request
 
 
 def _noop_has_inflight(model: str) -> bool:
@@ -268,7 +268,9 @@ class TestGPUGatingMidSwap:
                  new_callable=AsyncMock, return_value=(True, "OK"),
              ), \
              patch.object(tracker, "log_vram_snapshot", new_callable=AsyncMock), \
-             patch.object(tracker, "get_loaded_vram_gb", new_callable=AsyncMock, return_value=0.0), \
+             patch.object(
+                 tracker, "get_loaded_vram_gb", new_callable=AsyncMock, return_value=0.0
+             ), \
              patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=24.0)):
             # F-2 — supply a plausible free-VRAM reading so the cold-swap reserve
             # (is_swap=True) actually SUCCEEDS; otherwise it would fail closed before
@@ -1691,9 +1693,9 @@ class TestAbortProbeWiring:
              patch("bastion.scheduler.check_gpu_safe", AsyncMock(return_value=(True, "OK"))), \
              patch.object(tracker, "log_vram_snapshot", AsyncMock()), \
              patch.object(tracker, "get_loaded_vram_gb", AsyncMock(return_value=0.0)), \
-             patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=30.0)):
-            with pytest.raises(RuntimeError, match="boom after acquire"):
-                await sched._handle_swap_dispatch(queue.pick_next(None))
+             patch("bastion.vram.get_vram_free_gb", AsyncMock(return_value=30.0)), \
+             pytest.raises(RuntimeError, match="boom after acquire"):
+            await sched._handle_swap_dispatch(queue.pick_next(None))
 
         # The except branch must abort the orphaned probe before re-raising.
         assert b._probe_outstanding is False

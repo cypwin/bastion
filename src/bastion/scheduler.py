@@ -724,10 +724,9 @@ class Scheduler:
         # the pinned-VRAM pressure even on a tick with no edge. pinned_vram_gb is a
         # config-estimate sum over the detected pin set (the authoritative live-size
         # value is fused onto /broker/status by the server's brake snapshot embed).
-        try:
+        # unknown state string — skip rather than crash the loop
+        with contextlib.suppress(ValueError):
             update_swap_brake_state(BrakeState(state).gauge_value)
-        except ValueError:
-            pass  # unknown state string — skip rather than crash the loop
         pinned_gb = sum(self._candidate_vram_gb(m) for m in self.vram._pinned)
         # Single-GPU deployments use gpu_index="0" (matches vram.py's ledger gauges).
         update_pinned_vram_gb(gpu_index="0", gb=pinned_gb)

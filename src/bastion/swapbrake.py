@@ -134,7 +134,10 @@ class SwapBrake:
     def _effective_tokens(self, now: float) -> float:
         """Read-only token estimate (for peek/snapshot) — does NOT mutate state."""
         elapsed = max(0.0, now - self._last_refill_t)
-        return min(float(self._cfg.bucket_capacity), self._tokens + elapsed * self._refill_rate_per_sec())
+        return min(
+            float(self._cfg.bucket_capacity),
+            self._tokens + elapsed * self._refill_rate_per_sec(),
+        )
 
     def _prune_window(self, now: float) -> None:
         while self._window and (now - self._window[0]) > _WINDOW_SECONDS:
@@ -218,7 +221,9 @@ class SwapBrake:
     def _latch_retry_after(self, now: float, model: str) -> float:
         return max(0.0, self._infeasible.get(model, now) - now)
 
-    def _dec(self, action: Literal["proceed", "stall", "shed"], reason: str, retry: float) -> BrakeDecision:
+    def _dec(
+        self, action: Literal["proceed", "stall", "shed"], reason: str, retry: float
+    ) -> BrakeDecision:
         return BrakeDecision(action=action, reason=reason, retry_after_s=retry)
 
     def _throttle_or_reopen(self, now: float, allow_proceed: bool) -> BrakeDecision:
@@ -320,7 +325,9 @@ class SwapBrake:
         if forced_release:
             return self._dec("proceed", "force-released", 0.0)
         if self._state == BrakeState.OPEN and now < self._brake_until:
-            return self._dec("stall", "swap brake OPEN (cooloff)", max(0.0, self._brake_until - now))
+            return self._dec(
+                "stall", "swap brake OPEN (cooloff)", max(0.0, self._brake_until - now)
+            )
         if not self._spacing_ok(now):
             return self._dec("stall", "min-spacing", self._spacing_remaining(now))
         if self._effective_tokens(now) < 1.0:
@@ -387,7 +394,8 @@ class SwapBrake:
     def note_infeasible(self, model: str) -> None:
         """Latch a candidate whose load would require evicting an externally pinned model."""
         now = self._clock()
-        self._infeasible[model] = now + self._cfg.infeasible_window_seconds  # monotonic TTL backstop
+        # monotonic TTL backstop
+        self._infeasible[model] = now + self._cfg.infeasible_window_seconds
         self._latch_baseline[model] = self._last_resident or frozenset()
 
     def clear_on_residency_delta(self, resident: set[str]) -> None:
@@ -411,7 +419,8 @@ class SwapBrake:
         self._hw_degraded = blind
 
     def set_drain(self, active: bool) -> None:
-        """Hold brake state during drain — a drain-induced zero rate must not read as 'storm over'."""
+        """Hold brake state during drain (a drain-induced zero rate must not read
+        as 'storm over')."""
         self._drain_active = active
 
     def force(self, release: bool, ttl_s: float) -> None:
@@ -442,17 +451,23 @@ class SwapBrake:
         return {
             "state": self._state,
             "reason": self._state.value,
-            "cooloff_remaining_s": max(0.0, self._brake_until - now) if self._state == BrakeState.OPEN else 0.0,
+            "cooloff_remaining_s": (
+                max(0.0, self._brake_until - now) if self._state == BrakeState.OPEN else 0.0
+            ),
             "windowed_rate_per_min": self._windowed_rate_per_min(now),
             "backoff_level": self._backoff_level,
             "tokens": round(self._effective_tokens(now), 4),
             "hardware_gate_blind": self._hw_degraded,
             "drain_active": self._drain_active,
             "latched": sorted(m for m, ttl in self._infeasible.items() if now < ttl),
-            "force_release_active": bool(self._force_release_until and now < self._force_release_until),
+            "force_release_active": bool(
+                self._force_release_until and now < self._force_release_until
+            ),
             "force_release_remaining_s": (
                 max(0.0, self._force_release_until - now)
                 if (self._force_release_until and now < self._force_release_until) else 0.0
             ),
-            "force_engage_active": bool(self._force_engage_until and now < self._force_engage_until),
+            "force_engage_active": bool(
+                self._force_engage_until and now < self._force_engage_until
+            ),
         }

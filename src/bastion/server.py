@@ -1859,7 +1859,9 @@ async def _funnel_preload(request: Request, config: BrokerConfig) -> Any:
             # while we awaited the semaphore (the fit TOCTOU the spec calls out).
             can_load, reason = await _vram_tracker.can_load_model(model)
             if not can_load:
-                return JSONResponse({"error": reason, "reason_code": "vram_no_fit"}, status_code=409)
+                return JSONResponse(
+                    {"error": reason, "reason_code": "vram_no_fit"}, status_code=409
+                )
 
             # NH-1 — stamp the min-spacing floor at the issue point so a load that
             # is issued then fails (POST raises) still spaces the next attempt.

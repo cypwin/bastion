@@ -318,7 +318,9 @@ class TestInfeasibleLatch:
 
     def test_latch_never_clears_on_pure_time(self) -> None:
         clk = FakeClock()
-        b = _brake(clk, min_spacing_seconds=0.0, bucket_capacity=100.0, infeasible_window_seconds=120.0)
+        b = _brake(
+            clk, min_spacing_seconds=0.0, bucket_capacity=100.0, infeasible_window_seconds=120.0
+        )
         b.clear_on_residency_delta({"trio_a"})
         b.note_infeasible("big27b")
         clk.advance(60.0)  # time passes, no residency delta
@@ -326,7 +328,9 @@ class TestInfeasibleLatch:
 
     def test_latch_ttl_backstop_clears(self) -> None:
         clk = FakeClock()
-        b = _brake(clk, min_spacing_seconds=0.0, bucket_capacity=100.0, infeasible_window_seconds=120.0)
+        b = _brake(
+            clk, min_spacing_seconds=0.0, bucket_capacity=100.0, infeasible_window_seconds=120.0
+        )
         b.clear_on_residency_delta({"trio_a"})
         b.note_infeasible("big27b")
         clk.advance(121.0)  # past the TTL backstop
