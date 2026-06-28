@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bastion-broker"
-version = "0.5.0a2"
+version = "0.5.0a3"
 description = "Batch Affinity Scheduler for Throttled Inference on Ollama Networks"
 readme = "README.md"
 license = "MIT"
@@ -82,6 +82,12 @@ exclude = [
   "/tmp",
   "/.worktrees",
   "/constraints.txt",
+  # Git lock / worktree pointers — never part of the package. (Under the bwrap
+  # sandbox these are bind-mounted to /dev/null and surface as character-special
+  # files, which the sdist tar filter rejects; excluding them keeps the build
+  # robust whether or not the sandbox is active.)
+  "/config.lock",
+  "/config.worktree",
 ]
 
 [tool.pytest.ini_options]

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import logging
 import os
@@ -1614,6 +1615,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     # continue to serve).
     if _proxy is not None:
         _proxy._is_draining_fn = lambda: _scheduler is not None and _scheduler.is_draining
+        # NH-2 — wire latch-aware admission: the proxy fast-sheds inference requests
+        # for a model whose swap is latched infeasible, instead of queuing doomed work.
+        _proxy._latch_retry_after_fn = _swap_brake_latch_retry_after
     _start_time = time.time()
     _reset_epoch = datetime.now(UTC).isoformat()
 
@@ -1769,6 +1773,243 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         await _vram_tracker.close()
 
 
+def _find_rate_limiter(app: Any) -> RateLimitMiddleware | None:
+    """Walk the built ASGI middleware stack and return the rate limiter.
+
+    The shed path needs the live :class:`RateLimitMiddleware` instance to
+    drain the offending caller's bucket (admission coupling). ``add_middleware``
+    does not hand back the instance, so we locate it by walking the
+    ``middleware_stack`` chain (each node exposes its inner app via ``.app``).
+    """
+    node = getattr(app, "middleware_stack", None)
+    for _ in range(64):  # bounded — the stack is short; never loop forever
+        if node is None:
+            break
+        if isinstance(node, RateLimitMiddleware):
+            return node
+        node = getattr(node, "app", None)
+    return None
+
+
+async def _funnel_preload(request: Request, config: BrokerConfig) -> Any:
+    """Shared body for BOTH ``/broker/preload`` routes (SRV1).
+
+    The admin preload is a residency-INCREASING load path and must therefore
+    pass through the SAME non-skippable chokepoint as the scheduler swap:
+    the scheduler-owned load serializer, with the swap brake's authoritative
+    ``acquire()`` + ``record_load()`` running INSIDE it. A direct
+    ``keep_alive:-1`` load that bypassed the serializer would be exactly the
+    unbounded swap-velocity hole the brake exists to close.
+    """
+    body = await request.json()
+    model = body.get("model")
+    if not model:
+        return JSONResponse({"error": "Missing 'model' field"}, status_code=400)
+
+    if not _vram_tracker:
+        return JSONResponse({"error": "VRAM tracker not initialized"}, status_code=503)
+
+    # None-guard: the serializer + brake live on the scheduler. Without it we
+    # MUST shed (503) rather than fall through to a direct, ungated load.
+    if _scheduler is None:
+        return JSONResponse(
+            {"error": "Scheduler not initialized", "reason_code": "scheduler_unavailable"},
+            status_code=503,
+        )
+
+    # Cheap pre-check before queueing on the serializer (fail fast on no-fit).
+    can_load, reason = await _vram_tracker.can_load_model(model)
+    if not can_load:
+        return JSONResponse({"error": reason, "reason_code": "vram_no_fit"}, status_code=409)
+
+    brake = _scheduler.swap_brake
+
+    # THE single chokepoint: hold the load serializer across gate + load.
+    async with _scheduler.load_serializer:
+        # Authoritative brake gate INSIDE the serializer (closes the TOCTOU:
+        # only one task holds the serializer, so its record_load wins the race).
+        decision = brake.acquire(model)
+        if decision.action != "proceed":
+            # Admission coupling: throttle this caller so a client that ignores
+            # Retry-After (the stress calibrator will) cannot hot-retry the
+            # shed path into a CPU busy-loop.
+            limiter = _find_rate_limiter(request.app)
+            if limiter is not None:
+                caller = limiter._get_client_ip(request)
+                limiter.throttle(caller, model)
+            retry_after = max(1, int(decision.retry_after_s) + 1)
+            return JSONResponse(
+                {
+                    "error": f"swap brake {decision.action}: {decision.reason}",
+                    "reason_code": f"swap_brake_{decision.action}",
+                },
+                status_code=503,
+                headers={"Retry-After": str(retry_after)},
+            )
+
+        # F-1 — acquire() above may have granted the single HALF_OPEN probe
+        # (this funnel is the SECOND acquire() site on the shared brake). If the
+        # load then fails to record (no-fit re-check returns 409, or the cold-load
+        # POST raises), the orphaned probe would wedge the brake at "half-open probe
+        # in flight" forever — bricking ALL scheduler swaps AND preloads until
+        # restart/force-release. Abort the probe on every exit that does not record.
+        loaded_ok = False
+        try:
+            # Re-check fit INSIDE the serializer — another load may have landed
+            # while we awaited the semaphore (the fit TOCTOU the spec calls out).
+            can_load, reason = await _vram_tracker.can_load_model(model)
+            if not can_load:
+                return JSONResponse(
+                    {"error": reason, "reason_code": "vram_no_fit"}, status_code=409
+                )
+
+            # NH-1 — stamp the min-spacing floor at the issue point so a load that
+            # is issued then fails (POST raises) still spaces the next attempt.
+            brake.note_load_issued(model)
+            # Trigger the cold load via a minimal generate request.
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                await client.post(
+                    f"{config.ollama.base_url}/api/generate",
+                    json={
+                        "model": model,
+                        "prompt": "",
+                        "keep_alive": -1,  # Keep loaded indefinitely
+                        "options": {"use_mmap": False},
+                    },
+                )
+            # Debit the brake token at the true GPU-I/O point.
+            brake.record_load(model)
+            loaded_ok = True
+        finally:
+            if not loaded_ok:
+                # No-op unless a probe is genuinely outstanding (record_load above
+                # already cleared it on the success path); re-OPENs an orphaned probe.
+                brake.abort_probe()
+
+    return {"status": "loaded", "model": model}
+
+
+def _embed_brake_snapshot(result: dict[str, Any], loaded: list[Any]) -> None:
+    """Embed the swap-brake snapshot into a ``/broker/status`` result dict (SRV2).
+
+    Populates the ``BrokerStatus`` brake fields (3am visibility). ``pinned_*``
+    are fused from the VRAM tracker's pin set and the already-fetched loaded
+    model list, so no extra GPU query is incurred.
+    """
+    if _scheduler is None:
+        return
+    snap = _scheduler.swap_brake.snapshot()
+    result["brake_state"] = str(snap["state"])
+    result["brake_reason"] = snap["reason"]
+    result["cooloff_remaining_s"] = snap["cooloff_remaining_s"]
+    result["windowed_rate_per_min"] = snap["windowed_rate_per_min"]
+    result["backoff_level"] = snap["backoff_level"]
+    # F5 — force-release visibility: the backstop is OFF while active, so surface
+    # it (and how long it stays off) on /broker/status, not just on the gauge.
+    result["force_release_active"] = snap["force_release_active"]
+    result["force_release_remaining_s"] = snap["force_release_remaining_s"]
+    # The VRAMManager hardware gate is the authoritative blind signal; fall
+    # back to the brake's own degraded flag when the manager is absent.
+    if _vram_manager is not None:
+        result["hardware_gate_blind"] = _vram_manager.hardware_gate_blind
+    else:
+        result["hardware_gate_blind"] = snap["hardware_gate_blind"]
+
+    pinned = sorted(_vram_tracker._pinned) if _vram_tracker is not None else []
+    result["pinned_models"] = pinned
+    pinned_set = set(pinned)
+    result["pinned_vram_gb"] = round(
+        sum(getattr(m, "vram_gb", 0.0) for m in loaded if getattr(m, "name", None) in pinned_set),
+        3,
+    )
+
+
+def _swap_brake_latch_retry_after(model: str) -> float | None:
+    """NH-2 — Retry-After (seconds) for a model whose swap is latched INFEASIBLE,
+    else None. The proxy uses this to fast-shed doomed inference requests at
+    admission with a latch-authoritative Retry-After (not a token-refill estimate).
+    Uses the side-effect-free ``peek`` so admission never mutates brake state."""
+    if _scheduler is None:
+        return None
+    decision = _scheduler.swap_brake.peek(model)
+    return decision.retry_after_s if decision.action == "shed" else None
+
+
+def _peer_is_loopback(request: Request) -> bool:
+    """True when the request's SOCKET peer is loopback (ignores X-Forwarded-For,
+    which is client-spoofable — the loopback gate must trust the real peer only)."""
+    host = request.client.host if request.client else None
+    if not host:
+        return False
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
+
+
+async def _force_swap_brake(request: Request) -> Any:
+    """Shared body for BOTH ``POST /broker/swap-brake`` admin routes (SRV2).
+
+    Maps ``{release: bool, ttl_s: float}`` to ``SwapBrake.force`` — an
+    auto-expiring override (force-release cannot be silently left on). Separate
+    from ``/drain``. Emits exactly one audit event per engage/release.
+    """
+    if _scheduler is None:
+        return JSONResponse({"error": "Scheduler not initialized"}, status_code=503)
+    body = await request.json()
+    release = bool(body.get("release", False))
+    try:
+        ttl_s = float(body.get("ttl_s", 0.0))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "ttl_s must be a number"}, status_code=400)
+    if ttl_s < 0:
+        return JSONResponse({"error": "ttl_s must be >= 0"}, status_code=400)
+
+    # NH-5 — force-RELEASE disarms the crash backstop. When admin auth is not
+    # actually ENFORCED, restrict it to a loopback peer so a remote caller cannot
+    # silently disable the velocity brake. Auth is enforced only when enabled AND a
+    # key is configured: make_admin_key_dependency passes through when api_keys is
+    # empty, so keying on enabled alone would leave the realistic enabled-but-no-keys
+    # misconfig wide open. A missing _config also requires loopback (fail safe).
+    # Force-ENGAGE keeps the brake ON (fails safe) and is intentionally not gated.
+    auth_enforced = bool(_config and _config.auth.enabled and _config.auth.api_keys)
+    if release and not auth_enforced and not _peer_is_loopback(request):
+        host = request.client.host if request.client else "unknown"
+        logger.warning(
+            "Refused remote force-release from %s on an unauthenticated admin "
+            "surface — enable auth or issue it from loopback.", host,
+        )
+        audit.emit("swap_brake_release_refused_remote", {"client": host})
+        return JSONResponse(
+            {
+                "error": "force-release requires loopback or enabled auth",
+                "reason_code": "force_release_forbidden",
+            },
+            status_code=403,
+        )
+
+    brake = _scheduler.swap_brake
+    # F5 — clamp a force-RELEASE ttl to the configured cap so the velocity backstop
+    # can NEVER be silently left disabled by an unbounded ttl_s; emit a LOUD audit
+    # whenever we clamp so the override (and its reduction) is visible. Force-engage
+    # keeps the brake ON (fails safe) and is therefore not capped.
+    if release and _config is not None:
+        cap = _config.scheduler.swap_brake.force_release_max_ttl_seconds
+        if ttl_s > cap:
+            logger.warning(
+                "Force-release ttl_s=%.1f exceeds the %.1fs cap — clamping so the "
+                "swap-brake backstop cannot be silently disabled.", ttl_s, cap,
+            )
+            audit.emit("swap_brake_override_clamped", {
+                "requested_ttl_s": ttl_s, "clamped_ttl_s": cap,
+            })
+            ttl_s = cap
+    brake.force(release=release, ttl_s=ttl_s)
+    action = "force_release" if release else "force_engage"
+    audit.emit("swap_brake_override", {"action": action, "ttl_s": ttl_s})
+    return {"status": action, "ttl_s": ttl_s, "snapshot": brake.snapshot()}
+
+
 def create_app(config: BrokerConfig) -> FastAPI:
     """Create and configure the FastAPI application."""
     global _config
@@ -1882,6 +2123,9 @@ def create_app(config: BrokerConfig) -> FastAPI:
         # Recent audit events for AuditStreamPanel
         result["recent_audit_events"] = audit.recent_events(10)
 
+        # SRV2: swap-velocity brake snapshot (3am visibility).
+        _embed_brake_snapshot(result, loaded)
+
         return result
 
     @broker_router.get("/queue")
@@ -1967,31 +2211,8 @@ def create_app(config: BrokerConfig) -> FastAPI:
 
     @broker_router.post("/preload")
     async def broker_preload(request: Request):
-        """Pre-load a model into VRAM."""
-        body = await request.json()
-        model = body.get("model")
-        if not model:
-            return JSONResponse({"error": "Missing 'model' field"}, status_code=400)
-
-        if not _vram_tracker:
-            return JSONResponse({"error": "VRAM tracker not initialized"}, status_code=503)
-
-        can_load, reason = await _vram_tracker.can_load_model(model)
-        if not can_load:
-            return JSONResponse({"error": reason}, status_code=409)
-
-        # Trigger model load via a minimal generate request
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            await client.post(
-                f"{config.ollama.base_url}/api/generate",
-                json={
-                    "model": model,
-                    "prompt": "",
-                    "keep_alive": -1,  # Keep loaded indefinitely
-                    "options": {"use_mmap": False},
-                },
-            )
-        return {"status": "loaded", "model": model}
+        """Pre-load a model into VRAM (funnelled through the brake + serializer)."""
+        return await _funnel_preload(request, config)
 
     @broker_router.post("/unload")
     async def broker_unload(request: Request):
@@ -2038,6 +2259,16 @@ def create_app(config: BrokerConfig) -> FastAPI:
             await _scheduler.resume()
             return {"status": "running"}
         return JSONResponse({"error": "Scheduler not initialized"}, status_code=503)
+
+    @broker_router.post("/swap-brake")
+    async def broker_swap_brake(request: Request):
+        """Auto-expiring admin override of the swap-velocity brake (SRV2).
+
+        Body ``{release: bool, ttl_s: float}`` -> ``SwapBrake.force``. Separate
+        from ``/drain``; force-release expires after ``ttl_s`` so the crash
+        backstop can never be silently left off.
+        """
+        return await _force_swap_brake(request)
 
     @broker_router.get("/metrics")
     async def broker_metrics():
@@ -2762,6 +2993,9 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
         # Recent audit events for AuditStreamPanel
         result["recent_audit_events"] = audit.recent_events(10)
 
+        # SRV2: swap-velocity brake snapshot (3am visibility).
+        _embed_brake_snapshot(result, loaded)
+
         return result
 
     @broker_router.get("/queue")
@@ -2833,27 +3067,8 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
 
     @broker_router.post("/preload")
     async def broker_preload(request: Request):
-        """Pre-load a model into VRAM."""
-        body = await request.json()
-        model = body.get("model")
-        if not model:
-            return JSONResponse({"error": "Missing 'model' field"}, status_code=400)
-        if not _vram_tracker:
-            return JSONResponse({"error": "VRAM tracker not initialized"}, status_code=503)
-        can_load, reason = await _vram_tracker.can_load_model(model)
-        if not can_load:
-            return JSONResponse({"error": reason}, status_code=409)
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            await client.post(
-                f"{config.ollama.base_url}/api/generate",
-                json={
-                    "model": model,
-                    "prompt": "",
-                    "keep_alive": -1,
-                    "options": {"use_mmap": False},
-                },
-            )
-        return {"status": "loaded", "model": model}
+        """Pre-load a model into VRAM (funnelled through the brake + serializer)."""
+        return await _funnel_preload(request, config)
 
     @broker_router.post("/unload")
     async def broker_unload(request: Request):
@@ -2899,6 +3114,11 @@ def create_admin_app(config: BrokerConfig) -> FastAPI:
             await _scheduler.resume()
             return {"status": "running"}
         return JSONResponse({"error": "Scheduler not initialized"}, status_code=503)
+
+    @broker_router.post("/swap-brake")
+    async def broker_swap_brake(request: Request):
+        """Auto-expiring admin override of the swap-velocity brake (admin app, SRV2)."""
+        return await _force_swap_brake(request)
 
     @broker_router.get("/metrics")
     async def broker_metrics():

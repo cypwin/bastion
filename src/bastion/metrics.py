@@ -294,6 +294,74 @@ THERMAL_HEADROOM_CELSIUS = Gauge(
 )
 
 # ---------------------------------------------------------------------------
+# Swap-velocity circuit breaker (swap brake) — additive gauges/counters
+# (swap-velocity circuit breaker design, spec Section "Observability")
+# ---------------------------------------------------------------------------
+
+# NET-NEW objects (NOT activations of frozen schema). The swap brake is a
+# token-bucket rate limiter on model transitions; these meter its state for
+# Prometheus. All are deliberately LABEL-LESS except PINNED_VRAM_GB, which
+# carries the single bounded ``gpu_index`` label (multi-GPU is a non-breaking
+# future extension; single-GPU deployments emit gpu_index="0").
+
+# Current brake state as a numeric enum, severity-ASCENDING (higher = more
+# engaged): 0=closed, 1=throttled, 2=half_open, 3=open. Pure gauge — the
+# human-readable state name stays on the JSON / TUI surfaces only.
+SWAP_BRAKE_STATE = Gauge(
+    "bastion_swap_brake_state",
+    "Current swap-brake state, severity-ascending (0=closed 1=throttled 2=half_open 3=open)",
+)
+
+# Rising-edge counter: incremented each time the brake transitions into the
+# engaged (blocking) state. Label-less by design.
+SWAP_BRAKE_ENGAGED_TOTAL = Counter(
+    "bastion_swap_brake_engaged_total",
+    "Cumulative count of swap-brake engagements (transitions into blocking)",
+)
+
+# 1 while a force-RELEASE admin override is active (the backstop is DISABLED),
+# else 0. Held high for the override window so the disabled state is visible on a
+# dashboard, not just at the moment the override is issued (F5). Pure gauge.
+SWAP_BRAKE_FORCE_ACTIVE = Gauge(
+    "bastion_swap_brake_force_active",
+    "1 while a force-release override has the swap brake disabled, else 0",
+)
+
+# Windowed model-swap rate in swaps/min, as measured by the brake. Pure gauge.
+SWAP_RATE_PER_MIN = Gauge(
+    "bastion_swap_rate_per_min",
+    "Windowed model-swap rate in swaps per minute as measured by the swap brake",
+)
+
+# VRAM held by pinned/latched models, in GB. Single bounded ``gpu_index`` label
+# so multi-GPU is a non-breaking future extension; single-GPU emits "0".
+PINNED_VRAM_GB = Gauge(
+    "bastion_pinned_vram_gb",
+    "VRAM held by pinned (latched) models in gigabytes",
+    labelnames=["gpu_index"],
+)
+
+# Rising-edge counter: incremented when the hardware safety gate cannot read
+# GPU telemetry (StubBackend / non-NVIDIA / nvidia-smi failure) and is therefore
+# "blind". Label-less by design.
+HARDWARE_GATE_BLIND_TOTAL = Counter(
+    "bastion_hardware_gate_blind_total",
+    "Cumulative count of hardware-gate evaluations made while blind to GPU telemetry",
+)
+
+# Instantaneous GPU power draw in watts. Pure gauge.
+GPU_POWER_WATTS = Gauge(
+    "bastion_gpu_power_watts",
+    "Instantaneous GPU power draw in watts",
+)
+
+# GPU power cap / enforced limit in watts. Pure gauge.
+GPU_POWER_CAP_WATTS = Gauge(
+    "bastion_gpu_power_cap_watts",
+    "GPU power cap (enforced power limit) in watts",
+)
+
+# ---------------------------------------------------------------------------
 # A2A task lifecycle metrics
 # ---------------------------------------------------------------------------
 
@@ -543,6 +611,98 @@ def record_model_swap_duration(model: str, duration: float) -> None:
     MODEL_SWAP_DURATION.labels(model=model).observe(duration)
 
 
+# ---------------------------------------------------------------------------
+# Swap-brake helpers (swap-velocity circuit breaker design)
+# ---------------------------------------------------------------------------
+
+def update_swap_brake_state(state: float) -> None:
+    """Update the swap-brake state gauge.
+
+    Parameters
+    ----------
+    state : float
+        Numeric brake state enum (0=open, 1=cooling, 2=engaged). The caller
+        maps the human-readable state name to this numeric value; the name
+        itself stays on the JSON / TUI surfaces only.
+    """
+    SWAP_BRAKE_STATE.set(state)
+
+
+def record_swap_brake_engaged() -> None:
+    """Record that the swap brake transitioned into the engaged (blocking) state."""
+    SWAP_BRAKE_ENGAGED_TOTAL.inc()
+
+
+def update_swap_brake_force_active(active: float) -> None:
+    """Update the force-release gauge — 1.0 while the backstop is admin-disabled.
+
+    Parameters
+    ----------
+    active : float
+        ``1.0`` while a force-release override is active (brake DISABLED), else
+        ``0.0``. Pushed each tick so the disabled window is visible on a dashboard.
+    """
+    SWAP_BRAKE_FORCE_ACTIVE.set(active)
+
+
+def update_swap_rate_per_min(rate: float) -> None:
+    """Update the windowed model-swap-rate gauge.
+
+    Parameters
+    ----------
+    rate : float
+        Windowed model-swap rate in swaps per minute as measured by the brake.
+    """
+    SWAP_RATE_PER_MIN.set(rate)
+
+
+def update_pinned_vram_gb(gpu_index: str, gb: float) -> None:
+    """Update the per-GPU pinned-VRAM gauge.
+
+    Single-GPU deployments use ``gpu_index="0"``.
+
+    Parameters
+    ----------
+    gpu_index : str
+        GPU identifier (string form so it round-trips through Prometheus labels).
+    gb : float
+        VRAM held by pinned (latched) models in gigabytes.
+    """
+    PINNED_VRAM_GB.labels(gpu_index=gpu_index).set(gb)
+
+
+def record_hardware_gate_blind() -> None:
+    """Record a hardware-gate evaluation made while blind to GPU telemetry.
+
+    Incremented when the hardware safety gate cannot read GPU telemetry
+    (StubBackend / non-NVIDIA / nvidia-smi failure). Label-less by design.
+    """
+    HARDWARE_GATE_BLIND_TOTAL.inc()
+
+
+def update_gpu_power_watts(watts: float) -> None:
+    """Update the GPU power-draw gauge.
+
+    Parameters
+    ----------
+    watts : float
+        Instantaneous GPU power draw in watts. The caller MUST guard this on a
+        not-None reading (StubBackend / non-NVIDIA reports no power draw).
+    """
+    GPU_POWER_WATTS.set(watts)
+
+
+def update_gpu_power_cap_watts(watts: float) -> None:
+    """Update the GPU power-cap gauge.
+
+    Parameters
+    ----------
+    watts : float
+        GPU power cap (enforced power limit) in watts.
+    """
+    GPU_POWER_CAP_WATTS.set(watts)
+
+
 def record_vram_reconcile_stale(count: int = 1) -> None:
     """Count stale ledger allocations dropped during ``reconcile()``.
 
@@ -785,6 +945,15 @@ __all__ = [
     "VRAM_USED_MB",
     "THRASHING_DETECTOR_HALT_TOTAL",
     "CONCURRENT_REQUESTS_ACTIVE",
+    # Swap-velocity circuit breaker (swap brake) — additive
+    "SWAP_BRAKE_STATE",
+    "SWAP_BRAKE_ENGAGED_TOTAL",
+    "SWAP_BRAKE_FORCE_ACTIVE",
+    "SWAP_RATE_PER_MIN",
+    "PINNED_VRAM_GB",
+    "HARDWARE_GATE_BLIND_TOTAL",
+    "GPU_POWER_WATTS",
+    "GPU_POWER_CAP_WATTS",
     # A2A metrics
     "A2A_TASKS_TOTAL",
     "A2A_ERRORS_TOTAL",
@@ -806,6 +975,15 @@ __all__ = [
     "record_vram_reconcile_stale",
     "record_vram_reconcile_import",
     "update_vram_ledger_drift",
+    # Swap-brake helpers (swap-velocity circuit breaker design)
+    "update_swap_brake_state",
+    "record_swap_brake_engaged",
+    "update_swap_brake_force_active",
+    "update_swap_rate_per_min",
+    "update_pinned_vram_gb",
+    "record_hardware_gate_blind",
+    "update_gpu_power_watts",
+    "update_gpu_power_cap_watts",
     # Correlation-engine helpers (observability expansion, spec 6.3/6.4/6.5)
     "update_risk_index",
     "record_risk_dominant_factor",

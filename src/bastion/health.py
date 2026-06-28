@@ -12,7 +12,11 @@ from __future__ import annotations
 import logging
 
 from bastion.gpu import get_backend
-from bastion.metrics import update_gpu_temperature
+from bastion.metrics import (
+    update_gpu_power_cap_watts,
+    update_gpu_power_watts,
+    update_gpu_temperature,
+)
 from bastion.models import GPUConfig, GPUStatus
 
 logger = logging.getLogger(__name__)
@@ -44,6 +48,15 @@ async def check_gpu_safe(config: GPUConfig) -> tuple[bool, str]:
     # emitting a misleading 0.
     if status.temperature_c is not None:
         update_gpu_temperature(status.temperature_c)
+
+    # Power telemetry (spec F6): the ms-scale inrush is unobservable in-band, so
+    # no new sensor or faster polling — min_spacing is the mitigation. We simply
+    # surface the already-fetched power draw, guarded on not-None so
+    # StubBackend / non-NVIDIA hosts skip the gauge rather than emitting a
+    # misleading 0. The cap is a static config value, always publishable.
+    if status.power_draw_watts is not None:
+        update_gpu_power_watts(status.power_draw_watts)
+    update_gpu_power_cap_watts(config.max_power_watts)
 
     if status.temperature_c is not None and status.temperature_c > config.max_temperature_c:
         return False, (

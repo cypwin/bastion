@@ -231,16 +231,30 @@ async def swap_ramp_phase(
     thermal_ceiling: int,
     thermal_cutoff_pct: float = 0.90,
     test_prompt: str = "Say hello.",
+    min_spacing_s: float = 8.0,
 ) -> PhaseResult:
     """Phase 3: Alternate models at decreasing intervals.
 
     Ramps swap frequency: 10s -> 8s -> 6s -> 4s -> 2s gaps.
     Stops when thermal threshold or swap failure occurs.
+
+    The ramp is paced with the swap-brake ``min_spacing_seconds`` floor
+    respected -- the calibrator never issues cold loads faster than
+    ``min_spacing_s`` apart, so it cannot itself drive the GPU into the
+    inrush crash zone while probing thermal response.
+
+    Tracks the last-known-safe burst depth (count of back-to-back swaps
+    tolerated without instability) and, on the FIRST sign of instability,
+    reports that last-known-safe value -- never the depth at which the GPU
+    became unstable. Calibration consumers map it to
+    ``swap_brake.bucket_capacity``.
     """
     intervals = [10, 8, 6, 4, 2]
     swaps_per_interval = 3
     cutoff_temp = int(thermal_ceiling * thermal_cutoff_pct)
     last_safe_rate: int | None = None
+    last_safe_burst: int | None = None
+    consecutive_swaps = 0
     swap_durations: list[float] = []
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
@@ -269,6 +283,7 @@ async def swap_ramp_phase(
                         break
 
                     swap_durations.append(t1 - t0)
+                    consecutive_swaps += 1
 
                 except Exception:
                     interval_ok = False
@@ -286,6 +301,7 @@ async def swap_ramp_phase(
                         success=True,
                         data={
                             "safe_swap_rate_per_min": last_safe_rate or rate_per_min,
+                            "safe_burst_depth": last_safe_burst or 1,
                             "stopped_at_interval_s": interval,
                             "stop_reason": (
                                 f"thermal cutoff ({status.temperature_c}C "
@@ -295,8 +311,9 @@ async def swap_ramp_phase(
                         },
                     )
 
-                if interval > 2:
-                    await asyncio.sleep(interval)
+                # Respect the min-spacing floor: never swap faster than the
+                # brake would allow, even at the tightest ramp intervals.
+                await asyncio.sleep(max(interval, min_spacing_s))
 
             if not interval_ok:
                 avg_swap = (
@@ -308,13 +325,16 @@ async def swap_ramp_phase(
                     success=True,
                     data={
                         "safe_swap_rate_per_min": last_safe_rate or 3,
+                        "safe_burst_depth": last_safe_burst or 1,
                         "stopped_at_interval_s": interval,
                         "stop_reason": "swap failed or errored",
                         "swap_duration_avg_s": avg_swap,
                     },
                 )
 
+            # Interval cleared cleanly -> promote last-known-safe markers.
             last_safe_rate = rate_per_min
+            last_safe_burst = consecutive_swaps
 
     avg_swap = (
         round(statistics.mean(swap_durations), 2)
@@ -325,6 +345,7 @@ async def swap_ramp_phase(
         success=True,
         data={
             "safe_swap_rate_per_min": last_safe_rate or 3,
+            "safe_burst_depth": last_safe_burst or 1,
             "stopped_at_interval_s": 2,
             "stop_reason": "completed all intervals",
             "swap_duration_avg_s": avg_swap,

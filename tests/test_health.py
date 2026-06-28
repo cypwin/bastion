@@ -131,6 +131,34 @@ class TestCheckGPUSafe:
             is_safe, reason = await check_gpu_safe(GPUConfig())
         assert is_safe is True
 
+    @pytest.mark.asyncio
+    async def test_publishes_power_gauge_when_reading_present(self):
+        """Power-draw gauge is published when a reading is available (F6)."""
+        status = GPUStatus(
+            temperature_c=55, vram_used_mb=8000,
+            vram_total_mb=32000, power_draw_watts=180.0,
+        )
+        config = GPUConfig(max_power_watts=450.0)
+        with patch("bastion.health.query_gpu_status", AsyncMock(return_value=status)), \
+                patch("bastion.health.update_gpu_power_watts") as mock_power, \
+                patch("bastion.health.update_gpu_power_cap_watts") as mock_cap:
+            await check_gpu_safe(config)
+        mock_power.assert_called_once_with(180.0)
+        mock_cap.assert_called_once_with(450.0)
+
+    @pytest.mark.asyncio
+    async def test_no_power_gauge_when_reading_absent(self):
+        """Non-NVIDIA / StubBackend (None power) emits no power-draw gauge."""
+        status = GPUStatus(temperature_c=55, power_draw_watts=None)
+        config = GPUConfig(max_power_watts=450.0)
+        with patch("bastion.health.query_gpu_status", AsyncMock(return_value=status)), \
+                patch("bastion.health.update_gpu_power_watts") as mock_power, \
+                patch("bastion.health.update_gpu_power_cap_watts") as mock_cap:
+            await check_gpu_safe(config)
+        mock_power.assert_not_called()
+        # The cap is configured statically, so it is still published.
+        mock_cap.assert_called_once_with(450.0)
+
 
 class TestGetVRAMFreeGB:
     @pytest.mark.asyncio

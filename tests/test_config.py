@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from bastion.config import load_config
+from bastion.config import _apply_gpu_profile, load_config
 from bastion.models import BrokerConfig
 
 
@@ -261,3 +261,132 @@ class TestLoadedFrom:
         monkeypatch.delenv("BASTION_CONFIG", raising=False)
         config = load_config(None)
         assert config.loaded_from is None
+
+
+class TestApplyGpuProfileBrake:
+    """CF1 — calibrated GPU profile maps onto swap_brake fields.
+
+    safe_swap_rate_per_min -> swap_brake.refill_per_minute,
+    safe_burst_depth       -> swap_brake.bucket_capacity,
+    with only-tighten precedence, GPU-name staleness refusal, and
+    enforced invariants (refill >= 1, warn < critical). Protection
+    (brake.enabled) must hold on the uncalibrated portable floor.
+    """
+
+    @staticmethod
+    def _profile(name: str = "NVIDIA GeForce RTX 5090", **calibrated) -> dict:
+        cal = {"safe_swap_rate_per_min": 3, "safe_burst_depth": 2}
+        cal.update(calibrated)
+        return {"gpu": {"name": name}, "calibrated": cal}
+
+    def test_profile_maps_to_brake_fields(self):
+        config = BrokerConfig()
+        _apply_gpu_profile(
+            config,
+            self._profile(safe_swap_rate_per_min=4, safe_burst_depth=2),
+            explicit_brake_keys=set(),
+            detected_gpu_name="NVIDIA GeForce RTX 5090",
+        )
+        assert config.scheduler.swap_brake.refill_per_minute == 4.0
+        assert config.scheduler.swap_brake.bucket_capacity == 2.0
+
+    def test_only_tighten_applies_tighter_explicit(self):
+        """Operator set a looser refill explicitly; a tighter (lower) profile wins."""
+        config = BrokerConfig()
+        config.scheduler.swap_brake.refill_per_minute = 9.0  # operator value
+        _apply_gpu_profile(
+            config,
+            self._profile(safe_swap_rate_per_min=4),
+            explicit_brake_keys={"refill_per_minute"},
+            detected_gpu_name="NVIDIA GeForce RTX 5090",
+        )
+        assert config.scheduler.swap_brake.refill_per_minute == 4.0  # tightened
+
+    def test_only_tighten_refuses_relax_with_audit(self, caplog):
+        """A profile that would RELAX an explicit operator value is refused + logged."""
+        config = BrokerConfig()
+        config.scheduler.swap_brake.refill_per_minute = 2.0  # operator (tight)
+        config.scheduler.swap_brake.bucket_capacity = 1.0
+        with caplog.at_level("WARNING"):
+            _apply_gpu_profile(
+                config,
+                self._profile(safe_swap_rate_per_min=8, safe_burst_depth=5),
+                explicit_brake_keys={"refill_per_minute", "bucket_capacity"},
+                detected_gpu_name="NVIDIA GeForce RTX 5090",
+            )
+        # Operator's tighter values preserved.
+        assert config.scheduler.swap_brake.refill_per_minute == 2.0
+        assert config.scheduler.swap_brake.bucket_capacity == 1.0
+        assert any("RELAX" in r.message for r in caplog.records)
+
+    def test_gpu_name_mismatch_refused(self, caplog):
+        """Profile recorded on a different card is refused; brake stays on the floor."""
+        config = BrokerConfig()
+        floor_refill = config.scheduler.swap_brake.refill_per_minute
+        floor_burst = config.scheduler.swap_brake.bucket_capacity
+        with caplog.at_level("WARNING"):
+            _apply_gpu_profile(
+                config,
+                self._profile(name="NVIDIA GeForce RTX 4090",
+                              safe_swap_rate_per_min=4, safe_burst_depth=2),
+                explicit_brake_keys=set(),
+                detected_gpu_name="NVIDIA GeForce RTX 5090",
+            )
+        assert config.scheduler.swap_brake.refill_per_minute == floor_refill
+        assert config.scheduler.swap_brake.bucket_capacity == floor_burst
+        assert any("stale" in r.message.lower() for r in caplog.records)
+        # Protection must hold uncalibrated.
+        assert config.scheduler.swap_brake.enabled is True
+
+    def test_gpu_name_match_applies(self):
+        config = BrokerConfig()
+        _apply_gpu_profile(
+            config,
+            self._profile(name="nvidia geforce rtx 5090",  # case-insensitive
+                          safe_swap_rate_per_min=4, safe_burst_depth=3),
+            explicit_brake_keys=set(),
+            detected_gpu_name="NVIDIA GeForce RTX 5090",
+        )
+        assert config.scheduler.swap_brake.refill_per_minute == 4.0
+        assert config.scheduler.swap_brake.bucket_capacity == 3.0
+
+    def test_invariant_refill_at_least_one(self):
+        config = BrokerConfig()
+        _apply_gpu_profile(
+            config,
+            self._profile(safe_swap_rate_per_min=0),
+            explicit_brake_keys=set(),
+            detected_gpu_name="NVIDIA GeForce RTX 5090",
+        )
+        assert config.scheduler.swap_brake.refill_per_minute >= 1.0
+
+    def test_invariant_warn_lt_critical(self):
+        config = BrokerConfig()
+        _apply_gpu_profile(
+            config,
+            self._profile(safe_swap_rate_per_min=1),
+            explicit_brake_keys=set(),
+            detected_gpu_name="NVIDIA GeForce RTX 5090",
+        )
+        assert (
+            config.scheduler.swap_rate_warn_threshold
+            < config.scheduler.swap_rate_critical_threshold
+        )
+
+    def test_uncalibrated_keeps_brake_enabled_on_floor(self):
+        """No profile applied at all: brake stays enabled on portable-floor defaults."""
+        config = BrokerConfig()
+        assert config.scheduler.swap_brake.enabled is True
+        assert config.scheduler.swap_brake.refill_per_minute >= 1.0
+        assert config.scheduler.swap_brake.bucket_capacity >= 1.0
+
+    def test_no_detection_does_not_refuse(self):
+        """When the card cannot be detected, a profile is not treated as stale."""
+        config = BrokerConfig()
+        _apply_gpu_profile(
+            config,
+            self._profile(safe_swap_rate_per_min=4, safe_burst_depth=2),
+            explicit_brake_keys=set(),
+            detected_gpu_name=None,
+        )
+        assert config.scheduler.swap_brake.refill_per_minute == 4.0

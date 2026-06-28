@@ -66,6 +66,15 @@ class GPUConfig(BaseModel):
     max_power_watts: float = 300.0  # Conservative default; auto-detect overrides
     default_vram_estimate_gb: float = 10.0  # VRAM estimate for unknown models
     nvidia_smi_timeout_seconds: int = 5  # nvidia-smi subprocess timeout
+    # F5 — physical-VRAM hardware gate (best-effort cross-check, NOT the crash boundary).
+    # nvidia-smi free-VRAM safety margin; raise to 3-4 for multi-monitor GPUs.
+    hardware_margin_gb: float = 2.0
+    non_ollama_reserve_gb: float = 0.0  # subtract compositor/framebuffer VRAM from the budget
+    hardware_gate_fail_mode: Literal["open", "closed_on_swap"] = "closed_on_swap"
+    hardware_gate_miss_degrade_after: int = 3  # consecutive cold-swap misses before degrade-to-open
+    # F6 — optional steady-state power headroom trip (0 = disabled; the brake is
+    # the transient backstop).
+    power_headroom_pct: float = 0.0
 
     @property
     def max_vram_gb(self) -> float:
@@ -88,6 +97,51 @@ class ProxyConfig(BaseModel):
             "/api/delete", "/api/copy", "/api/create", "/api/blobs",
         }
     )
+
+
+class SwapBrakeConfig(BaseModel):
+    """Swap-velocity circuit breaker — the sensor-independent crash backstop (F1/F2).
+
+    Counts BASTION's OWN residency transitions on a monotonic clock, so it keeps
+    working when every nvidia-smi / ``/api/ps`` sensor is dark — which is when the
+    host is most likely to die. Defaults are conservative portable floors for an
+    unknown card; calibrate down via ``--stress-test``. With ``count_evictions``
+    each swap spends ~2 tokens (evict + load), so ``refill_per_minute=5.0`` ⇒
+    ~2.5 sustained swaps/min — below the >8/min crash zone. See
+    docs/design/specs/2026-06-26-swap-velocity-circuit-breaker-design.md.
+
+    Defined ABOVE SchedulerConfig deliberately: ``default_factory=SwapBrakeConfig``
+    is a live name lookup at SchedulerConfig class-body execution time, so the
+    factory target must already exist (``from __future__ import annotations`` only
+    defers the annotation string, not the default_factory argument).
+    """
+    enabled: bool = True               # hard to disable; backstop for fail-open gates
+    min_spacing_seconds: float = 8.0   # cold-LOAD floor; 7.5/min instantaneous ceiling
+    bucket_capacity: float = 3.0       # burst tolerance (calibrated: safe_burst_depth)
+    refill_per_minute: float = 5.0     # sustained velocity (calibrated: safe_swap_rate_per_min)
+    count_evictions: bool = True       # BASTION-initiated unloads debit a token (2 events/swap)
+    cooloff_seconds: float = 30.0      # base OPEN hold
+    cooloff_backoff_max_seconds: float = 60.0  # exponential 30→60 cap (forgiving)
+    min_state_hold_seconds: float = 5.0        # anti tick-flap (loop runs at 0.1s)
+    release_rate_per_minute: float = 3.0       # hysteresis (< refill): anti-flap band
+    shed_when_infeasible: bool = True          # 503 doomed swaps; do not stall them
+    infeasible_evict_reload_threshold: int = 3
+    infeasible_window_seconds: float = 120.0
+    degraded_refill_factor: float = 0.5        # tighten refill when hardware gate blind (F5)
+    force_release_max_ttl_seconds: float = 600.0  # F5 — cap force-release so the backstop
+    #                                              can never be SILENTLY left disabled
+
+
+class PinDetectionConfig(BaseModel):
+    """Ollama ``keep_alive=-1`` pin detection (F4).
+
+    The behavioral evict↔reload oscillation signature is the PRIMARY,
+    version-independent detector; ``expires_at`` parsing is an additive proactive
+    hint. Absent/unparseable ``expires_at`` degrades to the behavioral signature,
+    never to "no protection".
+    """
+    enabled: bool = True
+    expires_horizon_seconds: float = 3600.0  # expires_at beyond now+this ⇒ externally pinned
 
 
 class SchedulerConfig(BaseModel):
@@ -117,6 +171,9 @@ class SchedulerConfig(BaseModel):
     # Stagger concurrent dispatches to reduce power transients
     concurrent_dispatch_delay_seconds: float = 0.1
     queue_ttl_seconds: float = 600.0  # Max age for queued requests (10 min); swept every 60s
+    # Swap-velocity circuit breaker (F1/F2) + Ollama keep_alive pin detection (F4).
+    swap_brake: SwapBrakeConfig = Field(default_factory=SwapBrakeConfig)
+    pin_detection: PinDetectionConfig = Field(default_factory=PinDetectionConfig)
 
 
 class AuditConfig(BaseModel):
@@ -455,9 +512,12 @@ class QueuedRequest(BaseModel):
 class LoadedModel(BaseModel):
     """A model currently loaded in Ollama's VRAM."""
     name: str
-    size_bytes: int = 0
+    size_bytes: int = 0  # disk size from /api/ps (NOT runtime VRAM — see size_vram)
     vram_gb: float = 0.0
     details: dict[str, Any] = Field(default_factory=dict)
+    # F4 fields parsed from /api/ps (both currently dropped by get_loaded_models):
+    expires_at: str | None = None  # RFC3339 keep_alive expiry; far-future ⇒ keep_alive=-1 pin
+    size_vram: int = 0  # actual GPU-resident bytes Ollama measured; preferred over disk size_bytes
 
 
 class ResidencyState(BaseModel):
@@ -683,6 +743,20 @@ class BrokerStatus(BaseModel):
     a2a_tasks: list[dict] = Field(default_factory=list)
     active_leases: list[dict] = Field(default_factory=list)
     recent_audit_events: list[dict] = Field(default_factory=list)
+    # --- Swap-velocity circuit breaker observability (F1/F2/F4/F5) -----------
+    # All Optional/None-default for backward compat; populated from
+    # Scheduler.swap_brake.snapshot() + the VRAM hardware-gate flag.
+    brake_state: str | None = None
+    brake_reason: str | None = None
+    cooloff_remaining_s: float | None = None
+    windowed_rate_per_min: float | None = None
+    backoff_level: int | None = None
+    pinned_models: list[str] | None = None
+    pinned_vram_gb: float | None = None
+    hardware_gate_blind: bool | None = None
+    # F5 — force-release override visibility (the backstop is OFF while active).
+    force_release_active: bool | None = None
+    force_release_remaining_s: float | None = None
 
 
 # ---------------------------------------------------------------------------

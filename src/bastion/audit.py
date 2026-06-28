@@ -29,6 +29,7 @@ EVENT_VRAM_ALERT = "vram_alert"
 EVENT_QUEUE_CHANGE = "queue_change"
 EVENT_REQUEST_COMPLETE = "request_complete"
 EVENT_THRASHING = "thrashing"
+EVENT_SWAP_BRAKE = "swap_brake"  # swap-velocity brake engage/release (F4 fail-LOUD)
 
 
 # ---------------------------------------------------------------------------

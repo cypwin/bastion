@@ -345,3 +345,84 @@ class TestDriftGaugeOnSlowTick:
             await server._collect_machine_snapshot(tick=0)
 
         spy.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Swap-velocity circuit breaker — additive gauges/counters (spec Section 309-312)
+# ---------------------------------------------------------------------------
+
+
+class TestSwapBrakeMetricObjectsExist:
+    def test_objects_are_importable(self):
+        from bastion.metrics import (
+            GPU_POWER_CAP_WATTS,
+            GPU_POWER_WATTS,
+            HARDWARE_GATE_BLIND_TOTAL,
+            PINNED_VRAM_GB,
+            SWAP_BRAKE_ENGAGED_TOTAL,
+            SWAP_BRAKE_FORCE_ACTIVE,
+            SWAP_BRAKE_STATE,
+            SWAP_RATE_PER_MIN,
+        )
+
+        assert SWAP_BRAKE_STATE is not None
+        assert SWAP_BRAKE_ENGAGED_TOTAL is not None
+        assert SWAP_BRAKE_FORCE_ACTIVE is not None
+        assert SWAP_RATE_PER_MIN is not None
+        assert PINNED_VRAM_GB is not None
+        assert HARDWARE_GATE_BLIND_TOTAL is not None
+        assert GPU_POWER_WATTS is not None
+        assert GPU_POWER_CAP_WATTS is not None
+
+    def test_helpers_run_under_noop_stubs(self):
+        """Each helper called once must not raise (no-op stubs or live client)."""
+        from bastion.metrics import (
+            record_hardware_gate_blind,
+            record_swap_brake_engaged,
+            update_gpu_power_cap_watts,
+            update_gpu_power_watts,
+            update_pinned_vram_gb,
+            update_swap_brake_force_active,
+            update_swap_brake_state,
+            update_swap_rate_per_min,
+        )
+
+        update_swap_brake_state(2.0)
+        record_swap_brake_engaged()
+        update_swap_brake_force_active(1.0)
+        update_swap_brake_force_active(0.0)
+        update_swap_rate_per_min(4.5)
+        update_pinned_vram_gb(gpu_index="0", gb=7.0)
+        record_hardware_gate_blind()
+        update_gpu_power_watts(420.0)
+        update_gpu_power_cap_watts(575.0)
+
+    def test_exported_in_all(self):
+        from bastion import metrics
+
+        for name in (
+            "SWAP_BRAKE_STATE",
+            "SWAP_BRAKE_ENGAGED_TOTAL",
+            "SWAP_BRAKE_FORCE_ACTIVE",
+            "SWAP_RATE_PER_MIN",
+            "PINNED_VRAM_GB",
+            "HARDWARE_GATE_BLIND_TOTAL",
+            "GPU_POWER_WATTS",
+            "GPU_POWER_CAP_WATTS",
+            "update_swap_brake_state",
+            "record_swap_brake_engaged",
+            "update_swap_brake_force_active",
+            "update_swap_rate_per_min",
+            "update_pinned_vram_gb",
+            "record_hardware_gate_blind",
+            "update_gpu_power_watts",
+            "update_gpu_power_cap_watts",
+        ):
+            assert name in metrics.__all__
+
+    def test_pinned_vram_gauge_has_gpu_index_label(self):
+        from bastion.metrics import PINNED_VRAM_GB, PROMETHEUS_AVAILABLE
+
+        if not PROMETHEUS_AVAILABLE:
+            pytest.skip("prometheus_client not installed — no-op gauge")
+        assert PINNED_VRAM_GB._labelnames == ("gpu_index",)

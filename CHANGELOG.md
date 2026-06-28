@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0a3] - 2026-06-27
+
+_Pre-release (alpha). Adds the swap-velocity circuit breaker — the crash-class fix for the 2026-06-26 swap-storm lockup, where a hard GPU lockup was traced to swap **velocity** (an unbounded burst of back-to-back model loads), not steady-state VRAM over-commit. BASTION previously gated swap *state* (does it fit?) but never swap *rate* (how fast are we loading?). Excluded from `pip install bastion-broker` by default (PEP 440 pre-release); stable `0.5.0` still follows after live-host validation. Design: `docs/design/specs/2026-06-26-swap-velocity-circuit-breaker-design.md`._
+
+### Added
+
+#### Swap-velocity circuit breaker (`SwapBrake`)
+
+- **`SwapBrake` core** (`circuitbreaker.py`/scheduler) — a per-swap go/no-go gate combining a **minimum-spacing floor** between loads, a **token bucket** bounding load burst depth, and a **closed/open/half-open state machine** with a single half-open probe. The brake now owns the swap go/no-go decision; the legacy cooldown still enforces and publishes the swap-rate gauge.
+- **Pin-aware infeasible latch (F4)** — BASTION **never evicts an externally pinned model** (a caller's `keep_alive=-1` / lease). When a queued model can only be satisfied by evicting a pin, the *candidate* is latched **infeasible**, the proxy returns **503**, and the brake sheds it — instead of fighting the caller's pin with `keep_alive=0` (the exact behaviour that fed the storm). A behavioural evict↔reload oscillation detector provides a version-independent fingerprint of an externally pinned working set.
+- **Single load chokepoint** — both `/broker/preload` routes now funnel through the scheduler-owned **load serializer** with the brake's authoritative `acquire()` + `record_load()` running *inside* it, closing the TOCTOU window where a direct `keep_alive:-1` load could bypass the brake.
+- **`POST /broker/swap-brake`** — auto-expiring admin override to force-open/force-close the brake; brake snapshot (state, tokens, infeasible latch, pinned set) is exposed on **`GET /broker/status`**.
+- **GPU power gauges** — `check_gpu_safe` now publishes power draw + cap; the calibrated GPU profile is mapped onto `swap_brake` with **only-tighten** semantics and a staleness guard, so a measured profile can lower but never raise the safe burst depth.
+- **Config** — `SwapBrakeConfig` + `PinDetectionConfig` nested under `SchedulerConfig`; `GPUConfig` hardware-gate + power knobs; documented in `config/broker.example.yaml`.
+- **Observability** — additive Prometheus gauges/counters for the brake (spacing waits, token level, shed/infeasible counts, swap-rate); `BrokerStatus` brake/pin/hardware fields; `LoadedModel.expires_at` + `size_vram` for pin detection and VRAM-ledger accuracy (the measured-vs-allocated Δ overhead).
+- **Stress calibrator** — `stress.py` emits `safe_burst_depth`; admission throttle hook lets the rate limiter shed brake-rejected hot-retriers rather than CPU busy-loop.
+
+### Changed
+
+- Scheduler swap timing moved to a **monotonic clock**; cold-swap VRAM reservation fails **closed** on a transient `nvidia-smi` miss (blind on the dangerous path = stop), degrading to the velocity brake only after K consecutive misses.
+
+### Documentation
+
+- `docs/design/specs/2026-06-26-swap-velocity-circuit-breaker-design.md` — full F1–F6 design spec, including the §9 post-implementation review follow-ups (F1–F5 + preload wedge) and §9.2 nice-to-haves (NH1–NH6).
+- RTX-5090 crash numerics scrubbed from shipped docstrings/comments (consumer-GPU-forensics framing) with a provenance guard test.
+
 ## [0.5.0a2] - 2026-06-23
 
 _Pre-release (alpha). Packaging/tooling fixes on top of `0.5.0a1`; no runtime broker changes. Still excluded from `pip install bastion-broker` by default (PEP 440 pre-release)._

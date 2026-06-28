@@ -1,0 +1,83 @@
+"""Pydantic field-default assertions for the swap-brake config models (M1–M4).
+
+This test file is owned exclusively by the models.py task chain (M1→M2→M3→M4)
+so those tasks never share a test file with their consumers — see the
+implementation plan's test-file ownership map.
+"""
+
+from __future__ import annotations
+
+from bastion.models import (
+    BrokerStatus,
+    GPUConfig,
+    LoadedModel,
+    PinDetectionConfig,
+    SchedulerConfig,
+    SwapBrakeConfig,
+)
+
+
+class TestSwapBrakeConfigDefaults:
+    def test_swap_brake_nested_in_scheduler(self) -> None:
+        sched = SchedulerConfig()
+        assert isinstance(sched.swap_brake, SwapBrakeConfig)
+        assert isinstance(sched.pin_detection, PinDetectionConfig)
+
+    def test_swap_brake_defaults(self) -> None:
+        b = SchedulerConfig().swap_brake
+        assert b.enabled is True
+        assert b.min_spacing_seconds == 8.0
+        assert b.bucket_capacity == 3.0
+        assert b.refill_per_minute == 5.0
+        assert b.count_evictions is True
+        assert b.cooloff_seconds == 30.0
+        assert b.cooloff_backoff_max_seconds == 60.0
+        assert b.min_state_hold_seconds == 5.0
+        assert b.release_rate_per_minute == 3.0
+        assert b.shed_when_infeasible is True
+        assert b.infeasible_evict_reload_threshold == 3
+        assert b.infeasible_window_seconds == 120.0
+        assert b.degraded_refill_factor == 0.5
+        # F-5 — bound on the force-release override so the backstop can never be
+        # silently disabled by an unbounded ttl_s.
+        assert b.force_release_max_ttl_seconds == 600.0
+
+    def test_pin_detection_defaults(self) -> None:
+        p = SchedulerConfig().pin_detection
+        assert p.enabled is True
+        assert p.expires_horizon_seconds == 3600.0
+
+
+class TestGPUConfigF5F6Fields:
+    def test_gpu_config_f5_f6_defaults(self) -> None:
+        g = GPUConfig()
+        assert g.hardware_margin_gb == 2.0
+        assert g.non_ollama_reserve_gb == 0.0
+        assert g.hardware_gate_fail_mode == "closed_on_swap"
+        assert g.hardware_gate_miss_degrade_after == 3
+        assert g.power_headroom_pct == 0.0
+
+
+class TestLoadedModelF4Fields:
+    def test_loadedmodel_carries_expires_and_size_vram(self) -> None:
+        m = LoadedModel(name="x:7b", expires_at="2026-06-26T15:30:00Z", size_vram=123456)
+        assert m.expires_at == "2026-06-26T15:30:00Z"
+        assert m.size_vram == 123456
+
+    def test_loadedmodel_f4_defaults(self) -> None:
+        m = LoadedModel(name="x:7b")
+        assert m.expires_at is None
+        assert m.size_vram == 0
+
+
+class TestBrokerStatusSwapVelocityFields:
+    def test_swap_velocity_fields_default_none(self) -> None:
+        s = BrokerStatus()
+        for field in (
+            "brake_state", "brake_reason", "cooloff_remaining_s",
+            "windowed_rate_per_min", "backoff_level", "pinned_models",
+            "pinned_vram_gb", "hardware_gate_blind",
+            # F-5 — force-release visibility on /broker/status.
+            "force_release_active", "force_release_remaining_s",
+        ):
+            assert getattr(s, field) is None

@@ -30,10 +30,16 @@ from bastion.metrics import (
     record_model_swap,
     record_model_swap_duration,
     record_queue_wait,
+    record_swap_brake_engaged,
     set_concurrent_requests_active,
+    update_pinned_vram_gb,
+    update_swap_brake_force_active,
+    update_swap_brake_state,
+    update_swap_rate_per_min,
 )
 from bastion.models import BrokerConfig, QueuedRequest
 from bastion.queue import AffinityQueue
+from bastion.swapbrake import BrakeState, SwapBrake
 from bastion.vram import (
     VRAM_STATE_UNKNOWN_REASON,
     VRAMManager,
@@ -43,6 +49,12 @@ from bastion.vram import (
 from bastion.watchdog import notify_watchdog
 
 logger = logging.getLogger(__name__)
+
+# S4 — queued-work tiering ceilings (scheduler-local; distinct from the proxy's
+# queue_timeout_seconds 504 bound). Conservative floors for an unknown card.
+_SWAP_STARVATION_CEILING_SECONDS = 60.0  # a starved swap earns the next freed slot
+_BRAKE_BACKLOG_CEILING = 256             # shed swap attempts past this under a long brake
+_LATCH_WARN_INTERVAL_SECONDS = 30.0      # F4 — throttled WARNING heartbeat while latched
 
 
 class Scheduler:
@@ -88,6 +100,18 @@ class Scheduler:
         self._has_inflight_fn = has_inflight_fn or (lambda model: False)
         self._inflight_count_fn = inflight_count_fn or (lambda: 0)
 
+        # F1/F2 — sensor-independent swap-velocity circuit breaker. Counts
+        # BASTION's OWN residency transitions on a monotonic clock, so it stays
+        # armed when every nvidia-smi / /api/ps sensor is dark.
+        self._brake = SwapBrake(config.scheduler.swap_brake, clock=time.monotonic)
+        # THE single chokepoint for residency-increasing loads. Must exist on
+        # every branch (R2-1): reuse the VRAMManager semaphore when present, else
+        # a private one — so the no-VRAMManager path is braked too and the brake
+        # can never be bypassed on an uncalibrated / non-NVIDIA host.
+        self._load_serializer: asyncio.Semaphore = (
+            vram_manager._load_semaphore if vram_manager is not None else asyncio.Semaphore(1)
+        )
+
         self._current_model: str | None = None  # Last dispatched model (for affinity bonus)
         self._last_swap_time: float = 0.0
         self._total_swaps: int = 0
@@ -117,6 +141,33 @@ class Scheduler:
         # genuinely stuck — operator should know once, not every tick).
         self._eviction_stuck_streak: dict[str, int] = {}
 
+        # F4 — behavioral evict↔reload oscillation detector (PRIMARY infeasible
+        # signal; version-independent). Fed when _unload_model succeeds and the
+        # model REAPPEARS resident on a later tick — the fingerprint of an
+        # externally pinned working set BASTION keeps fighting (last-writer-wins
+        # against the caller's keep_alive=-1). Promotes _eviction_stuck_streak.
+        self._evict_reload_history: dict[str, deque[float]] = {}
+        self._recently_unloaded: dict[str, float] = {}  # model -> monotonic unload time
+
+        # S4 — priority-aging snapshot captured on the CLOSED→engaged edge so the
+        # single swap granted at release does NOT load a background model that only
+        # age-inflated past a foreground one DURING the brake. None ⇒ not engaged.
+        self._engage_ranking: dict[str, float] | None = None
+        # F4 — fail-LOUD brake observability state. The incident's own failure mode
+        # was a guardrail that engaged SILENTLY; these surface engage/release as an
+        # audit event (duration + swaps granted while braked) and a WARNING heartbeat.
+        self._brake_engaged_at: float | None = None
+        self._swaps_during_brake: int = 0
+        self._last_latch_warn_t: float = 0.0
+        # S4 — backlog ceiling: shed swap attempts past a bound under a long brake.
+        self._brake_backlog_count: int = 0
+        self._brake_backlog_ceiling: int = _BRAKE_BACKLOG_CEILING
+        # S4 — swap-starvation ceiling (distinct from queue_timeout): a swap-needing
+        # request that starves behind ungated Phase-1 traffic eventually earns the
+        # next freed in-flight slot to evict for it.
+        self._swap_starve_since: dict[str, float] = {}
+        self._swap_starvation_ceiling: float = _SWAP_STARVATION_CEILING_SECONDS
+
     @property
     def current_model(self) -> str | None:
         """Last dispatched model (used for affinity bonus and admin API).
@@ -143,6 +194,21 @@ class Scheduler:
     def is_draining(self) -> bool:
         return self._draining
 
+    @property
+    def swap_brake(self) -> SwapBrake:
+        """The swap-velocity circuit breaker (for /broker/status + admin override)."""
+        return self._brake
+
+    @property
+    def load_serializer(self) -> asyncio.Semaphore:
+        """THE residency-increasing-load serialization point.
+
+        Every direct-load path (scheduler swap, /broker/preload) MUST hold this
+        and run the brake's authoritative ``acquire()``+``record_load()`` inside
+        it — see the funnel regression test (REG).
+        """
+        return self._load_serializer
+
     def notify(self) -> None:
         """Wake the scheduler (call after enqueuing a request)."""
         self._wake_event.set()
@@ -158,7 +224,10 @@ class Scheduler:
         float
             Cooldown duration in seconds.
         """
-        now = time.time()
+        # Swap-timing clock is MONOTONIC (F1): a wall-clock backward NTP step /
+        # suspend-resume would otherwise read the trailing window as ~0 swaps and
+        # silently disarm the rate throttle. Stall-DISPLAY stamps stay wall-clock.
+        now = time.monotonic()
         window = self.config.scheduler.swap_rate_window_seconds
 
         # Prune timestamps outside the window
@@ -166,6 +235,9 @@ class Scheduler:
             self._swap_timestamps.popleft()
 
         rate = len(self._swap_timestamps)
+        # Vision C gauge: surface the live per-minute swap rate so a storm is
+        # visible forming, independent of whether the brake has engaged.
+        update_swap_rate_per_min(float(rate))
         cfg = self.config.scheduler
 
         if rate >= cfg.swap_rate_critical_threshold:
@@ -229,12 +301,14 @@ class Scheduler:
     async def drain(self) -> None:
         """Enter drain mode: finish current queue, reject new requests."""
         self._draining = True
+        self._brake.set_drain(True)  # hold brake state — drain-induced zero rate != "storm over"
         self._wake_event.set()
         logger.info("Scheduler entering drain mode (queue depth: %d)", self.queue.total_size)
 
     async def resume(self) -> None:
         """Exit drain mode and resume normal scheduling."""
         self._draining = False
+        self._brake.set_drain(False)
         logger.info("Scheduler resumed from drain mode")
 
     # ── Main loop ──────────────────────────────────────────────────
@@ -315,11 +389,19 @@ class Scheduler:
                 self._last_stall_time = time.time()
             return False
 
+        # F4 — clear any infeasible latch on a real residency delta (each tick;
+        # never on a pure time advance), feed the behavioral evict↔reload detector,
+        # and maintain the S4 priority-aging snapshot across brake engage/release.
+        if self._brake is not None:
+            self._brake.clear_on_residency_delta(resident_models)
+        self._detect_evict_reload_oscillation(resident_models)
+        self._update_brake_engage_snapshot()
+
         dispatch_delay = self.config.scheduler.concurrent_dispatch_delay_seconds
 
         while current_inflight < max_concurrent:
             # Stagger concurrent dispatches to reduce GPU power transients
-            # (460W→80W→460W spikes stress VRMs; 100ms delay staggers ramp-up)
+            # (large cold-load power swings stress VRMs; a short delay staggers ramp-up)
             if dispatched_any and dispatch_delay > 0:
                 await asyncio.sleep(dispatch_delay)
 
@@ -351,7 +433,7 @@ class Scheduler:
                 logger.debug("Co-resident dispatch: %s (non-blocking)", model)
                 if self._current_model is None:
                     # First dispatch — set swap time baseline for cooldown tracking
-                    self._last_swap_time = time.time()
+                    self._last_swap_time = time.monotonic()
                 elif model != self._current_model:
                     logger.debug("Co-resident transition: %s -> %s, skipping cooldown",
                                 self._current_model, model)
@@ -369,7 +451,7 @@ class Scheduler:
         # Phase 2: If there's still room and a non-resident model needs dispatch,
         # handle the swap case (blocking, serialized)
         if current_inflight < max_concurrent and not self.queue.is_empty:
-            candidate = self.queue.pick_next(self._current_model)
+            candidate = await self._select_swap_candidate(resident_models)
             if candidate is not None:
                 is_resident = candidate.model in resident_models
                 # Re-check residency from cache (may have changed)
@@ -438,7 +520,7 @@ class Scheduler:
                 non_resident = [m for m in models_with_work if m not in resident_models]
                 if non_resident:
                     swap_cooldown = self._get_swap_cooldown()
-                    elapsed = time.time() - self._last_swap_time
+                    elapsed = max(0.0, time.monotonic() - self._last_swap_time)
                     remaining = swap_cooldown - elapsed
                     if remaining > 0:
                         reason = "swap_cooldown"
@@ -452,7 +534,7 @@ class Scheduler:
             non_resident_with_work = [m for m in models_with_work if m not in resident_models]
             if non_resident_with_work:
                 swap_cooldown = self._get_swap_cooldown()
-                elapsed = time.time() - self._last_swap_time
+                elapsed = max(0.0, time.monotonic() - self._last_swap_time)
                 remaining = swap_cooldown - elapsed
                 if remaining > 0:
                     reason = "swap_cooldown"
@@ -486,6 +568,261 @@ class Scheduler:
         """Timestamp when current stall reason was first detected."""
         return self._last_stall_time
 
+    # ── F4 / S4 — pin-aware infeasible detection + queued-work tiering ──────
+
+    def _detect_evict_reload_oscillation(self, resident_models: set[str]) -> None:
+        """Feed the behavioral evict↔reload detector (F4 PRIMARY signal).
+
+        A model BASTION unloaded that REAPPEARS resident is a same-model
+        oscillation — the version-independent fingerprint of an externally pinned
+        working set BASTION is fighting. Expired watches/history are pruned to the
+        configured window so a one-off churn never accumulates into a false latch.
+        """
+        now = time.monotonic()
+        window = self.config.scheduler.swap_brake.infeasible_window_seconds
+        for model, t in list(self._recently_unloaded.items()):
+            if model in resident_models:
+                self._evict_reload_history.setdefault(model, deque()).append(now)
+                self._recently_unloaded.pop(model, None)
+            elif (now - t) > window:
+                self._recently_unloaded.pop(model, None)
+        for model, hist in list(self._evict_reload_history.items()):
+            while hist and (now - hist[0]) > window:
+                hist.popleft()
+            if not hist:
+                self._evict_reload_history.pop(model, None)
+
+    def _pinned_resident(self, resident_loaded: list) -> list:
+        """Resident LoadedModels that are externally pinned (caller keep_alive)."""
+        return [m for m in resident_loaded if m.name in self.vram._pinned]
+
+    def _candidate_vram_gb(self, model: str) -> float:
+        info = registry_lookup(self.config.models, model)
+        return info.vram_gb if info else self.config.gpu.default_vram_estimate_gb
+
+    def _pinned_overflow(self, candidate_model: str, resident_loaded: list) -> bool:
+        """True when the pinned resident set + candidate overruns the VRAM budget.
+
+        This is the set-level "would require evicting a pinned model" condition: a
+        candidate that cannot fit alongside the pinned set provably demands evicting
+        one of those caller pins — which BASTION refuses to do (it sheds instead).
+        """
+        if candidate_model in self.vram._pinned:
+            return False
+        pinned = self._pinned_resident(resident_loaded)
+        if not pinned:
+            return False
+        budget = self.config.gpu.max_vram_gb
+        if budget <= 0:
+            return False
+        pinned_vram = sum(m.vram_gb for m in pinned)
+        return (pinned_vram + self._candidate_vram_gb(candidate_model)) > budget
+
+    def _pinned_oscillation_count(self, resident_loaded: list) -> int:
+        now = time.monotonic()
+        window = self.config.scheduler.swap_brake.infeasible_window_seconds
+        total = 0
+        for m in self._pinned_resident(resident_loaded):
+            hist = self._evict_reload_history.get(m.name)
+            if hist:
+                while hist and (now - hist[0]) > window:
+                    hist.popleft()
+                total += len(hist)
+        return total
+
+    def _max_oscillation_count(self) -> int:
+        """Max per-model evict↔reload oscillation count, UNFILTERED by ``vram._pinned``.
+
+        The version-independent fallback signal (F-3). ``_pinned_oscillation_count``
+        loops only over ``_pinned_resident`` models, so on an Ollama build without a
+        parseable ``expires_at`` (``vram._pinned`` empty) it reads zero and the
+        behavioral history is stranded. This reads the raw same-model evict↔reload
+        history directly: a model BASTION evicted that keeps REAPPEARING resident is
+        the fingerprint of a caller ``keep_alive`` pin regardless of whether its
+        expiry timer is parseable. Window-pruned (mirrors the per-tick prune)."""
+        now = time.monotonic()
+        window = self.config.scheduler.swap_brake.infeasible_window_seconds
+        best = 0
+        for hist in self._evict_reload_history.values():
+            while hist and (now - hist[0]) > window:
+                hist.popleft()
+            if len(hist) > best:
+                best = len(hist)
+        return best
+
+    def _maybe_latch_infeasible(self, candidate: QueuedRequest, resident_loaded: list) -> bool:
+        """Latch the CANDIDATE (never the pinned victim) when its load would require
+        evicting an externally pinned model, OR the evict↔reload oscillation count
+        crosses the behavioral threshold (set-level freeze)."""
+        if not self.config.scheduler.pin_detection.enabled:
+            return False
+        threshold = self.config.scheduler.swap_brake.infeasible_evict_reload_threshold
+        if self._pinned_resident(resident_loaded):
+            # Pin metadata available: proactive overflow OR pinned-set oscillation.
+            overflow = self._pinned_overflow(candidate.model, resident_loaded)
+            behavioral = self._pinned_oscillation_count(resident_loaded) >= threshold
+            if overflow or behavioral:
+                self._brake.note_infeasible(candidate.model)
+                return True
+            return False
+        # F-3 — no parseable expires_at (vram._pinned empty) ⇒ the pinned set is
+        # invisible. Fall back to the version-independent same-model evict↔reload
+        # oscillation signature so detection degrades to the behavioral signal, never
+        # to "no protection" (spec F4 / PinDetectionConfig docstring).
+        if self._max_oscillation_count() >= threshold:
+            self._brake.note_infeasible(candidate.model)
+            return True
+        return False
+
+    def _is_feasible_candidate(self, model: str, resident_loaded: list) -> bool:
+        """S4 HALF_OPEN feasible-probe filter: skip latched / pinned-evicting candidates."""
+        if self._brake.is_latched(model):
+            return False
+        return not self._pinned_overflow(model, resident_loaded)
+
+    def _peek_request_for_model(self, model: str) -> QueuedRequest | None:
+        """Highest-priority queued request for a model WITHOUT dequeuing (read-only).
+
+        Mirrors AffinityQueue.dequeue_for_model's selection without mutating the
+        queue, so the S4 release-probe can present a specific feasible model's
+        request to the swap path (which re-dequeues authoritatively downstream).
+        """
+        queues = getattr(self.queue, "_model_queues", None)
+        if not queues:
+            return None
+        q = queues.get(model)
+        if not q:
+            return None
+        now = time.time()
+        return max(q, key=lambda r: r.effective_priority(self.config.scheduler.aging_rate, now=now))
+
+    def _best_priority_for_model(self, model: str, now: float) -> float:
+        req = self._peek_request_for_model(model)
+        if req is None:
+            return 0.0
+        return req.effective_priority(self.config.scheduler.aging_rate, now=now)
+
+    def _update_brake_engage_snapshot(self) -> None:
+        """S4 priority-aging snapshot + F4 fail-LOUD brake observability (every tick).
+
+        S4: snapshot the priority-aging baseline on the CLOSED→engaged edge — at
+        release exactly one swap is granted, and without this snapshot a low-base
+        background request that merely aged DURING the brake could outrank the
+        foreground request and reload a stale model, re-triggering the storm.
+
+        F4: the incident's own failure mode was a guardrail that engaged SILENTLY.
+        So push the brake-state + pinned-VRAM gauges each tick, count the engage
+        edge, emit ONE audit event on engage and on release (with brake duration +
+        swaps granted while braked), and re-log any infeasible latch at WARNING on a
+        throttled heartbeat (it otherwise logs once then sheds at debug).
+        """
+        snap = self._brake.snapshot()
+        state = snap["state"]
+        engaged = state in ("open", "half_open")
+
+        # Gauges — pushed every tick so a dashboard sees the live brake state and
+        # the pinned-VRAM pressure even on a tick with no edge. pinned_vram_gb is a
+        # config-estimate sum over the detected pin set (the authoritative live-size
+        # value is fused onto /broker/status by the server's brake snapshot embed).
+        # unknown state string — skip rather than crash the loop
+        with contextlib.suppress(ValueError):
+            update_swap_brake_state(BrakeState(state).gauge_value)
+        pinned_gb = sum(self._candidate_vram_gb(m) for m in self.vram._pinned)
+        # Single-GPU deployments use gpu_index="0" (matches vram.py's ledger gauges).
+        update_pinned_vram_gb(gpu_index="0", gb=pinned_gb)
+        # F5 — hold the force-release gauge high for the whole disabled window so a
+        # dashboard shows the backstop is OFF, not just the instant it was issued.
+        update_swap_brake_force_active(1.0 if snap.get("force_release_active") else 0.0)
+
+        if engaged and self._engage_ranking is None:
+            # CLOSED → engaged edge.
+            now = time.time()
+            self._engage_ranking = {
+                m: self._best_priority_for_model(m, now)
+                for m in self.queue.get_models_with_requests()
+            }
+            self._brake_engaged_at = time.monotonic()
+            self._swaps_during_brake = 0
+            record_swap_brake_engaged()
+            logger.warning(
+                "Swap brake ENGAGED (%s): %s — pinned≈%.1f GB, rate=%.1f/min, backoff=%d",
+                state, snap.get("reason", ""), pinned_gb,
+                snap.get("windowed_rate_per_min", 0.0), snap.get("backoff_level", 0),
+            )
+            audit.emit(audit.EVENT_SWAP_BRAKE, {
+                "transition": "engaged",
+                "state": str(state),
+                "reason": snap.get("reason", ""),
+                "pinned_vram_gb": round(pinned_gb, 2),
+                "latched": snap.get("latched", []),
+            })
+        elif not engaged and self._engage_ranking is not None:
+            # engaged → released edge.
+            duration = (
+                time.monotonic() - self._brake_engaged_at
+                if self._brake_engaged_at is not None else 0.0
+            )
+            logger.warning(
+                "Swap brake RELEASED after %.1fs (%d swap(s) granted while braked)",
+                duration, self._swaps_during_brake,
+            )
+            audit.emit(audit.EVENT_SWAP_BRAKE, {
+                "transition": "released",
+                "duration_seconds": round(duration, 2),
+                "swaps_during_brake": self._swaps_during_brake,
+            })
+            self._engage_ranking = None
+            self._brake_backlog_count = 0
+            self._brake_engaged_at = None
+
+        # Throttled WARNING heartbeat: keep a sustained infeasible latch visible (it
+        # logs once at WARNING then sheds at debug — the silent-degrade anti-pattern).
+        latched = snap.get("latched") or []
+        if latched:
+            now_m = time.monotonic()
+            if now_m - self._last_latch_warn_t >= _LATCH_WARN_INTERVAL_SECONDS:
+                self._last_latch_warn_t = now_m
+                logger.warning(
+                    "Swap brake INFEASIBLE latch active: %s (demanded resident set "
+                    "exceeds the %.1f GB budget; shedding these candidates)",
+                    ", ".join(latched), self.config.gpu.max_vram_gb,
+                )
+
+    async def _select_swap_candidate(self, resident_models: set[str]) -> QueuedRequest | None:
+        """Pick the swap target. While the brake is engaged, prefer a feasible,
+        non-latched model ranked by the ENGAGE-time priority snapshot (S4) instead
+        of the age-inflated live ranking, never spending the probe evicting a pin."""
+        base = self.queue.pick_next(self._current_model)
+        if base is None or self._engage_ranking is None:
+            return base
+        resident_loaded = await self.vram.get_loaded_models()
+        if resident_loaded is None:
+            return base
+        nonres = [m for m in self.queue.get_models_with_requests() if m not in resident_models]
+        feasible = [m for m in nonres if self._is_feasible_candidate(m, resident_loaded)]
+        if not feasible:
+            return base
+        feasible.sort(key=lambda m: self._engage_ranking.get(m, 0.0), reverse=True)
+        chosen = feasible[0]
+        if base.model == chosen:
+            return base
+        return self._peek_request_for_model(chosen) or base
+
+    def _brake_backlog_exceeded(self) -> bool:
+        """S4 backlog ceiling — under a long brake, shed rather than accumulate."""
+        return self._brake_backlog_count > self._brake_backlog_ceiling
+
+    def _note_swap_starvation(self, model: str) -> None:
+        self._swap_starve_since.setdefault(model, time.monotonic())
+
+    def _clear_swap_starvation(self, model: str) -> None:
+        self._swap_starve_since.pop(model, None)
+
+    def _swap_starved(self, model: str) -> bool:
+        """S4 — has a swap-needing model starved past the ceiling behind Phase-1 traffic?"""
+        t = self._swap_starve_since.get(model)
+        return t is not None and (time.monotonic() - t) >= self._swap_starvation_ceiling
+
     async def _handle_swap_dispatch(self, candidate: QueuedRequest) -> bool:
         """Handle dispatch for a non-resident model that requires a swap.
 
@@ -493,23 +830,57 @@ class Scheduler:
         When a VRAMManager is available, uses the assume/confirm/forget pattern
         to atomically reserve VRAM before loading, eliminating TOCTOU races.
         """
-        # Check cooldown (dynamic based on swap rate)
-        swap_cooldown = self._get_swap_cooldown()
-        elapsed = time.time() - self._last_swap_time
-        remaining = swap_cooldown - elapsed
-        if remaining > 0:
-            # Can we serve a request for the current model instead?
+        # Advisory swap-rate telemetry — the SwapBrake now owns go/no-go (S2).
+        # _get_swap_cooldown still publishes the swap_rate gauge + audit level.
+        self._get_swap_cooldown()
+
+        # --- Brake PRE-GATE (cheap, pure peek; early-reject BEFORE any eviction
+        # so a doomed swap never evicts a model). The AUTHORITATIVE acquire runs
+        # inside the load serializer below. ---
+        pre = self._brake.peek(candidate.model)
+        if pre.action != "proceed":
+            # While the brake holds, drain the current (already-resident) model's
+            # queue instead of swapping — co-resident dispatch causes no inrush.
             current_depth = self.queue.model_queue_size(self._current_model)
-            if current_depth > 0 and not self._has_inflight_fn(self._current_model):
-                # Drain current model's queue while waiting for cooldown
+            if (
+                pre.action == "stall"
+                and current_depth > 0
+                and not self._has_inflight_fn(self._current_model)
+            ):
                 return await self._dispatch_for_model(self._current_model, needs_swap=False)
-            else:
-                # Wait for cooldown
-                # Tier-0 dead-metric activation (spec 5.4): count each enforced
-                # cooldown wait so the swap-rate limiter is visible to alerts.
+            if pre.action == "stall":
                 record_cooldown_wait()
-                logger.debug("Cooldown: %.1fs remaining before model swap", remaining)
-                await asyncio.sleep(min(remaining, 0.5))
+                # S4 — clock starvation: a swap-needing request held off behind
+                # ungated Phase-1 traffic must eventually earn a freed slot.
+                self._note_swap_starvation(candidate.model)
+            logger.debug(
+                "Swap brake %s for '%s' (pre-gate): %s",
+                pre.action, candidate.model, pre.reason,
+            )
+            return False
+
+        # F4 — set-level infeasible detection BEFORE any reservation / eviction:
+        # if satisfying this candidate would require evicting an externally pinned
+        # model (pinned set overruns budget OR the pinned set is oscillating), LATCH
+        # THE CANDIDATE (not the pinned victim) and surface it — the request stays
+        # queued, the proxy 503s, and next tick the brake sheds. We must never issue
+        # keep_alive=0 against a caller's pin (the actual storm-stopper).
+        resident_loaded = await self.vram.get_loaded_models()
+        if resident_loaded is not None and self._maybe_latch_infeasible(candidate, resident_loaded):
+            logger.warning(
+                "Infeasible swap latched: '%s' would evict an externally pinned "
+                "model (pinned set overruns the %.1f GB budget); refusing eviction",
+                candidate.model, self.config.gpu.max_vram_gb,
+            )
+            return False
+
+        # S4 — backlog ceiling: under a sustained brake, shed swap attempts past a
+        # bound rather than accumulate stale, age-inflated work.
+        if self._engage_ranking is not None:
+            self._brake_backlog_count += 1
+            if self._brake_backlog_exceeded():
+                record_cooldown_wait()
+                logger.debug("Swap backlog ceiling hit for '%s' — shedding", candidate.model)
                 return False
 
         # Log VRAM state before swap decision
@@ -528,7 +899,13 @@ class Scheduler:
             vram_bytes = int(vram_gb * 1024 * 1024 * 1024)
 
             try:
-                reservation = await self.vram_manager.reserve(candidate.model, vram_bytes)
+                # F-2/F5 — is_swap=True marks the COLD-SWAP path: a transient
+                # nvidia-smi miss fails CLOSED (blind on the dangerous path = stop),
+                # degrading to the velocity brake only after K consecutive misses.
+                # Without this the fail-closed/degrade-after-K/blind machinery is inert.
+                reservation = await self.vram_manager.reserve(
+                    candidate.model, vram_bytes, is_swap=True,
+                )
             except ValueError as exc:
                 logger.warning(
                     "VRAM reservation failed for '%s': %s — trying to free VRAM",
@@ -538,7 +915,9 @@ class Scheduler:
                 freed = await self._evict_for_model(candidate)
                 if freed:
                     try:
-                        reservation = await self.vram_manager.reserve(candidate.model, vram_bytes)
+                        reservation = await self.vram_manager.reserve(
+                            candidate.model, vram_bytes, is_swap=True,
+                        )
                     except ValueError as exc2:
                         logger.error(
                             "Cannot reserve VRAM for '%s' after eviction: %s",
@@ -571,94 +950,137 @@ class Scheduler:
                 await self.vram_manager.release(reservation)
             return False
 
-        # Perform the swap (serialized through load semaphore if VRAMManager available)
+        # Perform the swap. The load serializer is THE single chokepoint; the
+        # brake's AUTHORITATIVE acquire()+record_load() run inside it on every
+        # branch (R2-1). This both closes the peek→load TOCTOU (only one task
+        # holds the serializer; the first record_load advances the brake and a
+        # racing second task re-checks and stalls) AND keeps the no-VRAMManager
+        # path braked. We never sleep inside the serializer on a stall —
+        # min-spacing is realized by the scheduler's tick retries.
+        #
+        # DURATION NOTE (NH-6): `_dispatch(..., needs_swap=True)` BLOCKS until the
+        # inference completes (server `_dispatch_request`: serialize Ollama access
+        # across a model transition), so the serializer is held for the whole
+        # load+inference, not just the cold load. This is intentional (no concurrent
+        # Ollama access mid-swap), but a long swap-in inference therefore delays the
+        # next swap and both `/broker/preload` routes (which share this serializer).
+        # Co-resident (Phase-1) dispatch never holds it, so steady-state throughput
+        # is unaffected; only swap-needing work queues behind an in-progress swap.
         logger.info(
             "Model swap: %s -> %s (queue depth for new: %d)",
             self._current_model, candidate.model,
             self.queue.model_queue_size(candidate.model),
         )
-
-        # Audit: model swap event
         from_model = self._current_model or "none"
-        loaded_before = await self.vram.get_loaded_vram_gb()
-        audit.emit(audit.EVENT_SWAP, {
-            "from_model": from_model,
-            "to_model": candidate.model,
-            "queue_depth": self.queue.model_queue_size(candidate.model),
-            "vram_before_gb": round(loaded_before, 2),
-        })
 
-        # Vision C schema-frozen metric: bastion_model_swap_total
-        # reason="scheduler_pick" for the normal swap path (queue advanced to a
-        # non-resident model). The eviction path uses reason="eviction" inside
-        # _unload_model (see that helper).
-        record_model_swap(
-            from_model=self._current_model,
-            to_model=candidate.model,
-            reason="scheduler_pick",
-        )
-
-        self._current_model = candidate.model
-        self._last_swap_time = time.time()
-        self._swap_timestamps.append(self._last_swap_time)
-        self._total_swaps += 1
-
-        # Proactive eviction: if resident count exceeds max_loaded_models,
-        # evict the least-useful excess model. Skip when tracker state is
-        # unknown — we cannot decide what to evict without ground truth.
-        max_loaded = self.config.scheduler.ollama_max_loaded_models
-        resident_after = await self.vram.get_loaded_models()
-        if resident_after is not None and len(resident_after) > max_loaded:
-            excess = [
-                m for m in resident_after
-                if m.name != candidate.model
-                and not (
-                    (info := registry_lookup(self.config.models, m.name))
-                    and info.always_allowed
-                )
-                and not (
-                    self._reservation_check_fn
-                    and self._reservation_check_fn(m.name)
-                )
-                and not self._has_inflight_fn(m.name)
-            ]
-            excess.sort(key=lambda m: (self.queue.model_queue_size(m.name), m.vram_gb))
-            evict_count = len(resident_after) - max_loaded
-            for m in excess[:evict_count]:
-                logger.info(
-                    "Proactive eviction: unloading '%s' (resident=%d > max=%d)",
-                    m.name, len(resident_after), max_loaded,
-                )
-                await self._unload_model(m.name)
-
-        # Dispatch the request (blocking -- swap path)
-        # Use load semaphore if VRAMManager is available to serialize GPU I/O
-        #
-        # Tier-0 dead-metric activation (spec 5.4): capture the swap-I/O start
-        # BEFORE the if/else split (set on both branches) and record the
-        # duration AFTER _dispatch_for_model returns in EACH branch. Capturing
-        # here — not before the _load_semaphore acquisition inside the branch —
-        # avoids folding in semaphore-contention wait (already metered by
-        # cooldown_waits_total) into the swap duration, and instrumenting both
-        # branches keeps the no-VRAMManager path from silently under-counting.
-        swap_start = time.monotonic()
-        if self.vram_manager is not None and reservation is not None:
-            async with self.vram_manager._load_semaphore:
-                try:
-                    result = await self._dispatch_for_model(candidate.model, needs_swap=True)
-                    record_model_swap_duration(candidate.model, time.monotonic() - swap_start)
-                    if result:
-                        await self.vram_manager.commit(reservation)
-                    else:
-                        await self.vram_manager.release(reservation)
-                    return result
-                except Exception:
+        async with self._load_serializer:
+            # S5/R1-2 — forward the F5 hardware-gate-blind signal to the sensor-
+            # independent brake at the chokepoint, so refill HALVES exactly when
+            # nvidia-smi goes dark; recovery (blind False) restores full refill.
+            # (vram.py never imports swapbrake — this scheduler forward is the only
+            # cross-layer link.)
+            if self.vram_manager is not None:
+                self._brake.set_hw_degraded(self.vram_manager.hardware_gate_blind)
+            auth = self._brake.acquire(candidate.model)
+            if auth.action != "proceed":
+                # Lost the race / brake opened or latched in the await window —
+                # back out cleanly WITHOUT recording the swap (a stalled swap
+                # must not inflate _total_swaps or the swap-rate window).
+                if self.vram_manager is not None and reservation is not None:
                     await self.vram_manager.release(reservation)
-                    raise
-        else:
-            result = await self._dispatch_for_model(candidate.model, needs_swap=True)
-            record_model_swap_duration(candidate.model, time.monotonic() - swap_start)
-            return result
+                logger.debug(
+                    "Swap brake %s for '%s' (authoritative): %s",
+                    auth.action, candidate.model, auth.reason,
+                )
+                return False
+
+            # Committed to the swap — record the transition accounting now.
+            loaded_before = await self.vram.get_loaded_vram_gb()
+            audit.emit(audit.EVENT_SWAP, {
+                "from_model": from_model,
+                "to_model": candidate.model,
+                "queue_depth": self.queue.model_queue_size(candidate.model),
+                "vram_before_gb": round(loaded_before, 2),
+            })
+            # Vision C schema-frozen metric: bastion_model_swap_total
+            # reason="scheduler_pick"; the eviction path uses reason="eviction".
+            record_model_swap(
+                from_model=self._current_model,
+                to_model=candidate.model,
+                reason="scheduler_pick",
+            )
+            self._current_model = candidate.model
+            self._last_swap_time = time.monotonic()
+            self._swap_timestamps.append(self._last_swap_time)
+            self._total_swaps += 1
+
+            # Proactive eviction: keep resident count <= max_loaded_models. Skip
+            # when tracker state is unknown (cannot decide without ground truth).
+            max_loaded = self.config.scheduler.ollama_max_loaded_models
+            resident_after = await self.vram.get_loaded_models()
+            if resident_after is not None and len(resident_after) > max_loaded:
+                excess = [
+                    m for m in resident_after
+                    if m.name != candidate.model
+                    # F4 — never proactively evict an externally pinned model.
+                    and m.name not in self.vram._pinned
+                    and not (
+                        (info := registry_lookup(self.config.models, m.name))
+                        and info.always_allowed
+                    )
+                    and not (
+                        self._reservation_check_fn
+                        and self._reservation_check_fn(m.name)
+                    )
+                    and not self._has_inflight_fn(m.name)
+                ]
+                excess.sort(key=lambda m: (self.queue.model_queue_size(m.name), m.vram_gb))
+                evict_count = len(resident_after) - max_loaded
+                for m in excess[:evict_count]:
+                    logger.info(
+                        "Proactive eviction: unloading '%s' (resident=%d > max=%d)",
+                        m.name, len(resident_after), max_loaded,
+                    )
+                    await self._unload_model(m.name)
+
+            swap_start = time.monotonic()
+            # NH-1 — advance the min-spacing floor at the GPU-I/O ISSUE point, so a
+            # load that is issued and then FAILS (record_load never fires) still
+            # spaces the next attempt instead of permitting an immediate retry inrush.
+            self._brake.note_load_issued(candidate.model)
+            try:
+                result = await self._dispatch_for_model(candidate.model, needs_swap=True)
+                record_model_swap_duration(candidate.model, time.monotonic() - swap_start)
+                if result:
+                    # Debit the brake token at the true GPU-I/O point.
+                    self._brake.record_load(candidate.model)
+                    # F4 — count swaps GRANTED while the brake is engaged (only the
+                    # success path: a stall returns False before record_load and an
+                    # aborted probe takes the else/except path, so neither inflates
+                    # this; it feeds the release audit event's swaps_during_brake).
+                    if self._engage_ranking is not None:
+                        self._swaps_during_brake += 1
+                    # S4 — the swap was granted: this model is no longer starving.
+                    self._clear_swap_starvation(candidate.model)
+                    if self.vram_manager is not None and reservation is not None:
+                        await self.vram_manager.commit(reservation)
+                else:
+                    # F-1 — acquire() above may have granted the single HALF_OPEN
+                    # probe (auth.action=="proceed"), but the dispatch did not record
+                    # a load (queue swept by TTL → dequeue None → result False). Abort
+                    # the orphaned probe so the brake re-OPENs instead of wedging
+                    # forever at "half-open probe in flight" (no-op outside HALF_OPEN).
+                    self._brake.abort_probe()
+                    if self.vram_manager is not None and reservation is not None:
+                        await self.vram_manager.release(reservation)
+                return result
+            except Exception:
+                # F-1 — same orphaned-probe recovery on the raising path (an await
+                # after acquire() failed before record_load). Re-OPEN, then re-raise.
+                self._brake.abort_probe()
+                if self.vram_manager is not None and reservation is not None:
+                    await self.vram_manager.release(reservation)
+                raise
 
     async def _evict_for_model(self, candidate: QueuedRequest) -> bool:
         """Evict resident models to make VRAM space for a candidate model.
@@ -680,6 +1102,10 @@ class Scheduler:
         evictable = [
             m for m in resident
             if m.name != candidate.model
+            # F4 — never evict an externally pinned model (caller keep_alive=-1);
+            # fighting the pin with keep_alive=0 is exactly the storm BASTION must
+            # stop. The candidate is latched INFEASIBLE upstream instead.
+            and m.name not in self.vram._pinned
             # Tag-aware: an always_allowed model resident as 'name:latest'
             # must not become evictable because the registry key is untagged.
             and not (
@@ -815,6 +1241,13 @@ class Scheduler:
         logger.info("Unloading model '%s' to free VRAM", model)
         success = await self.vram.unload_model(model)
         if success:
+            # Two-token accounting: a BASTION-initiated unload is a real residency
+            # transition / power event (count_evictions). External (Ollama-timeout)
+            # unloads are NOT recorded here — only ones BASTION drove.
+            self._brake.record_unload(model)
+            # F4 — watch for a same-model REAPPEARANCE next tick (evict↔reload
+            # oscillation = an externally pinned working set BASTION is fighting).
+            self._recently_unloaded[model] = time.monotonic()
             # Vision C: count the eviction as a model transition with
             # reason="eviction" (no to_model in the strict sense; we use
             # "_none" to signal the unloaded slot, mirroring the from_model
@@ -873,6 +1306,10 @@ class Scheduler:
             )
 
         record_model_swap(from_model=model, to_model="_none", reason="eviction")
+        # F4 — pair operator force-unload with "refuse this model's next loads" so
+        # the keep_alive=0 force isn't instantly re-pinned by a caller's
+        # last-writer-wins keep_alive=-1.
+        self._brake.note_infeasible(model)
         if self._current_model == model:
             self._current_model = None
         if self.vram_manager is not None:
@@ -888,6 +1325,12 @@ class Scheduler:
         as the initial "current" model for affinity bonus purposes. The actual
         residency tracking is handled by VRAMTracker's residency cache.
         """
+        # Seed the brake "just swapped" so a post-restart first swap is SPACED,
+        # not free: a watchdog bounce after a hard-lock otherwise leaves
+        # _last_swap_time=0.0 (= infinite elapsed) while the caller's keep_alive
+        # pins survive in Ollama — handing the first swap a straight shot back
+        # into the crash zone (the crash-restart-loop hole).
+        self._brake.seed_just_swapped()
         try:
             loaded = await self.vram.get_loaded_models()
             if loaded:
@@ -895,7 +1338,7 @@ class Scheduler:
                 largest = max(loaded, key=lambda m: m.vram_gb)
                 self._current_model = largest.name
                 # Set swap time baseline so first non-resident swap respects cooldown
-                self._last_swap_time = time.time()
+                self._last_swap_time = time.monotonic()
                 logger.info(
                     "Synced with Ollama: %d models loaded, current='%s' (%.1f GB)",
                     len(loaded), largest.name, largest.vram_gb,

@@ -37,6 +37,7 @@ from bastion.models import (
     ModelInfo,
     PriorityTier,
     SchedulerConfig,
+    SwapBrakeConfig,
 )
 from bastion.proxy import OllamaProxy
 from bastion.queue import AffinityQueue
@@ -90,6 +91,9 @@ def _failure_config() -> BrokerConfig:
             max_queue_size=32,
             gpu_unsafe_backoff_seconds=0.1,
             loop_interval_seconds=0.05,
+            # Brake-neutral so the startup just-swapped seed doesn't space the
+            # first swap past these tests' windows (brake tests: test_swapbrake.py).
+            swap_brake=SwapBrakeConfig(min_spacing_seconds=0.0, bucket_capacity=1_000_000.0),
         ),
         models={
             "qwen3:14b": ModelInfo(vram_gb=9.3),

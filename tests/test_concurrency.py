@@ -29,6 +29,7 @@ from bastion.models import (
     ModelInfo,
     PriorityTier,
     SchedulerConfig,
+    SwapBrakeConfig,
 )
 from bastion.queue import AffinityQueue
 from bastion.scheduler import Scheduler
@@ -431,6 +432,9 @@ def _burst_config(max_queue_size: int = 256) -> BrokerConfig:
             concurrent_dispatch_delay_seconds=0.0,
             # Allow many parallel dispatches so 100 burst items drain quickly.
             max_concurrent_dispatches=8,
+            # Brake-neutral so the startup just-swapped seed doesn't space the
+            # first swap past these tests' windows (brake tests: test_swapbrake.py).
+            swap_brake=SwapBrakeConfig(min_spacing_seconds=0.0, bucket_capacity=1_000_000.0),
         ),
         models={
             "qwen3:14b": ModelInfo(vram_gb=9.3),

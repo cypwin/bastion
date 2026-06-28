@@ -26,7 +26,8 @@ class GPUProfile:
     notes: str | None = None     # Hardware-specific warnings
 
 
-# Default profile for unknown GPUs -- conservative values safe for any hardware
+# Default profile for unknown GPUs -- a conservative floor for an unknown card;
+# calibrate the real ceiling for your hardware via --stress-test.
 _DEFAULT_PROFILE = GPUProfile(
     name="Unknown GPU",
     vram_total_mb=0,             # 0 = must be detected at runtime

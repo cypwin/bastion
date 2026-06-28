@@ -20,6 +20,7 @@ from bastion.models import (
     PriorityTier,
     ResidencyState,
     SchedulerConfig,
+    SwapBrakeConfig,
 )
 from bastion.queue import AffinityQueue
 from bastion.scheduler import Scheduler
@@ -38,6 +39,9 @@ def residency_config() -> BrokerConfig:
             aging_rate=2.0,
             max_queue_size=32,
             residency_cache_ttl_seconds=0.1,  # Fast expiry for tests
+            # Brake-neutral so the startup just-swapped seed doesn't space the
+            # first swap past these tests' windows (brake tests: test_swapbrake.py).
+            swap_brake=SwapBrakeConfig(min_spacing_seconds=0.0, bucket_capacity=1_000_000.0),
         ),
         models={
             "qwen3:14b": ModelInfo(vram_gb=9.3),
